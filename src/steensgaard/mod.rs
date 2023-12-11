@@ -365,6 +365,19 @@ impl std::fmt::Debug for AnalysisResults {
     }
 }
 
+impl AnalysisResults {
+    #[inline]
+    pub fn local(&self, f: LocalDefId, i: u32) -> VarId {
+        self.vars[&VarId::Local(f, i)]
+    }
+
+    #[inline]
+    pub fn var_ty(&self, id: VarId) -> Type {
+        let VarType::Ref(ty) = self.var_tys[&id] else { panic!() };
+        ty
+    }
+}
+
 impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
@@ -383,36 +396,11 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
 
     fn transfer_stmt(&mut self, func: LocalDefId, stmt: &Statement<'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { unreachable!() };
-        let l_deref = l.is_indirect_first_projection();
         let l_id = VarId::Local(func, l.local.as_u32());
+        let l_deref = l.is_indirect_first_projection();
         match r {
-            Rvalue::Use(r) => match r {
-                Operand::Copy(r) | Operand::Move(r) => {
-                    let r_deref = r.is_indirect_first_projection();
-                    let r_id = VarId::Local(func, r.local.as_u32());
-                    match (l_deref, r_deref) {
-                        (false, false) => self.x_eq_y(l_id, r_id),
-                        (false, true) => self.x_eq_deref_y(l_id, r_id),
-                        (true, false) => self.deref_x_eq_y(l_id, r_id),
-                        (true, true) => unreachable!(),
-                    }
-                }
-                Operand::Constant(box constant) => match constant.literal {
-                    ConstantKind::Ty(_) => unreachable!(),
-                    ConstantKind::Unevaluated(_, _) => unreachable!(),
-                    ConstantKind::Val(value, _) => match value {
-                        ConstValue::Scalar(scalar) => match scalar {
-                            Scalar::Int(_) => {}
-                            Scalar::Ptr(_, _) => unreachable!(),
-                        },
-                        ConstValue::ZeroSized => unreachable!(),
-                        ConstValue::Slice { .. } => unreachable!(),
-                        ConstValue::ByRef { .. } => unreachable!(),
-                    },
-                },
-            },
-            Rvalue::Repeat(_, _) => {
-                todo!();
+            Rvalue::Use(r) | Rvalue::Repeat(r, _) | Rvalue::Cast(_, r, _) => {
+                self.transfer_operand(func, l_id, l_deref, r)
             }
             Rvalue::Ref(_, _, r) => {
                 assert!(!l_deref);
@@ -428,9 +416,6 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.x_eq_y(l_id, r_id);
             }
             Rvalue::Len(_) => unreachable!(),
-            Rvalue::Cast(_, _, _) => {
-                todo!();
-            }
             Rvalue::BinaryOp(_, box (_, _)) => {
                 todo!();
             }
@@ -449,6 +434,40 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             Rvalue::CopyForDeref(_) => {
                 todo!();
             }
+        }
+    }
+
+    fn transfer_operand(
+        &mut self,
+        func: LocalDefId,
+        l_id: VarId,
+        l_deref: bool,
+        r: &Operand<'tcx>,
+    ) {
+        match r {
+            Operand::Copy(r) | Operand::Move(r) => {
+                let r_deref = r.is_indirect_first_projection();
+                let r_id = VarId::Local(func, r.local.as_u32());
+                match (l_deref, r_deref) {
+                    (false, false) => self.x_eq_y(l_id, r_id),
+                    (false, true) => self.x_eq_deref_y(l_id, r_id),
+                    (true, false) => self.deref_x_eq_y(l_id, r_id),
+                    (true, true) => unreachable!(),
+                }
+            }
+            Operand::Constant(box constant) => match constant.literal {
+                ConstantKind::Ty(_) => unreachable!(),
+                ConstantKind::Unevaluated(_, _) => unreachable!(),
+                ConstantKind::Val(value, _) => match value {
+                    ConstValue::Scalar(scalar) => match scalar {
+                        Scalar::Int(_) => {}
+                        Scalar::Ptr(_, _) => unreachable!(),
+                    },
+                    ConstValue::ZeroSized => unreachable!(),
+                    ConstValue::Slice { .. } => unreachable!(),
+                    ConstValue::ByRef { .. } => unreachable!(),
+                },
+            },
         }
     }
 
