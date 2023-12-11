@@ -18,7 +18,9 @@ jobs:
         run: cargo fmt --check
       - name: Apply lints
         run: cargo clippy -- -D warnings
-      - name: Build
-        run: cargo build --release
       - name: Build dependency crate
         run: cd deps_crate && cargo build
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release

@@ -77,12 +77,8 @@ impl<'tcx> TyVisitor<'tcx> {
     }
 
     fn handle_ty(&mut self, ty: &'tcx Ty<'tcx>) {
-        let TyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
-            return;
-        };
-        let Res::Def(_, def_id) = path.res else {
-            return;
-        };
+        let TyKind::Path(QPath::Resolved(_, path)) = ty.kind else { return };
+        let Res::Def(_, def_id) = path.res else { return };
         if !def_id.is_local() {
             return;
         }
@@ -149,9 +145,7 @@ impl<'tcx, 'a> UnionVisitor<'tcx, 'a> {
     }
 
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        let ExprKind::Field(expr, ident) = expr.kind else {
-            return;
-        };
+        let ExprKind::Field(expr, ident) = expr.kind else { return };
         let ty = self.typeck.expr_ty(expr);
         let adt_def = some_or!(ty.ty_adt_def(), return);
         if !adt_def.is_union() {

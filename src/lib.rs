@@ -33,6 +33,7 @@
 #![feature(iter_intersperse)]
 #![feature(file_create_new)]
 #![feature(box_into_inner)]
+#![feature(box_patterns)]
 
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -52,3 +53,4 @@ pub mod analysis;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod graph;
+pub mod steensgaard;

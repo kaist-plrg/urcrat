@@ -9,6 +9,7 @@ clap = { version = "4.4.2", features = ["derive"] }
 rustfix = "0.6.1"
 etrace = "1.1.1"
 lazy_static = "1.4.0"
+typed-arena = "2.0.2"
 
 [package.metadata.rust-analyzer]
 rustc_private = true
