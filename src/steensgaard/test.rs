@@ -6,7 +6,8 @@ fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     compile_util::run_compiler(config, f);
 }
 
-fn analyze_fn<F: FnOnce(Vec<VarId>, Vec<Type>, TyCtxt<'_>) + Send>(code: &str, f: F) {
+fn analyze_fn<F>(code: &str, f: F)
+where F: FnOnce(Vec<VarId>, Vec<Type>, AnalysisResults, TyCtxt<'_>) + Send {
     let name = "foo";
     let code = format!(
         "
@@ -25,7 +26,7 @@ fn analyze_fn<F: FnOnce(Vec<VarId>, Vec<Type>, TyCtxt<'_>) + Send>(code: &str, f
         let (def_id, n) = find_item(name, tcx);
         let x: Vec<_> = (0..n).map(|i| res.local(def_id, i)).collect();
         let t: Vec<_> = x.iter().map(|x| res.var_ty(*x)).collect();
-        f(x, t, tcx);
+        f(x, t, res, tcx);
     });
 }
 
@@ -57,7 +58,7 @@ fn test_eq_ref() {
         let mut x: libc::c_int = 0 as libc::c_int;
         let mut y: *mut libc::c_int = &mut x;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_ne!(x[2], x[3]);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
@@ -79,7 +80,7 @@ fn test_eq_ref_twice() {
         let mut y: *mut libc::c_int = &mut x;
         y = &mut x;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -107,7 +108,7 @@ fn test_eq_ref_join() {
         let mut y2: *mut libc::c_int = &mut x2;
         y1 = &mut x2;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
             assert_eq!(t[5].var_ty, x[1]);
@@ -144,7 +145,7 @@ fn test_eq_ref_join_2() {
         let mut z2: *mut *mut libc::c_int = &mut y2;
         z1 = &mut y2;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[7].var_ty, x[3]);
             assert_eq!(t[8].var_ty, x[3]);
             assert_eq!(t[9].var_ty, x[3]);
@@ -178,7 +179,7 @@ fn test_eq() {
         let mut z: *mut libc::c_int = 0 as *mut libc::c_int;
         z = y;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_ne!(x[2], x[3]);
             assert_ne!(x[2], x[4]);
             assert_ne!(x[3], x[4]);
@@ -200,7 +201,7 @@ fn test_eq_bot() {
         let mut z: *mut libc::c_int = 0 as *mut libc::c_int;
         z = y;
         ",
-        |_, t, _| {
+        |_, t, _, _| {
             assert_ne!(t[1].var_ty, t[2].var_ty);
         },
     );
@@ -223,7 +224,7 @@ fn test_eq_bot2() {
         z = y;
         z = &mut x;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_ne!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -250,7 +251,7 @@ fn test_eq_pending() {
         z = y;
         y = &mut x;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -278,7 +279,7 @@ fn test_eq_pending_2() {
         z = y;
         y = &mut x;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -321,7 +322,7 @@ fn test_eq_join() {
         }
         let mut c: *mut *mut libc::c_int = &mut y;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[7].var_ty, x[3]);
             assert_eq!(t[8].var_ty, x[3]);
             assert_eq!(t[13].var_ty, x[3]);
@@ -354,7 +355,7 @@ fn test_eq_deref() {
         let mut z: *mut *mut libc::c_int = &mut y;
         let mut w: *mut libc::c_int = *z;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[4].var_ty, x[2]);
             assert_eq!(t[5].var_ty, x[2]);
             assert_eq!(t[2].var_ty, x[1]);
@@ -385,7 +386,7 @@ fn test_eq_deref_bot() {
         let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
         y = &mut w;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[1].var_ty, x[6]);
             assert_eq!(t[7].var_ty, x[6]);
             assert_eq!(t[8].var_ty, x[6]);
@@ -424,7 +425,7 @@ fn test_eq_deref_pending() {
         let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
         y1 = &mut w;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[1].var_ty, x[8]);
             assert_eq!(t[2].var_ty, x[8]);
             assert_eq!(t[3].var_ty, x[8]);
@@ -456,7 +457,7 @@ fn test_deref_eq() {
         let mut w: *mut libc::c_int = &mut z;
         *y = w;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[1].var_ty, x[4]);
@@ -490,7 +491,7 @@ fn test_deref_eq_bot() {
         let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
         x = &mut w;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[8].var_ty, x[7]);
             assert_eq!(t[9].var_ty, x[7]);
             assert_eq!(t[1].var_ty, x[7]);
@@ -520,7 +521,7 @@ fn test_eq_alloc() {
         x = malloc(::std::mem::size_of::<libc::c_int>() as libc::c_ulong)
             as *mut libc::c_int;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -541,7 +542,7 @@ fn test_eq_alloc_bot() {
         ) as *mut libc::c_int;
         let mut y: *mut libc::c_int = x;
         ",
-        |_, t, _| {
+        |_, t, _, _| {
             assert_eq!(t[1].var_ty, t[2].var_ty);
         },
     );
@@ -574,7 +575,7 @@ fn test_eq_add() {
         let mut w: libc::c_long = z + 1 as libc::c_int as libc::c_long;
         let mut v: *mut libc::c_char = w as *mut libc::c_char;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[6].var_ty, x[1]);
             assert_eq!(t[7].var_ty, x[1]);
             assert_eq!(t[8].var_ty, x[1]);
@@ -600,7 +601,7 @@ fn test_eq_eq() {
         let mut y: *mut libc::c_int = &mut x;
         let mut z: libc::c_int = (y == 0 as *mut libc::c_int) as libc::c_int;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_ne!(t[4].var_ty, x[1]);
@@ -627,7 +628,7 @@ fn test_eq_neg() {
         let mut v: libc::c_long = -w;
         let mut u: *mut libc::c_int = v as *mut libc::c_int;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -649,7 +650,7 @@ fn test_eq_not() {
         let mut v: libc::c_long = -w;
         let mut u: *mut libc::c_int = v as *mut libc::c_int;
         ",
-        |x, t, _| {
+        |x, t, _, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -670,12 +671,57 @@ fn test_eq_static() {
         static mut x: libc::c_int = 0 as libc::c_int;
         let mut y: *mut libc::c_int = &mut x;
         ",
-        |_, t, tcx| {
+        |_, t, _, tcx| {
+            let (def_id, _) = find_item("x", tcx);
+            let x = VarId::Global(def_id);
+            assert_eq!(t[1].var_ty, x);
+            assert_eq!(t[2].var_ty, x);
+            assert_eq!(t[3].var_ty, x);
+        },
+    );
+}
+
+#[test]
+fn test_static_eq() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = const {alloc1: *mut *mut i32}
+    // (*_4) = move _2
+    analyze_fn(
+        "
+        static mut x: *mut libc::c_int = 0 as *const libc::c_int as *mut libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        x = &mut y;
+        ",
+        |x, t, res, tcx| {
             let (def_id, _) = find_item("x", tcx);
             let x_id = VarId::Global(def_id);
-            assert_eq!(t[1].var_ty, x_id);
-            assert_eq!(t[2].var_ty, x_id);
-            assert_eq!(t[3].var_ty, x_id);
+            let x_ty = res.var_ty(x_id);
+            assert_eq!(t[4].var_ty, x_id);
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(x_ty.var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_static2() {
+    analyze_fn(
+        "
+        static mut x: libc::c_int = 0 as libc::c_int;
+        static mut y: *mut libc::c_int = unsafe {
+            &x as *const libc::c_int as *mut libc::c_int
+        };
+        ",
+        |_, _, res, tcx| {
+            let (def_id, _) = find_item("x", tcx);
+            let x_id = VarId::Global(def_id);
+            let (def_id, _) = find_item("y", tcx);
+            let y_id = VarId::Global(def_id);
+            let y_ty = res.var_ty(y_id);
+            assert_eq!(y_ty.var_ty, x_id);
         },
     );
 }

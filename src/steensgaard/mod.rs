@@ -45,8 +45,17 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let def_id = local_def_id.to_def_id();
         match item.kind {
             ItemKind::Static(_, _, _) => {
+                let body = tcx.mir_for_ctfe(def_id);
+                let local_decls = body.local_decls.len();
+
+                for i in 0..local_decls {
+                    let id = VarId::Local(local_def_id, i as _);
+                    analyzer.insert_and_allocate(id);
+                }
+
                 let id = VarId::Global(local_def_id);
                 analyzer.insert_and_allocate(id);
+                analyzer.x_eq_y(id, VarId::Local(local_def_id, 0));
             }
             ItemKind::Fn(_, _, _) => {
                 let body = tcx.optimized_mir(def_id);
@@ -67,14 +76,17 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
     for item_id in hir.items() {
         let item = hir.item(item_id);
-        // if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
-        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+        if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
             continue;
         }
 
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
-        let body = tcx.optimized_mir(def_id);
+        let body = if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+            tcx.optimized_mir(def_id)
+        } else {
+            tcx.mir_for_ctfe(def_id)
+        };
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
                 println!("{:?}", stmt);
@@ -432,7 +444,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     }
 
     fn transfer_stmt(&mut self, func: LocalDefId, stmt: &Statement<'tcx>) {
-        let StatementKind::Assign(box (l, r)) = &stmt.kind else { unreachable!() };
+        let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let l_id = VarId::Local(func, l.local.as_u32());
         let l_deref = l.is_indirect_first_projection();
         match r {
