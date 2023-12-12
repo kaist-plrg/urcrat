@@ -725,3 +725,25 @@ fn test_static2() {
         },
     );
 }
+
+#[test]
+fn test_fn_arg() {
+    // _1 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _2 = foo::g(move _3) -> [return: bb1, unwind continue]
+    analyze_fn(
+        "
+        fn g(mut x: *mut libc::c_int) {}
+        let mut x: libc::c_int = 0;
+        g(&mut x);
+        ",
+        |x, t, res, tcx| {
+            let (def_id, _) = find_item("g", tcx);
+            let gx = VarId::Local(def_id, 1);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(res.var_ty(gx).var_ty, x[1]);
+        },
+    );
+}

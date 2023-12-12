@@ -492,13 +492,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         }
     }
 
-    fn transfer_operand(
-        &mut self,
-        func: LocalDefId,
-        l_id: VarId,
-        l_deref: bool,
-        r: &Operand<'tcx>,
-    ) {
+    fn transfer_operand(&mut self, func: LocalDefId, l_id: VarId, l_deref: bool, r: &Operand<'_>) {
         match r {
             Operand::Copy(r) | Operand::Move(r) => {
                 let r_deref = r.is_indirect_first_projection();
@@ -548,72 +542,90 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
                 assert!(!func.is_indirect_first_projection());
-                let id = VarId::Local(caller, func.local.as_u32());
-                let (_, ft) = self.variable_type(id);
-                if self.fn_type(ft).is_bot() {
-                    let args = args.iter().map(|_| self.mk_ecr()).collect();
-                    let ret = self.mk_ecr();
-                    self.fn_set_type(ft, FnType::Lambda(args, ret));
-                }
-                let FnType::Lambda(params, ret) = self.fn_type(ft) else { panic!() };
-                let ret = *ret;
-
-                for (p, a) in params.clone().into_iter().zip(args) {
-                    match a {
-                        Operand::Copy(a) | Operand::Move(a) => {
-                            assert!(!a.is_indirect_first_projection());
-                            let a_id = VarId::Local(caller, a.local.as_u32());
-                            let (vt, ft) = self.variable_type(a_id);
-                            self.var_cond_join(p.var_ty, vt);
-                            self.fn_cond_join(p.fn_ty, ft);
-                        }
-                        Operand::Constant(box _) => {
-                            todo!();
-                        }
-                    }
-                }
-
-                let (vt, ft) = self.variable_type(d_id);
-                self.var_cond_join(ret.var_ty, vt);
-                self.fn_cond_join(ret.fn_ty, ft);
+                let callee = VarId::Local(caller, func.local.as_u32());
+                self.transfer_intra_call(caller, callee, args, d_id);
             }
-            Operand::Constant(box constant) => match constant.literal {
-                ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => unreachable!(),
-                ConstantKind::Val(value, ty) => match value {
-                    ConstValue::Scalar(_) => unreachable!(),
-                    ConstValue::ZeroSized => {
-                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let name = self.def_id_to_string(*def_id);
-                        let mut segs: Vec<_> = name.split("::").collect();
-                        let seg0 = segs.pop().unwrap_or_default();
-                        let seg1 = segs.pop().unwrap_or_default();
-                        let seg2 = segs.pop().unwrap_or_default();
-                        let seg3 = segs.pop().unwrap_or_default();
-                        if def_id.is_local() {
-                            if seg1.contains("{extern#") {
-                                match seg0 {
-                                    "malloc" => self.x_eq_alloc(d_id),
-                                    _ => panic!("{}", seg0),
-                                }
-                            } else {
-                                panic!("{}", name);
-                            }
-                        } else {
-                            match (seg3, seg2, seg1, seg0) {
-                                (_, _, "mem", "size_of" | "align_of") => {}
-                                (_, "slice", _, "as_mut_ptr") => {
-                                    let a = &args[0];
-                                    self.transfer_operand(caller, d_id, false, a);
-                                }
-                                _ => panic!("{}", name),
-                            }
-                        }
+            Operand::Constant(box constant) => {
+                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                assert!(matches!(value, ConstValue::ZeroSized));
+                let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                let name = self.def_id_to_string(*def_id);
+                let mut segs: Vec<_> = name.split("::").collect();
+                let seg0 = segs.pop().unwrap_or_default();
+                let seg1 = segs.pop().unwrap_or_default();
+                let seg2 = segs.pop().unwrap_or_default();
+                let seg3 = segs.pop().unwrap_or_default();
+                if let Some(local_def_id) = def_id.as_local() {
+                    if seg1.contains("{extern#") {
+                        self.transfer_c_call(seg0, d_id);
+                    } else {
+                        let callee = VarId::Global(local_def_id);
+                        self.transfer_intra_call(caller, callee, args, d_id);
                     }
-                    ConstValue::Slice { .. } => unreachable!(),
-                    ConstValue::ByRef { .. } => unreachable!(),
-                },
-            },
+                } else {
+                    self.transfer_rust_call(caller, (seg3, seg2, seg1, seg0), args, d_id);
+                }
+            }
+        }
+    }
+
+    fn transfer_intra_call(
+        &mut self,
+        caller: LocalDefId,
+        callee: VarId,
+        args: &[Operand<'_>],
+        dst: VarId,
+    ) {
+        let (_, ft) = self.variable_type(callee);
+        if self.fn_type(ft).is_bot() {
+            let args = args.iter().map(|_| self.mk_ecr()).collect();
+            let ret = self.mk_ecr();
+            self.fn_set_type(ft, FnType::Lambda(args, ret));
+        }
+        let FnType::Lambda(params, ret) = self.fn_type(ft) else { panic!() };
+        let ret = *ret;
+
+        for (p, a) in params.clone().into_iter().zip(args) {
+            match a {
+                Operand::Copy(a) | Operand::Move(a) => {
+                    assert!(!a.is_indirect_first_projection());
+                    let a_id = VarId::Local(caller, a.local.as_u32());
+                    let (vt, ft) = self.variable_type(a_id);
+                    self.var_cond_join(p.var_ty, vt);
+                    self.fn_cond_join(p.fn_ty, ft);
+                }
+                Operand::Constant(box _) => {
+                    todo!();
+                }
+            }
+        }
+
+        let (vt, ft) = self.variable_type(dst);
+        self.var_cond_join(ret.var_ty, vt);
+        self.fn_cond_join(ret.fn_ty, ft);
+    }
+
+    fn transfer_c_call(&mut self, name: &str, dst: VarId) {
+        match name {
+            "malloc" => self.x_eq_alloc(dst),
+            _ => panic!("{}", name),
+        }
+    }
+
+    fn transfer_rust_call(
+        &mut self,
+        caller: LocalDefId,
+        name: (&str, &str, &str, &str),
+        args: &[Operand<'_>],
+        dst: VarId,
+    ) {
+        match name {
+            (_, _, "mem", "size_of" | "align_of") => {}
+            (_, "slice", _, "as_mut_ptr") => {
+                let a = &args[0];
+                self.transfer_operand(caller, dst, false, a);
+            }
+            _ => panic!("{:?}", name),
         }
     }
 
