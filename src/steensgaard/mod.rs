@@ -135,9 +135,15 @@ impl Type {
     }
 }
 
+type Unify<T, S> = (Vec<(T, T)>, Vec<(S, S)>);
+
 trait Domain {
+    type I1: Copy + Eq + std::hash::Hash;
+    type I2: Copy + Eq + std::hash::Hash;
+
     fn bot() -> Self;
     fn is_bot(&self) -> bool;
+    fn unify(self, other: Self) -> Unify<Self::I1, Self::I2>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +162,9 @@ impl std::fmt::Debug for VarType {
 }
 
 impl Domain for VarType {
+    type I1 = VarId;
+    type I2 = FnId;
+
     #[inline]
     fn bot() -> Self {
         VarType::Bot
@@ -164,6 +173,12 @@ impl Domain for VarType {
     #[inline]
     fn is_bot(&self) -> bool {
         matches!(self, VarType::Bot)
+    }
+
+    fn unify(self, other: Self) -> Unify<Self::I1, Self::I2> {
+        let VarType::Ref(t1) = self else { panic!() };
+        let VarType::Ref(t2) = other else { panic!() };
+        (vec![(t1.var_ty, t2.var_ty)], vec![(t1.fn_ty, t2.fn_ty)])
     }
 }
 
@@ -198,6 +213,9 @@ impl std::fmt::Debug for FnType {
 }
 
 impl Domain for FnType {
+    type I1 = FnId;
+    type I2 = VarId;
+
     #[inline]
     fn bot() -> Self {
         FnType::Bot
@@ -206,6 +224,16 @@ impl Domain for FnType {
     #[inline]
     fn is_bot(&self) -> bool {
         matches!(self, FnType::Bot)
+    }
+
+    fn unify(self, other: Self) -> Unify<Self::I1, Self::I2> {
+        let FnType::Lambda(p1, r1) = self else { panic!() };
+        let FnType::Lambda(p2, r2) = other else { panic!() };
+        std::iter::once(r1)
+            .chain(p1)
+            .zip(std::iter::once(r2).chain(p2))
+            .map(|(t1, t2)| ((t1.fn_ty, t2.fn_ty), (t1.var_ty, t2.var_ty)))
+            .unzip()
     }
 }
 
@@ -222,13 +250,13 @@ impl FnType {
 
 type Ecr<'a, I> = &'a DisjointSet<'a, I>;
 
-struct Ecrs<'a, I, T> {
-    ecrs: HashMap<I, Ecr<'a, I>>,
-    types: HashMap<I, T>,
-    pendings: HashMap<I, HashSet<I>>,
+struct Ecrs<'a, T: Domain> {
+    ecrs: HashMap<T::I1, Ecr<'a, T::I1>>,
+    types: HashMap<T::I1, T>,
+    pendings: HashMap<T::I1, HashSet<T::I1>>,
 }
 
-impl<'a, I: Copy + Eq + std::hash::Hash, T: Clone + Domain> Ecrs<'a, I, T> {
+impl<'a, T: Clone + Domain> Ecrs<'a, T> {
     fn new() -> Self {
         Self {
             ecrs: HashMap::new(),
@@ -238,26 +266,28 @@ impl<'a, I: Copy + Eq + std::hash::Hash, T: Clone + Domain> Ecrs<'a, I, T> {
     }
 
     #[inline]
-    fn root(&self, x: I) -> I {
+    fn root(&self, x: T::I1) -> T::I1 {
         self.ecrs[&x].find_set().id()
     }
 
     #[inline]
-    fn insert(&mut self, x: I, e: Ecr<'a, I>) {
+    fn insert(&mut self, x: T::I1, e: Ecr<'a, T::I1>) {
         self.ecrs.insert(x, e);
         self.types.insert(x, T::bot());
     }
 
-    fn set_type(&mut self, e: I, t: T) {
+    fn set_type<S>(&mut self, e: T::I1, t: T, other: &mut Ecrs<'a, S>)
+    where S: Clone + Domain<I1 = T::I2, I2 = T::I1> {
         let e = self.root(e);
         self.types.insert(e, t);
         let pendings = some_or!(self.pendings.remove(&e), return);
         for x in pendings {
-            self.join(e, x);
+            self.join(e, x, other);
         }
     }
 
-    fn cond_join(&mut self, e1: I, e2: I) {
+    fn cond_join<S>(&mut self, e1: T::I1, e2: T::I1, other: &mut Ecrs<'a, S>)
+    where S: Clone + Domain<I1 = T::I2, I2 = T::I1> {
         let e1 = self.root(e1);
         let e2 = self.root(e2);
         if e1 == e2 {
@@ -267,15 +297,16 @@ impl<'a, I: Copy + Eq + std::hash::Hash, T: Clone + Domain> Ecrs<'a, I, T> {
         if t2.is_bot() {
             self.pendings.entry(e2).or_default().insert(e1);
         } else {
-            self.join(e1, e2);
+            self.join(e1, e2, other);
         }
     }
 
-    fn join(&mut self, e1: I, e2: I) -> Option<(T, T)> {
+    fn join<S>(&mut self, e1: T::I1, e2: T::I1, other: &mut Ecrs<'a, S>)
+    where S: Clone + Domain<I1 = T::I2, I2 = T::I1> {
         let e1 = self.ecrs[&e1].find_set();
         let e2 = self.ecrs[&e2].find_set();
         if e1 == e2 {
-            return None;
+            return;
         }
 
         let e1_id = e1.id();
@@ -303,7 +334,7 @@ impl<'a, I: Copy + Eq + std::hash::Hash, T: Clone + Domain> Ecrs<'a, I, T> {
                 }
             } else if let Some(pendings) = self.pendings.remove(&e1) {
                 for x in pendings {
-                    self.join(e, x);
+                    self.join(e, x, other);
                 }
             }
         } else {
@@ -311,14 +342,19 @@ impl<'a, I: Copy + Eq + std::hash::Hash, T: Clone + Domain> Ecrs<'a, I, T> {
             if t2_is_bot {
                 if let Some(pendings) = self.pendings.remove(&e2) {
                     for x in pendings {
-                        self.join(e, x);
+                        self.join(e, x, other);
                     }
                 }
             } else {
-                return Some((t1, t2));
+                let (this_ts, other_ts) = t1.unify(t2);
+                for (t1, t2) in this_ts {
+                    self.join(t1, t2, other);
+                }
+                for (t1, t2) in other_ts {
+                    other.join(t1, t2, self);
+                }
             }
         }
-        None
     }
 }
 
@@ -330,8 +366,8 @@ struct Analyzer<'tcx, 'a> {
     var_arena: &'a Arena<DisjointSet<'a, VarId>>,
     fn_arena: &'a Arena<DisjointSet<'a, FnId>>,
 
-    var_ecrs: Ecrs<'a, VarId, VarType>,
-    fn_ecrs: Ecrs<'a, FnId, FnType>,
+    var_ecrs: Ecrs<'a, VarType>,
+    fn_ecrs: Ecrs<'a, FnType>,
 }
 
 pub struct AnalysisResults {
@@ -684,53 +720,32 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
 
     #[inline]
     fn var_set_type(&mut self, e: VarId, t: VarType) {
-        self.var_ecrs.set_type(e, t);
+        self.var_ecrs.set_type(e, t, &mut self.fn_ecrs);
     }
 
     #[inline]
     fn fn_set_type(&mut self, e: FnId, t: FnType) {
-        self.fn_ecrs.set_type(e, t);
+        self.fn_ecrs.set_type(e, t, &mut self.var_ecrs);
     }
 
     #[inline]
     fn var_cond_join(&mut self, e1: VarId, e2: VarId) {
-        self.var_ecrs.cond_join(e1, e2);
+        self.var_ecrs.cond_join(e1, e2, &mut self.fn_ecrs);
     }
 
     #[inline]
     fn fn_cond_join(&mut self, e1: FnId, e2: FnId) {
-        self.fn_ecrs.cond_join(e1, e2);
+        self.fn_ecrs.cond_join(e1, e2, &mut self.var_ecrs);
     }
 
     #[inline]
     fn var_join(&mut self, e1: VarId, e2: VarId) {
-        let (t1, t2) = some_or!(self.var_ecrs.join(e1, e2), return);
-        self.var_unify(t1, t2);
+        self.var_ecrs.join(e1, e2, &mut self.fn_ecrs);
     }
 
     #[inline]
     fn fn_join(&mut self, e1: FnId, e2: FnId) {
-        let (t1, t2) = some_or!(self.fn_ecrs.join(e1, e2), return);
-        self.fn_unify(t1, t2);
-    }
-
-    fn var_unify(&mut self, t1: VarType, t2: VarType) {
-        let VarType::Ref(t1) = t1 else { panic!() };
-        let VarType::Ref(t2) = t2 else { panic!() };
-        self.var_join(t1.var_ty, t2.var_ty);
-        self.fn_join(t1.fn_ty, t2.fn_ty);
-    }
-
-    fn fn_unify(&mut self, t1: FnType, t2: FnType) {
-        let FnType::Lambda(p1, r1) = t1 else { panic!() };
-        let FnType::Lambda(p2, r2) = t2 else { panic!() };
-        for (t1, t2) in std::iter::once(r1)
-            .chain(p1)
-            .zip(std::iter::once(r2).chain(p2))
-        {
-            self.var_join(t1.var_ty, t2.var_ty);
-            self.fn_join(t1.fn_ty, t2.fn_ty);
-        }
+        self.fn_ecrs.join(e1, e2, &mut self.var_ecrs);
     }
 }
 

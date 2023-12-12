@@ -2,3 +2,5 @@ target
 Session.vim
 *.log
 *.txt
+*.profdata
+*.profraw
