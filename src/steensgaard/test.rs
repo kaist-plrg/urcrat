@@ -6,26 +6,41 @@ fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     compile_util::run_compiler(config, f);
 }
 
-fn analyze_fn<F: FnOnce(Vec<VarId>, Vec<Type>) + Send>(code: &str, f: F) {
+fn analyze_fn<F: FnOnce(Vec<VarId>, Vec<Type>, TyCtxt<'_>) + Send>(code: &str, f: F) {
     let name = "foo";
-    let code = format!("extern crate libc;unsafe fn {}(){{{}}}", name, code);
+    let code = format!(
+        "
+        extern crate libc;
+        extern \"C\" {{
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }}
+        unsafe fn {}() {{
+            {}
+        }}
+    ",
+        name, code
+    );
     run_compiler(&code, |tcx| {
         let res = analyze(tcx);
-        let (def_id, n) = find_fn(name, tcx);
+        let (def_id, n) = find_item(name, tcx);
         let x: Vec<_> = (0..n).map(|i| res.local(def_id, i)).collect();
         let t: Vec<_> = x.iter().map(|x| res.var_ty(*x)).collect();
-        f(x, t);
+        f(x, t, tcx);
     });
 }
 
-fn find_fn(name: &str, tcx: TyCtxt<'_>) -> (LocalDefId, u32) {
+fn find_item(name: &str, tcx: TyCtxt<'_>) -> (LocalDefId, u32) {
     let hir = tcx.hir();
     for item_id in hir.items() {
         let item = hir.item(item_id);
-        if matches!(item.kind, ItemKind::Fn(_, _, _)) && item.ident.name.as_str() == name {
+        if item.ident.name.as_str() == name {
             let local_def_id = item.owner_id.def_id;
-            let body = tcx.optimized_mir(local_def_id.to_def_id());
-            let locals = body.local_decls.len();
+            let locals = if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                let body = tcx.optimized_mir(local_def_id.to_def_id());
+                body.local_decls.len()
+            } else {
+                0
+            };
             return (local_def_id, locals as _);
         }
     }
@@ -42,7 +57,7 @@ fn test_eq_ref() {
         let mut x: libc::c_int = 0 as libc::c_int;
         let mut y: *mut libc::c_int = &mut x;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_ne!(x[2], x[3]);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
@@ -64,7 +79,7 @@ fn test_eq_ref_twice() {
         let mut y: *mut libc::c_int = &mut x;
         y = &mut x;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -92,7 +107,7 @@ fn test_eq_ref_join() {
         let mut y2: *mut libc::c_int = &mut x2;
         y1 = &mut x2;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
             assert_eq!(t[5].var_ty, x[1]);
@@ -129,7 +144,7 @@ fn test_eq_ref_join_2() {
         let mut z2: *mut *mut libc::c_int = &mut y2;
         z1 = &mut y2;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[7].var_ty, x[3]);
             assert_eq!(t[8].var_ty, x[3]);
             assert_eq!(t[9].var_ty, x[3]);
@@ -163,7 +178,7 @@ fn test_eq() {
         let mut z: *mut libc::c_int = 0 as *mut libc::c_int;
         z = y;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_ne!(x[2], x[3]);
             assert_ne!(x[2], x[4]);
             assert_ne!(x[3], x[4]);
@@ -185,9 +200,8 @@ fn test_eq_bot() {
         let mut z: *mut libc::c_int = 0 as *mut libc::c_int;
         z = y;
         ",
-        |x, t| {
-            assert_ne!(x[1], x[2]);
-            assert_ne!(t[1], t[2]);
+        |_, t, _| {
+            assert_ne!(t[1].var_ty, t[2].var_ty);
         },
     );
 }
@@ -209,7 +223,7 @@ fn test_eq_bot2() {
         z = y;
         z = &mut x;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_ne!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -236,7 +250,7 @@ fn test_eq_pending() {
         z = y;
         y = &mut x;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -264,7 +278,7 @@ fn test_eq_pending_2() {
         z = y;
         y = &mut x;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -307,7 +321,7 @@ fn test_eq_join() {
         }
         let mut c: *mut *mut libc::c_int = &mut y;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[7].var_ty, x[3]);
             assert_eq!(t[8].var_ty, x[3]);
             assert_eq!(t[13].var_ty, x[3]);
@@ -340,12 +354,87 @@ fn test_eq_deref() {
         let mut z: *mut *mut libc::c_int = &mut y;
         let mut w: *mut libc::c_int = *z;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[4].var_ty, x[2]);
             assert_eq!(t[5].var_ty, x[2]);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[6].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_deref_bot() {
+    // _1 = const 0_usize as *mut *mut i32 (PointerFromExposedAddress)
+    // _2 = (*_1)
+    // _3 = const 0_i32
+    // _5 = &mut _3
+    // _4 = &raw mut (*_5)
+    // _2 = move _4
+    // _6 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _8 = &mut _6
+    // _7 = &raw mut (*_8)
+    // _1 = move _7
+    analyze_fn(
+        "
+        let mut y: *mut *mut libc::c_int = 0 as *mut *mut libc::c_int;
+        let mut x: *mut libc::c_int = *y;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        x = &mut z;
+        let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
+        y = &mut w;
+        ",
+        |x, t, _| {
+            assert_eq!(t[1].var_ty, x[6]);
+            assert_eq!(t[7].var_ty, x[6]);
+            assert_eq!(t[8].var_ty, x[6]);
+
+            assert_eq!(t[2].var_ty, x[3]);
+            assert_eq!(t[4].var_ty, x[3]);
+            assert_eq!(t[5].var_ty, x[3]);
+            assert_eq!(t[6].var_ty, x[3]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_deref_pending() {
+    // _1 = const 0_usize as *mut *mut i32 (PointerFromExposedAddress)
+    // _2 = const 0_usize as *mut *mut i32 (PointerFromExposedAddress)
+    // _3 = _1
+    // _2 = move _3
+    // _4 = (*_1)
+    // _5 = const 0_i32
+    // _7 = &mut _5
+    // _6 = &raw mut (*_7)
+    // _4 = move _6
+    // _8 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _10 = &mut _8
+    // _9 = &raw mut (*_10)
+    // _1 = move _9
+    analyze_fn(
+        "
+        let mut y1: *mut *mut libc::c_int = 0 as *mut *mut libc::c_int;
+        let mut y2: *mut *mut libc::c_int = 0 as *mut *mut libc::c_int;
+        y2 = y1;
+        let mut x: *mut libc::c_int = *y1;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        x = &mut z;
+        let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
+        y1 = &mut w;
+        ",
+        |x, t, _| {
+            assert_eq!(t[1].var_ty, x[8]);
+            assert_eq!(t[2].var_ty, x[8]);
+            assert_eq!(t[3].var_ty, x[8]);
+            assert_eq!(t[9].var_ty, x[8]);
+            assert_eq!(t[10].var_ty, x[8]);
+
+            assert_eq!(t[4].var_ty, x[5]);
+            assert_eq!(t[6].var_ty, x[5]);
+            assert_eq!(t[7].var_ty, x[5]);
+            assert_eq!(t[8].var_ty, x[5]);
         },
     );
 }
@@ -367,12 +456,226 @@ fn test_deref_eq() {
         let mut w: *mut libc::c_int = &mut z;
         *y = w;
         ",
-        |x, t| {
+        |x, t, _| {
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[1].var_ty, x[4]);
             assert_eq!(t[5].var_ty, x[4]);
             assert_eq!(t[6].var_ty, x[4]);
+        },
+    );
+}
+
+#[test]
+fn test_deref_eq_bot() {
+    // _1 = const 0_usize as *mut *mut i32 (PointerFromExposedAddress)
+    // _2 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _3 = _2
+    // (*_1) = move _3
+    // _4 = const 0_i32
+    // _6 = &mut _4
+    // _5 = &raw mut (*_6)
+    // _2 = move _5
+    // _7 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _9 = &mut _7
+    // _8 = &raw mut (*_9)
+    // _1 = move _8
+    analyze_fn(
+        "
+        let mut x: *mut *mut libc::c_int = 0 as *mut *mut libc::c_int;
+        let mut y: *mut libc::c_int = 0 as *mut libc::c_int;
+        *x = y;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        y = &mut z;
+        let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
+        x = &mut w;
+        ",
+        |x, t, _| {
+            assert_eq!(t[8].var_ty, x[7]);
+            assert_eq!(t[9].var_ty, x[7]);
+            assert_eq!(t[1].var_ty, x[7]);
+
+            assert_eq!(t[2].var_ty, x[4]);
+            assert_eq!(t[3].var_ty, x[4]);
+            assert_eq!(t[5].var_ty, x[4]);
+            assert_eq!(t[6].var_ty, x[4]);
+            assert_eq!(t[7].var_ty, x[4]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_alloc() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _6 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _5 = move _6 as u64 (IntToInt)
+    // _4 = malloc(move _5) -> [return: bb2, unwind continue]
+    // _2 = move _4 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut x: *mut libc::c_int = &mut y;
+        x = malloc(::std::mem::size_of::<libc::c_int>() as libc::c_ulong)
+            as *mut libc::c_int;
+        ",
+        |x, t, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_alloc_bot() {
+    // _4 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _3 = move _4 as u64 (IntToInt)
+    // _2 = malloc(move _3) -> [return: bb2, unwind continue]
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = malloc(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        let mut y: *mut libc::c_int = x;
+        ",
+        |_, t, _| {
+            assert_eq!(t[1].var_ty, t[2].var_ty);
+        },
+    );
+}
+
+#[test]
+fn test_eq_add() {
+    // _3 = const 0_i32
+    // _2 = move _3 as i8 (IntToInt)
+    // _5 = const 0_i32
+    // _4 = move _5 as i8 (IntToInt)
+    // _1 = [move _2, move _4]
+    // _8 = &mut _1
+    // _7 = move _8 as &mut [i8] (PointerCoercion(Unsize))
+    // _6 = core::slice::<impl [i8]>::as_mut_ptr(move _7) -> [return: bb1, unwind continue]
+    // _10 = _6
+    // _9 = move _10 as i64 (PointerExposeAddress)
+    // _13 = const 1_i32
+    // _12 = move _13 as i64 (IntToInt)
+    // _11 = Add(_9, move _12)
+    // _14 = _11 as *mut i8 (PointerFromExposedAddress)
+    analyze_fn(
+        "
+        let mut x: [libc::c_char; 2] = [
+            0 as libc::c_int as libc::c_char,
+            0 as libc::c_int as libc::c_char,
+        ];
+        let mut y: *mut libc::c_char = x.as_mut_ptr();
+        let mut z: libc::c_long = y as libc::c_long;
+        let mut w: libc::c_long = z + 1 as libc::c_int as libc::c_long;
+        let mut v: *mut libc::c_char = w as *mut libc::c_char;
+        ",
+        |x, t, _| {
+            assert_eq!(t[6].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+            assert_eq!(t[8].var_ty, x[1]);
+            assert_eq!(t[9].var_ty, x[1]);
+            assert_eq!(t[10].var_ty, x[1]);
+            assert_eq!(t[11].var_ty, x[1]);
+            assert_eq!(t[14].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_eq() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _6 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _5 = Eq(_2, move _6)
+    // _4 = move _5 as i32 (IntToInt)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: libc::c_int = (y == 0 as *mut libc::c_int) as libc::c_int;
+        ",
+        |x, t, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_ne!(t[4].var_ty, x[1]);
+            assert_ne!(t[5].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_neg() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = _2 as i64 (PointerExposeAddress)
+    // _5 = Neg(_4)
+    // _6 = Neg(_5)
+    // _7 = _6 as *mut i32 (PointerFromExposedAddress)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: libc::c_long = y as libc::c_long;
+        let mut w: libc::c_long = -z;
+        let mut v: libc::c_long = -w;
+        let mut u: *mut libc::c_int = v as *mut libc::c_int;
+        ",
+        |x, t, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(t[6].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_not() {
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: libc::c_long = y as libc::c_long;
+        let mut w: libc::c_long = -z;
+        let mut v: libc::c_long = -w;
+        let mut u: *mut libc::c_int = v as *mut libc::c_int;
+        ",
+        |x, t, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(t[6].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_static() {
+    // _3 = const {alloc1: *mut i32}
+    // _2 = &mut (*_3)
+    // _1 = &raw mut (*_2)
+    analyze_fn(
+        "
+        static mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        ",
+        |_, t, tcx| {
+            let (def_id, _) = find_item("x", tcx);
+            let x_id = VarId::Global(def_id);
+            assert_eq!(t[1].var_ty, x_id);
+            assert_eq!(t[2].var_ty, x_id);
+            assert_eq!(t[3].var_ty, x_id);
         },
     );
 }

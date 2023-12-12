@@ -8,13 +8,13 @@ use etrace::some_or;
 use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, Scalar},
-        ConstantKind, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        interpret::{ConstValue, GlobalAlloc, Scalar},
+        BinOp, ConstantKind, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::TyCtxt,
+    ty::{TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{DefId, LocalDefId};
 use typed_arena::Arena;
 
 use crate::*;
@@ -67,7 +67,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
     for item_id in hir.items() {
         let item = hir.item(item_id);
-        if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
+        // if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
+        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
             continue;
         }
 
@@ -435,14 +436,18 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         let l_id = VarId::Local(func, l.local.as_u32());
         let l_deref = l.is_indirect_first_projection();
         match r {
-            Rvalue::Use(r) | Rvalue::Repeat(r, _) | Rvalue::Cast(_, r, _) => {
-                self.transfer_operand(func, l_id, l_deref, r)
-            }
+            Rvalue::Use(r)
+            | Rvalue::Repeat(r, _)
+            | Rvalue::Cast(_, r, _)
+            | Rvalue::UnaryOp(_, r) => self.transfer_operand(func, l_id, l_deref, r),
             Rvalue::Ref(_, _, r) => {
                 assert!(!l_deref);
-                assert!(!r.is_indirect_first_projection());
                 let r_id = VarId::Local(func, r.local.as_u32());
-                self.x_eq_ref_y(l_id, r_id);
+                if r.is_indirect_first_projection() {
+                    self.x_eq_y(l_id, r_id);
+                } else {
+                    self.x_eq_ref_y(l_id, r_id);
+                }
             }
             Rvalue::ThreadLocalRef(_) => unreachable!(),
             Rvalue::AddressOf(_, r) => {
@@ -452,19 +457,21 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.x_eq_y(l_id, r_id);
             }
             Rvalue::Len(_) => unreachable!(),
-            Rvalue::BinaryOp(_, box (_, _)) => {
-                todo!();
-            }
-            Rvalue::CheckedBinaryOp(_, box (_, _)) => {
-                todo!();
+            Rvalue::BinaryOp(op, box (r1, r2)) | Rvalue::CheckedBinaryOp(op, box (r1, r2)) => {
+                if !matches!(
+                    op,
+                    BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
+                ) {
+                    self.transfer_operand(func, l_id, l_deref, r1);
+                    self.transfer_operand(func, l_id, l_deref, r2);
+                }
             }
             Rvalue::NullaryOp(_, _) => unreachable!(),
-            Rvalue::UnaryOp(_, _) => {
-                todo!();
-            }
             Rvalue::Discriminant(_) => unreachable!(),
-            Rvalue::Aggregate(box _, _) => {
-                todo!();
+            Rvalue::Aggregate(box _, rs) => {
+                for r in rs {
+                    self.transfer_operand(func, l_id, l_deref, r);
+                }
             }
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(_) => {
@@ -497,7 +504,13 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 ConstantKind::Val(value, _) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => {}
-                        Scalar::Ptr(_, _) => unreachable!(),
+                        Scalar::Ptr(ptr, _) => {
+                            let alloc = self.tcx.global_alloc(ptr.provenance);
+                            let GlobalAlloc::Static(def_id) = alloc else { unreachable!() };
+                            let r_id = VarId::Global(def_id.as_local().unwrap());
+                            assert!(!l_deref);
+                            self.x_eq_ref_y(l_id, r_id);
+                        }
                     },
                     ConstValue::ZeroSized => unreachable!(),
                     ConstValue::Slice { .. } => unreachable!(),
@@ -517,6 +530,9 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         else {
             return;
         };
+        assert!(!destination.is_indirect_first_projection());
+        let d_id = VarId::Local(caller, destination.local.as_u32());
+
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
                 assert!(!func.is_indirect_first_projection());
@@ -545,16 +561,52 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     }
                 }
 
-                assert!(!destination.is_indirect_first_projection());
-                let d_id = VarId::Local(caller, destination.local.as_u32());
                 let (vt, ft) = self.variable_type(d_id);
                 self.var_cond_join(ret.var_ty, vt);
                 self.fn_cond_join(ret.fn_ty, ft);
             }
-            Operand::Constant(box _) => {
-                todo!();
-            }
+            Operand::Constant(box constant) => match constant.literal {
+                ConstantKind::Ty(_) => unreachable!(),
+                ConstantKind::Unevaluated(_, _) => unreachable!(),
+                ConstantKind::Val(value, ty) => match value {
+                    ConstValue::Scalar(_) => unreachable!(),
+                    ConstValue::ZeroSized => {
+                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let name = self.def_id_to_string(*def_id);
+                        let mut segs: Vec<_> = name.split("::").collect();
+                        let seg0 = segs.pop().unwrap_or_default();
+                        let seg1 = segs.pop().unwrap_or_default();
+                        let seg2 = segs.pop().unwrap_or_default();
+                        let seg3 = segs.pop().unwrap_or_default();
+                        if def_id.is_local() {
+                            if seg1.contains("{extern#") {
+                                match seg0 {
+                                    "malloc" => self.x_eq_alloc(d_id),
+                                    _ => panic!("{}", seg0),
+                                }
+                            } else {
+                                panic!("{}", name);
+                            }
+                        } else {
+                            match (seg3, seg2, seg1, seg0) {
+                                (_, _, "mem", "size_of" | "align_of") => {}
+                                (_, "slice", _, "as_mut_ptr") => {
+                                    let a = &args[0];
+                                    self.transfer_operand(caller, d_id, false, a);
+                                }
+                                _ => panic!("{}", name),
+                            }
+                        }
+                    }
+                    ConstValue::Slice { .. } => unreachable!(),
+                    ConstValue::ByRef { .. } => unreachable!(),
+                },
+            },
         }
+    }
+
+    fn def_id_to_string(&self, def_id: DefId) -> String {
+        self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
 
     fn get_results(&self) -> AnalysisResults {
@@ -666,8 +718,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         }
     }
 
-    #[allow(dead_code)]
-    fn x_eq_allocate(&mut self, x: VarId) {
+    fn x_eq_alloc(&mut self, x: VarId) {
         let (vt1, _) = self.variable_type(x);
         if self.var_type(vt1).is_bot() {
             self.allocate(vt1);
@@ -741,11 +792,6 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     #[inline]
     fn var_join(&mut self, e1: VarId, e2: VarId) {
         self.var_ecrs.join(e1, e2, &mut self.fn_ecrs);
-    }
-
-    #[inline]
-    fn fn_join(&mut self, e1: FnId, e2: FnId) {
-        self.fn_ecrs.join(e1, e2, &mut self.var_ecrs);
     }
 }
 
