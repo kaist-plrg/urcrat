@@ -507,7 +507,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
                 ConstantKind::Unevaluated(_, _) => unreachable!(),
-                ConstantKind::Val(value, _) => match value {
+                ConstantKind::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => {}
                         Scalar::Ptr(ptr, _) => {
@@ -518,7 +518,12 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                             self.x_eq_ref_y(l_id, r_id);
                         }
                     },
-                    ConstValue::ZeroSized => unreachable!(),
+                    ConstValue::ZeroSized => {
+                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let r_id = VarId::Global(def_id.as_local().unwrap());
+                        assert!(!l_deref);
+                        self.x_eq_y(l_id, r_id);
+                    }
                     ConstValue::Slice { .. } => unreachable!(),
                     ConstValue::ByRef { .. } => unreachable!(),
                 },
@@ -615,7 +620,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     ) {
         match name {
             (_, _, "mem", "size_of" | "align_of") => {}
-            (_, "slice", _, "as_mut_ptr") => {
+            (_, "slice", _, "as_mut_ptr") | ("", "option", _, "unwrap") => {
                 let a = &args[0];
                 self.transfer_operand(caller, dst, false, a);
             }

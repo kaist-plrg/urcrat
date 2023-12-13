@@ -740,10 +740,10 @@ fn test_fn_arg() {
         ",
         |x, t, res, tcx| {
             let (def_id, _) = find_item("g", tcx);
-            let gx = VarId::Local(def_id, 1);
+            let g1 = VarId::Local(def_id, 1);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
-            assert_eq!(res.var_ty(gx).var_ty, x[1]);
+            assert_eq!(res.var_ty(g1).var_ty, x[1]);
         },
     );
 }
@@ -768,13 +768,124 @@ fn test_fn_ret() {
         ",
         |x, t, res, tcx| {
             let (def_id, _) = find_item("g", tcx);
-            let gx0 = VarId::Local(def_id, 0);
-            let gx1 = VarId::Local(def_id, 1);
+            let g0 = VarId::Local(def_id, 0);
+            let g1 = VarId::Local(def_id, 1);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
-            assert_eq!(res.var_ty(gx0).var_ty, x[1]);
-            assert_eq!(res.var_ty(gx1).var_ty, x[1]);
+            assert_eq!(res.var_ty(g0).var_ty, x[1]);
+            assert_eq!(res.var_ty(g1).var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_fn_ptr() {
+    // g
+    // _0 = _1
+    //
+    // f
+    // _2 = foo::g as fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _1 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _2)
+    // _3 = const 0_i32
+    // _5 = std::option::Option::<fn(*mut i32) -> *mut i32>::unwrap(_1) -> [return: bb1, unwind continue]
+    // _7 = &mut _3
+    // _6 = &raw mut (*_7)
+    // _4 = move _5(move _6) -> [return: bb2, unwind continue]
+    analyze_fn(
+        "
+        fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return x;
+        }
+        let mut h: Option::<fn(*mut libc::c_int) -> *mut libc::c_int> = Some(
+            g as fn(*mut libc::c_int) -> *mut libc::c_int,
+        );
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = h.unwrap()(&mut x);
+        ",
+        |x, t, res, tcx| {
+            let (def_id, _) = find_item("g", tcx);
+            let g = VarId::Global(def_id);
+            let tg = res.var_ty(g);
+            let g0 = VarId::Local(def_id, 0);
+            let g1 = VarId::Local(def_id, 1);
+            assert_eq!(t[1].fn_ty, tg.fn_ty);
+            assert_eq!(t[2].fn_ty, tg.fn_ty);
+            assert_eq!(t[5].fn_ty, tg.fn_ty);
+            assert_eq!(t[4].var_ty, x[3]);
+            assert_eq!(t[6].var_ty, x[3]);
+            assert_eq!(t[7].var_ty, x[3]);
+            assert_eq!(res.var_ty(g0).var_ty, x[3]);
+            assert_eq!(res.var_ty(g1).var_ty, x[3]);
+        },
+    );
+}
+
+#[test]
+fn test_fn_ptrs() {
+    // g
+    // _0 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    //
+    // h
+    // _0 = _1
+    //
+    // f
+    // _1 = const 0_i32
+    // _3 = _1
+    // _4 = foo::g as fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _4)
+    // _5 = foo::h as fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _5)
+    // _8 = &mut _1
+    // _7 = &raw mut (*_8)
+    // _6 = foo::g(move _7) -> [return: bb4, unwind continue]
+    analyze_fn(
+        "
+        fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return 0 as *mut libc::c_int;
+        }
+        fn h(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return x;
+        }
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut i: Option::<fn(*mut libc::c_int) -> *mut libc::c_int> = if x
+            != 0
+        {
+            Some(g as fn(*mut libc::c_int) -> *mut libc::c_int)
+        } else {
+            Some(h as fn(*mut libc::c_int) -> *mut libc::c_int)
+        };
+        let mut y: *mut libc::c_int = g(&mut x);
+        ",
+        |x, t, res, tcx| {
+            let (def_id, _) = find_item("g", tcx);
+            let g = VarId::Global(def_id);
+            let tg = res.var_ty(g);
+            let g0 = VarId::Local(def_id, 0);
+            let tg0 = res.var_ty(g0);
+            let g1 = VarId::Local(def_id, 1);
+            let tg1 = res.var_ty(g1);
+
+            let (def_id, _) = find_item("h", tcx);
+            let h = VarId::Global(def_id);
+            let th = res.var_ty(h);
+            let h0 = VarId::Local(def_id, 0);
+            let th0 = res.var_ty(h0);
+            let h1 = VarId::Local(def_id, 1);
+            let th1 = res.var_ty(h1);
+
+            assert_eq!(t[6].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+            assert_eq!(t[8].var_ty, x[1]);
+            assert_eq!(tg0.var_ty, x[1]);
+            assert_eq!(tg1.var_ty, x[1]);
+            assert_eq!(th0.var_ty, x[1]);
+            assert_eq!(th1.var_ty, x[1]);
+
+            assert_eq!(t[2].fn_ty, tg.fn_ty);
+            assert_eq!(t[4].fn_ty, tg.fn_ty);
+            assert_eq!(t[5].fn_ty, tg.fn_ty);
+            assert_eq!(th.fn_ty, tg.fn_ty);
         },
     );
 }
