@@ -503,8 +503,10 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 }
             }
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
-            Rvalue::CopyForDeref(_) => {
-                todo!();
+            Rvalue::CopyForDeref(r) => {
+                assert!(r.is_indirect_first_projection());
+                let r_id = VarId::Local(func, r.local.as_u32());
+                self.x_eq_deref_y(l_id, r_id);
             }
         }
     }
@@ -624,12 +626,19 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         let ret = *ret;
 
         for (p, a) in params.clone().into_iter().zip(args) {
-            let (Operand::Copy(a) | Operand::Move(a)) = a else { unreachable!() };
-            assert!(!a.is_indirect_first_projection());
-            let a_id = VarId::Local(caller, a.local.as_u32());
-            let (vt, ft) = self.variable_type(a_id);
-            self.var_cond_join(p.var_ty, vt);
-            self.fn_cond_join(p.fn_ty, ft);
+            match a {
+                Operand::Copy(a) | Operand::Move(a) => {
+                    assert!(!a.is_indirect_first_projection());
+                    let a_id = VarId::Local(caller, a.local.as_u32());
+                    let (vt, ft) = self.variable_type(a_id);
+                    self.var_cond_join(p.var_ty, vt);
+                    self.fn_cond_join(p.fn_ty, ft);
+                }
+                Operand::Constant(box constant) => {
+                    let ConstantKind::Unevaluated(_, ty) = constant.literal else { unreachable!() };
+                    assert!(ty.is_primitive());
+                }
+            }
         }
 
         let (vt, ft) = self.variable_type(dst);
@@ -683,9 +692,15 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         }
         match name {
             (_, "slice", _, "as_ptr" | "as_mut_ptr")
-            | ("ptr", _, _, "offset")
+            | ("ptr", _, _, "offset" | "offset_from")
             | ("", "option", _, "unwrap") => {
                 self.transfer_operand(caller, dst, false, &args[0]);
+            }
+            ("", "", "ptr", "write_volatile") => {
+                let l = args[0].place().unwrap();
+                assert!(!l.is_indirect_first_projection());
+                let l_id = VarId::Local(caller, l.local.as_u32());
+                self.transfer_operand(caller, l_id, true, &args[1]);
             }
             _ => tracing::info!("{:?}", name),
         }

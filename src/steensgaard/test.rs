@@ -998,3 +998,77 @@ fn test_offset() {
         },
     );
 }
+
+#[test]
+fn test_copy_for_deref() {
+    // _1 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _5 = &mut _2
+    // _4 = &raw mut (*_5)
+    // _6 = const 0_i32
+    // _8 = &mut _6
+    // _7 = &raw mut (*_8)
+    // _9 = deref_copy (*_4)
+    // (*_9) = move _7
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = 0 as *mut libc::c_int;
+        let mut y: *mut *mut libc::c_int = &mut x;
+        let mut z: *mut *mut *mut libc::c_int = &mut y;
+        let mut w: libc::c_int = 0 as libc::c_int;
+        **z = &mut w;
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[4].var_ty, x[2]);
+            assert_eq!(t[5].var_ty, x[2]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[9].var_ty, x[1]);
+
+            assert_eq!(t[1].var_ty, x[6]);
+            assert_eq!(t[7].var_ty, x[6]);
+            assert_eq!(t[8].var_ty, x[6]);
+        },
+    );
+}
+
+#[test]
+fn test_write_volatile() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = _2 as i64 (PointerExposeAddress)
+    // _6 = &mut _4
+    // _5 = &raw mut (*_6)
+    // _8 = const 0_i32
+    // _7 = move _8 as i64 (IntToInt)
+    // _11 = &mut _7
+    // _10 = &raw mut (*_11)
+    // _12 = (*_5)
+    // _9 = std::ptr::write_volatile::<i64>(move _10, move _12)
+    analyze_fn(
+        "
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: *mut libc::c_int = &mut z;
+        let mut v: libc::c_long = w as libc::c_long;
+        let mut y: *mut libc::c_long = &mut v;
+        let mut x: libc::c_long = 0 as libc::c_int as libc::c_long;
+        ::std::ptr::write_volatile(&mut x as *mut libc::c_long, *y);
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[5].var_ty, x[4]);
+            assert_eq!(t[6].var_ty, x[4]);
+
+            assert_eq!(t[10].var_ty, x[7]);
+            assert_eq!(t[11].var_ty, x[7]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+            assert_eq!(t[12].var_ty, x[1]);
+        },
+    );
+}
