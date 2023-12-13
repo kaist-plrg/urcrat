@@ -438,6 +438,11 @@ impl AnalysisResults {
     }
 
     #[inline]
+    pub fn global(&self, f: LocalDefId) -> VarId {
+        self.vars[&VarId::Global(f)]
+    }
+
+    #[inline]
     pub fn var_ty(&self, id: VarId) -> Type {
         let VarType::Ref(ty) = self.var_tys[&id] else { panic!() };
         ty
@@ -635,8 +640,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     self.fn_cond_join(p.fn_ty, ft);
                 }
                 Operand::Constant(box constant) => {
-                    let ConstantKind::Unevaluated(_, ty) = constant.literal else { unreachable!() };
-                    assert!(ty.is_primitive());
+                    assert!(constant.ty().is_primitive());
                 }
             }
         }
@@ -693,6 +697,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         match name {
             (_, "slice", _, "as_ptr" | "as_mut_ptr")
             | ("ptr", _, _, "offset" | "offset_from")
+            | ("ops", "deref", _, "deref" | "deref_mut")
             | ("", "option", _, "unwrap") => {
                 self.transfer_operand(caller, dst, false, &args[0]);
             }
@@ -701,6 +706,14 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 assert!(!l.is_indirect_first_projection());
                 let l_id = VarId::Local(caller, l.local.as_u32());
                 self.transfer_operand(caller, l_id, true, &args[1]);
+            }
+            ("", "clone", "Clone", "clone")
+            | ("", "ffi", _, "as_va_list")
+            | ("", "ffi", _, "arg") => {
+                let a = args[0].place().unwrap();
+                assert!(!a.is_indirect_first_projection());
+                let a_id = VarId::Local(caller, a.local.as_u32());
+                self.x_eq_deref_y(dst, a_id);
             }
             _ => tracing::info!("{:?}", name),
         }

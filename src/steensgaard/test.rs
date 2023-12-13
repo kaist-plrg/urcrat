@@ -3,31 +3,49 @@ use super::*;
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, f);
+    compile_util::run_compiler(config, f).unwrap();
 }
 
-fn analyze_fn<F>(code: &str, f: F)
+fn analyze_fn_with_params<F>(params: &str, code: &str, f: F)
 where F: FnOnce(Vec<VarId>, Vec<Type>, AnalysisResults, TyCtxt<'_>) + Send {
     let name = "foo";
     let code = format!(
         "
+        #![feature(c_variadic)]
         extern crate libc;
         extern \"C\" {{
             fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
         }}
-        unsafe fn {}() {{
+        unsafe extern \"C\" fn {}({}) {{
             {}
         }}
     ",
-        name, code
+        name, params, code
     );
     run_compiler(&code, |tcx| {
         let res = analyze(tcx);
-        let (def_id, n) = find_item(name, tcx);
-        let x: Vec<_> = (0..n).map(|i| res.local(def_id, i)).collect();
-        let t: Vec<_> = x.iter().map(|x| res.var_ty(*x)).collect();
+        let (x, t) = get_xts(name, &res, tcx);
         f(x, t, res, tcx);
     });
+}
+
+fn get_xt(name: &str, res: &AnalysisResults, tcx: TyCtxt<'_>) -> (VarId, Type) {
+    let (def_id, _) = find_item(name, tcx);
+    let x = res.global(def_id);
+    let t = res.var_ty(x);
+    (x, t)
+}
+
+fn get_xts(name: &str, res: &AnalysisResults, tcx: TyCtxt<'_>) -> (Vec<VarId>, Vec<Type>) {
+    let (def_id, n) = find_item(name, tcx);
+    let x: Vec<_> = (0..n).map(|i| res.local(def_id, i)).collect();
+    let t = x.iter().map(|x| res.var_ty(*x)).collect();
+    (x, t)
+}
+
+fn analyze_fn<F>(code: &str, f: F)
+where F: FnOnce(Vec<VarId>, Vec<Type>, AnalysisResults, TyCtxt<'_>) + Send {
+    analyze_fn_with_params("", code, f);
 }
 
 fn find_item(name: &str, tcx: TyCtxt<'_>) -> (LocalDefId, u32) {
@@ -777,13 +795,11 @@ fn test_static_eq() {
         x = &mut y;
         ",
         |x, t, res, tcx| {
-            let (def_id, _) = find_item("x", tcx);
-            let x_id = VarId::Global(def_id);
-            let x_ty = res.var_ty(x_id);
-            assert_eq!(t[4].var_ty, x_id);
+            let (xx, xt) = get_xt("x", &res, tcx);
+            assert_eq!(t[4].var_ty, xx);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
-            assert_eq!(x_ty.var_ty, x[1]);
+            assert_eq!(xt.var_ty, x[1]);
         },
     );
 }
@@ -798,12 +814,9 @@ fn test_static2() {
         };
         ",
         |_, _, res, tcx| {
-            let (def_id, _) = find_item("x", tcx);
-            let x_id = VarId::Global(def_id);
-            let (def_id, _) = find_item("y", tcx);
-            let y_id = VarId::Global(def_id);
-            let y_ty = res.var_ty(y_id);
-            assert_eq!(y_ty.var_ty, x_id);
+            let (xx, _) = get_xt("x", &res, tcx);
+            let (_, yt) = get_xt("y", &res, tcx);
+            assert_eq!(yt.var_ty, xx);
         },
     );
 }
@@ -821,11 +834,10 @@ fn test_fn_arg() {
         g(&mut x);
         ",
         |x, t, res, tcx| {
-            let (def_id, _) = find_item("g", tcx);
-            let g1 = VarId::Local(def_id, 1);
+            let (_, gt) = get_xts("g", &res, tcx);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
-            assert_eq!(res.var_ty(g1).var_ty, x[1]);
+            assert_eq!(gt[1].var_ty, x[1]);
         },
     );
 }
@@ -849,14 +861,12 @@ fn test_fn_ret() {
         let mut y: *mut libc::c_int = g(&mut x);
         ",
         |x, t, res, tcx| {
-            let (def_id, _) = find_item("g", tcx);
-            let g0 = VarId::Local(def_id, 0);
-            let g1 = VarId::Local(def_id, 1);
+            let (_, gt) = get_xts("g", &res, tcx);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
-            assert_eq!(res.var_ty(g0).var_ty, x[1]);
-            assert_eq!(res.var_ty(g1).var_ty, x[1]);
+            assert_eq!(gt[0].var_ty, x[1]);
+            assert_eq!(gt[1].var_ty, x[1]);
         },
     );
 }
@@ -886,19 +896,16 @@ fn test_fn_ptr() {
         let mut y: *mut libc::c_int = h.unwrap()(&mut x);
         ",
         |x, t, res, tcx| {
-            let (def_id, _) = find_item("g", tcx);
-            let g = VarId::Global(def_id);
-            let tg = res.var_ty(g);
-            let g0 = VarId::Local(def_id, 0);
-            let g1 = VarId::Local(def_id, 1);
-            assert_eq!(t[1].fn_ty, tg.fn_ty);
-            assert_eq!(t[2].fn_ty, tg.fn_ty);
-            assert_eq!(t[5].fn_ty, tg.fn_ty);
+            let (_, gt) = get_xt("g", &res, tcx);
+            let (_, gts) = get_xts("g", &res, tcx);
+            assert_eq!(t[1].fn_ty, gt.fn_ty);
+            assert_eq!(t[2].fn_ty, gt.fn_ty);
+            assert_eq!(t[5].fn_ty, gt.fn_ty);
             assert_eq!(t[4].var_ty, x[3]);
             assert_eq!(t[6].var_ty, x[3]);
             assert_eq!(t[7].var_ty, x[3]);
-            assert_eq!(res.var_ty(g0).var_ty, x[3]);
-            assert_eq!(res.var_ty(g1).var_ty, x[3]);
+            assert_eq!(gts[0].var_ty, x[3]);
+            assert_eq!(gts[1].var_ty, x[3]);
         },
     );
 }
@@ -940,34 +947,23 @@ fn test_fn_ptrs() {
         let mut y: *mut libc::c_int = g(&mut x);
         ",
         |x, t, res, tcx| {
-            let (def_id, _) = find_item("g", tcx);
-            let g = VarId::Global(def_id);
-            let tg = res.var_ty(g);
-            let g0 = VarId::Local(def_id, 0);
-            let tg0 = res.var_ty(g0);
-            let g1 = VarId::Local(def_id, 1);
-            let tg1 = res.var_ty(g1);
-
-            let (def_id, _) = find_item("h", tcx);
-            let h = VarId::Global(def_id);
-            let th = res.var_ty(h);
-            let h0 = VarId::Local(def_id, 0);
-            let th0 = res.var_ty(h0);
-            let h1 = VarId::Local(def_id, 1);
-            let th1 = res.var_ty(h1);
+            let (_, gt) = get_xt("g", &res, tcx);
+            let (_, gts) = get_xts("g", &res, tcx);
+            let (_, ht) = get_xt("h", &res, tcx);
+            let (_, hts) = get_xts("h", &res, tcx);
 
             assert_eq!(t[6].var_ty, x[1]);
             assert_eq!(t[7].var_ty, x[1]);
             assert_eq!(t[8].var_ty, x[1]);
-            assert_eq!(tg0.var_ty, x[1]);
-            assert_eq!(tg1.var_ty, x[1]);
-            assert_eq!(th0.var_ty, x[1]);
-            assert_eq!(th1.var_ty, x[1]);
+            assert_eq!(gts[0].var_ty, x[1]);
+            assert_eq!(gts[1].var_ty, x[1]);
+            assert_eq!(hts[0].var_ty, x[1]);
+            assert_eq!(hts[1].var_ty, x[1]);
 
-            assert_eq!(t[2].fn_ty, tg.fn_ty);
-            assert_eq!(t[4].fn_ty, tg.fn_ty);
-            assert_eq!(t[5].fn_ty, tg.fn_ty);
-            assert_eq!(th.fn_ty, tg.fn_ty);
+            assert_eq!(t[2].fn_ty, gt.fn_ty);
+            assert_eq!(t[4].fn_ty, gt.fn_ty);
+            assert_eq!(t[5].fn_ty, gt.fn_ty);
+            assert_eq!(ht.fn_ty, gt.fn_ty);
         },
     );
 }
@@ -1069,6 +1065,73 @@ fn test_write_volatile() {
             assert_eq!(t[4].var_ty, x[1]);
             assert_eq!(t[7].var_ty, x[1]);
             assert_eq!(t[12].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_variadic() {
+    // h
+    // _5 = &mut _1
+    // _4 = <std::ffi::VaList<'_, '_> as std::ops::DerefMut>::deref_mut(move _5)
+    // _3 = _4
+    // _2 = std::ffi::VaListImpl::<'_>::arg::<*mut i32>(move _3)
+    // _0 = _2
+    //
+    // g
+    // _9 = const false
+    // _5 = &_2
+    // _4 = <std::ffi::VaListImpl<'_> as std::clone::Clone>::clone(move _5)
+    // _9 = const true
+    // _3 = move _4
+    // _8 = &mut _3
+    // _7 = std::ffi::VaListImpl::<'_>::as_va_list(move _8)
+    // _6 = foo::g::h(move _7)
+    // _9 = const false
+    // _5 = &mut _1
+    //
+    // f
+    // _1 = const 0_i32
+    // _3 = const 0_i32
+    // _5 = &mut _1
+    // _4 = &raw mut (*_5)
+    // _2 = foo::g(move _3, move _4)
+    analyze_fn(
+        "
+        unsafe extern \"C\" fn g(mut x: libc::c_int, mut args: ...) {
+            unsafe fn h(mut y: ::std::ffi::VaList) -> *mut libc::c_int {
+                let mut z: *mut libc::c_int = y.arg::<*mut libc::c_int>();
+                return z;
+            }
+            let mut y: ::std::ffi::VaListImpl;
+            y = args.clone();
+            let mut z: *mut libc::c_int = h(y.as_va_list());
+        }
+        let mut x: libc::c_int = 0 as libc::c_int;
+        g(0 as libc::c_int, &mut x as *mut libc::c_int);
+        ",
+        |fx, ft, res, tcx| {
+            let (gx, gt) = get_xts("g", &res, tcx);
+            let (hx, ht) = get_xts("h", &res, tcx);
+
+            assert_eq!(ht[3].var_ty, hx[1]);
+            assert_eq!(ht[4].var_ty, hx[1]);
+            assert_eq!(ht[5].var_ty, hx[1]);
+
+            assert_eq!(gt[8].var_ty, gx[3]);
+
+            assert_eq!(gt[5].var_ty, gx[2]);
+
+            assert_eq!(ft[4].var_ty, fx[1]);
+            assert_eq!(ft[5].var_ty, fx[1]);
+            assert_eq!(gt[2].var_ty, fx[1]);
+            assert_eq!(gt[3].var_ty, fx[1]);
+            assert_eq!(gt[4].var_ty, fx[1]);
+            assert_eq!(gt[6].var_ty, fx[1]);
+            assert_eq!(gt[7].var_ty, fx[1]);
+            assert_eq!(ht[0].var_ty, fx[1]);
+            assert_eq!(ht[1].var_ty, fx[1]);
+            assert_eq!(ht[2].var_ty, fx[1]);
         },
     );
 }
