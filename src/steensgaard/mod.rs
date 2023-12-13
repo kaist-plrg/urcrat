@@ -586,23 +586,17 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         let ret = *ret;
 
         for (p, a) in params.clone().into_iter().zip(args) {
-            match a {
-                Operand::Copy(a) | Operand::Move(a) => {
-                    assert!(!a.is_indirect_first_projection());
-                    let a_id = VarId::Local(caller, a.local.as_u32());
-                    let (vt, ft) = self.variable_type(a_id);
-                    self.var_cond_join(p.var_ty, vt);
-                    self.fn_cond_join(p.fn_ty, ft);
-                }
-                Operand::Constant(box _) => {
-                    todo!();
-                }
-            }
+            let (Operand::Copy(a) | Operand::Move(a)) = a else { unreachable!() };
+            assert!(!a.is_indirect_first_projection());
+            let a_id = VarId::Local(caller, a.local.as_u32());
+            let (vt, ft) = self.variable_type(a_id);
+            self.var_cond_join(p.var_ty, vt);
+            self.fn_cond_join(p.fn_ty, ft);
         }
 
         let (vt, ft) = self.variable_type(dst);
-        self.var_cond_join(ret.var_ty, vt);
-        self.fn_cond_join(ret.fn_ty, ft);
+        self.var_cond_join(vt, ret.var_ty);
+        self.fn_cond_join(ft, ret.fn_ty);
     }
 
     fn transfer_c_call(&mut self, name: &str, dst: VarId) {
