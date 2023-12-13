@@ -5,13 +5,13 @@ use std::{
 
 use disjoint_set::DisjointSet;
 use etrace::some_or;
-use rustc_hir::ItemKind;
+use rustc_hir::{ForeignItemKind, ItemKind};
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
         BinOp, ConstantKind, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
 use rustc_span::def_id::{DefId, LocalDefId};
@@ -41,9 +41,22 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
     for item_id in hir.items() {
         let item = hir.item(item_id);
+        if item.ident.name.as_str() == "main" {
+            continue;
+        }
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
         match item.kind {
+            ItemKind::ForeignMod { items, .. } => {
+                for item_ref in items {
+                    let item = hir.foreign_item(item_ref.id);
+                    if !matches!(item.kind, ForeignItemKind::Static(_, _)) {
+                        continue;
+                    }
+                    let id = VarId::Global(item.owner_id.def_id);
+                    analyzer.insert_and_allocate(id);
+                }
+            }
             ItemKind::Static(_, _, _) => {
                 let body = tcx.mir_for_ctfe(def_id);
                 let local_decls = body.local_decls.len();
@@ -77,6 +90,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
+            continue;
+        }
+        if item.ident.name.as_str() == "main" {
             continue;
         }
 
@@ -479,7 +495,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 }
             }
             Rvalue::NullaryOp(_, _) => unreachable!(),
-            Rvalue::Discriminant(_) => unreachable!(),
+            Rvalue::Discriminant(_) => {}
             Rvalue::Aggregate(box _, rs) => {
                 for r in rs {
                     self.transfer_operand(func, l_id, l_deref, r);
@@ -501,22 +517,28 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     (false, false) => self.x_eq_y(l_id, r_id),
                     (false, true) => self.x_eq_deref_y(l_id, r_id),
                     (true, false) => self.deref_x_eq_y(l_id, r_id),
-                    (true, true) => unreachable!(),
+                    (true, true) => self.deref_x_eq_deref_y(l_id, r_id),
                 }
             }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => unreachable!(),
+                ConstantKind::Unevaluated(_, ty) => {
+                    assert!(ty.is_primitive());
+                }
                 ConstantKind::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => {}
-                        Scalar::Ptr(ptr, _) => {
-                            let alloc = self.tcx.global_alloc(ptr.provenance);
-                            let GlobalAlloc::Static(def_id) = alloc else { unreachable!() };
-                            let r_id = VarId::Global(def_id.as_local().unwrap());
-                            assert!(!l_deref);
-                            self.x_eq_ref_y(l_id, r_id);
-                        }
+                        Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
+                            GlobalAlloc::Static(def_id) => {
+                                let r_id = VarId::Global(def_id.as_local().unwrap());
+                                assert!(!l_deref);
+                                self.x_eq_ref_y(l_id, r_id);
+                            }
+                            GlobalAlloc::Memory(_) => {
+                                self.x_eq_alloc(l_id);
+                            }
+                            _ => unreachable!(),
+                        },
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
@@ -560,15 +582,25 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let seg1 = segs.pop().unwrap_or_default();
                 let seg2 = segs.pop().unwrap_or_default();
                 let seg3 = segs.pop().unwrap_or_default();
+                let sig = self.tcx.fn_sig(def_id).skip_binder();
+                let inputs = sig.inputs().skip_binder();
+                let output = sig.output().skip_binder();
                 if let Some(local_def_id) = def_id.as_local() {
                     if seg1.contains("{extern#") {
-                        self.transfer_c_call(seg0, d_id);
+                        self.transfer_c_call(seg0, inputs, output, d_id);
                     } else {
                         let callee = VarId::Global(local_def_id);
                         self.transfer_intra_call(caller, callee, args, d_id);
                     }
                 } else {
-                    self.transfer_rust_call(caller, (seg3, seg2, seg1, seg0), args, d_id);
+                    self.transfer_rust_call(
+                        caller,
+                        (seg3, seg2, seg1, seg0),
+                        inputs,
+                        output,
+                        args,
+                        d_id,
+                    );
                 }
             }
         }
@@ -604,27 +636,35 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         self.fn_cond_join(ft, ret.fn_ty);
     }
 
-    fn transfer_c_call(&mut self, name: &str, dst: VarId) {
-        match name {
-            "malloc" => self.x_eq_alloc(dst),
-            _ => panic!("{}", name),
+    fn transfer_c_call(&mut self, name: &str, inputs: &[Ty<'_>], output: Ty<'_>, dst: VarId) {
+        if output.is_primitive() && inputs.iter().filter(|t| !t.is_primitive()).count() < 2 {
+            return;
         }
+        if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive()) {
+            self.x_eq_alloc(dst);
+            return;
+        }
+        tracing::info!("{}", name);
     }
 
     fn transfer_rust_call(
         &mut self,
         caller: LocalDefId,
         name: (&str, &str, &str, &str),
+        inputs: &[Ty<'_>],
+        output: Ty<'_>,
         args: &[Operand<'_>],
         dst: VarId,
     ) {
+        if output.is_primitive() && inputs.iter().filter(|t| !t.is_primitive()).count() < 2 {
+            return;
+        }
         match name {
-            (_, _, "mem", "size_of" | "align_of") => {}
             (_, "slice", _, "as_mut_ptr") | ("", "option", _, "unwrap") => {
                 let a = &args[0];
                 self.transfer_operand(caller, dst, false, a);
             }
-            _ => panic!("{:?}", name),
+            _ => tracing::info!("{:?}", name),
         }
     }
 
@@ -739,6 +779,13 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.fn_cond_join(ft3, ft2);
             }
         }
+    }
+
+    fn deref_x_eq_deref_y(&mut self, x: VarId, y: VarId) {
+        let z = VarId::Temp(self.get_id());
+        self.insert_and_allocate(z);
+        self.x_eq_deref_y(z, y);
+        self.deref_x_eq_y(x, z);
     }
 
     fn x_eq_alloc(&mut self, x: VarId) {

@@ -506,6 +506,26 @@ fn test_deref_eq_bot() {
 }
 
 #[test]
+fn test_deref_eq_deref() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = const 1_i32
+    // (*_2) = Add((*_2), move _4)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        *y += 1 as libc::c_int;
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
 fn test_eq_alloc() {
     // _1 = const 0_i32
     // _3 = &mut _1
@@ -544,6 +564,51 @@ fn test_eq_alloc_bot() {
         ",
         |_, t, _, _| {
             assert_eq!(t[1].var_ty, t[2].var_ty);
+        },
+    );
+}
+
+#[test]
+fn test_eq_bstr() {
+    // _2 = const 0_i32
+    // _1 = move _2 as i8 (IntToInt)
+    // _4 = &mut _1
+    // _3 = &raw const (*_4)
+    // _7 = const b"hello\x00"
+    // _6 = &raw const (*_7)
+    // _5 = move _6 as *const u8 (PointerCoercion(ArrayToPointer))
+    // _3 = move _5 as *const i8 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut y: libc::c_char = 0 as libc::c_int as libc::c_char;
+        let mut x: *const libc::c_char = &mut y;
+        x = b\"hello\\0\" as *const u8 as *const libc::c_char;
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(t[6].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_bstr_bot() {
+    // _4 = const b"hello\x00"
+    // _3 = &raw const (*_4)
+    // _2 = move _3 as *const u8 (PointerCoercion(ArrayToPointer))
+    // _1 = move _2 as *const i8 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *const libc::c_char = b\"hello\\0\" as *const u8 as *const libc::c_char;
+        let mut y: *const libc::c_char = x;
+        ",
+        |_, t, _, _| {
+            assert_eq!(t[1].var_ty, t[4].var_ty);
+            assert_eq!(t[2].var_ty, t[4].var_ty);
+            assert_eq!(t[3].var_ty, t[4].var_ty);
         },
     );
 }
@@ -677,6 +742,23 @@ fn test_eq_static() {
             assert_eq!(t[1].var_ty, x);
             assert_eq!(t[2].var_ty, x);
             assert_eq!(t[3].var_ty, x);
+        },
+    );
+}
+
+#[test]
+fn test_eq_extern_static() {
+    // _3 = const {alloc1: *mut i32}
+    // _2 = &mut (*_3)
+    // _1 = &raw mut (*_2)
+    analyze_fn(
+        "
+        extern \"C\" { static mut x: libc::c_int; }
+        let mut y: *mut libc::c_int = &mut x;
+        ",
+        |_, t, _, _| {
+            assert_eq!(t[1].var_ty, t[3].var_ty);
+            assert_eq!(t[2].var_ty, t[3].var_ty);
         },
     );
 }
