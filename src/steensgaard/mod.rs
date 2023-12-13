@@ -106,11 +106,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         };
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
-                println!("{:?}", stmt);
+                println!("{:?} {:?}", stmt, stmt.source_info.span);
                 analyzer.transfer_stmt(local_def_id, stmt);
             }
             if let Some(term) = &bbd.terminator {
-                println!("{:?}", term.kind);
+                println!("{:?} {:?}", term.kind, term.source_info.span);
                 analyzer.transfer_term(local_def_id, term);
             }
         }
@@ -534,9 +534,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, ty) => {
-                    assert!(ty.is_primitive());
-                }
+                ConstantKind::Unevaluated(_, _) => {}
                 ConstantKind::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => {}
@@ -726,6 +724,17 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let a_id = VarId::Local(caller, a.local.as_u32());
                 self.x_eq_deref_y(dst, a_id);
             }
+            ("", "unix", _, "memcpy") => {
+                let l = args[0].place().unwrap();
+                let r = args[1].place().unwrap();
+                assert!(!l.is_indirect_first_projection());
+                assert!(!r.is_indirect_first_projection());
+                let l_id = VarId::Local(caller, l.local.as_u32());
+                let r_id = VarId::Local(caller, r.local.as_u32());
+                self.deref_x_eq_deref_y(l_id, r_id);
+                self.x_eq_y(dst, l_id);
+            }
+            (_, _, "AsmCastTrait", _) => {}
             _ => tracing::info!("{:?}", name),
         }
     }

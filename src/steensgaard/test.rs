@@ -1169,3 +1169,47 @@ fn test_variadic() {
         },
     );
 }
+
+#[test]
+fn test_memcpy() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _8 = &mut _4
+    // _7 = &raw mut (*_8)
+    // _6 = move _7 as *mut libc::c_void (PtrToPtr)
+    // _11 = &mut _2
+    // _10 = &raw mut (*_11)
+    // _9 = move _10 as *const libc::c_void (PtrToPtr)
+    // _14 = std::mem::size_of::<*mut i32>()
+    // _13 = move _14 as u64 (IntToInt)
+    // _12 = move _13 as usize (IntToInt)
+    // _5 = libc::memcpy(move _6, move _9, move _12)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y1: *mut libc::c_int = &mut x;
+        let mut y2: *mut libc::c_int = 0 as *mut libc::c_int;
+        libc::memcpy(
+            &mut y2 as *mut *mut libc::c_int as *mut libc::c_void,
+            &mut y1 as *mut *mut libc::c_int as *const libc::c_void,
+            ::std::mem::size_of::<*mut libc::c_int>() as libc::c_ulong as libc::size_t,
+        );
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[5].var_ty, x[4]);
+            assert_eq!(t[6].var_ty, x[4]);
+            assert_eq!(t[7].var_ty, x[4]);
+            assert_eq!(t[8].var_ty, x[4]);
+
+            assert_eq!(t[9].var_ty, x[2]);
+            assert_eq!(t[10].var_ty, x[2]);
+            assert_eq!(t[11].var_ty, x[2]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+        },
+    );
+}
