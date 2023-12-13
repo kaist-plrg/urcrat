@@ -1104,6 +1104,52 @@ fn test_write_volatile() {
 }
 
 #[test]
+fn test_read_volatile() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = _2 as i64 (PointerExposeAddress)
+    // _7 = &mut _4
+    // _6 = &raw mut (*_7)
+    // _11 = &_4
+    // _10 = &raw const (*_11)
+    // _9 = std::ptr::read_volatile::<i64>(move _10)
+    // _13 = const 0_i32
+    // _12 = move _13 as i64 (IntToInt)
+    // _8 = Add(move _9, move _12)
+    // _5 = std::ptr::write_volatile::<i64>(move _6, move _8)
+    // _15 = _4
+    // _14 = move _15 as *mut i32 (PointerFromExposedAddress)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: libc::c_long = y as libc::c_long;
+        ::std::ptr::write_volatile(
+            &mut z as *mut libc::c_long,
+            ::std::ptr::read_volatile::<libc::c_long>(&z as *const libc::c_long)
+                + 0 as libc::c_int as libc::c_long,
+        );
+        let mut w: *mut libc::c_int = z as *mut libc::c_int;
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[6].var_ty, x[4]);
+            assert_eq!(t[7].var_ty, x[4]);
+            assert_eq!(t[10].var_ty, x[4]);
+            assert_eq!(t[11].var_ty, x[4]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[8].var_ty, x[1]);
+            assert_eq!(t[9].var_ty, x[1]);
+            assert_eq!(t[14].var_ty, x[1]);
+            assert_eq!(t[15].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
 fn test_variadic() {
     // h
     // _5 = &mut _1

@@ -106,11 +106,13 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         };
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
-                println!("{:?} {:?}", stmt, stmt.source_info.span);
+                println!("{:?}", stmt);
+                // println!("{:?} {:?}", stmt, stmt.source_info.span);
                 analyzer.transfer_stmt(local_def_id, stmt);
             }
             if let Some(term) = &bbd.terminator {
-                println!("{:?} {:?}", term.kind, term.source_info.span);
+                println!("{:?}", term.kind);
+                // println!("{:?} {:?}", term.kind, term.source_info.span);
                 analyzer.transfer_term(local_def_id, term);
             }
         }
@@ -718,7 +720,8 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             }
             ("", "clone", "Clone", "clone")
             | ("", "ffi", _, "as_va_list")
-            | ("", "ffi", _, "arg") => {
+            | ("", "ffi", _, "arg")
+            | ("", "", "ptr", "read_volatile") => {
                 let a = args[0].place().unwrap();
                 assert!(!a.is_indirect_first_projection());
                 let a_id = VarId::Local(caller, a.local.as_u32());
