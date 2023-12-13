@@ -530,9 +530,9 @@ fn test_eq_alloc() {
     // _1 = const 0_i32
     // _3 = &mut _1
     // _2 = &raw mut (*_3)
-    // _6 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _6 = std::mem::size_of::<i32>()
     // _5 = move _6 as u64 (IntToInt)
-    // _4 = malloc(move _5) -> [return: bb2, unwind continue]
+    // _4 = malloc(move _5)
     // _2 = move _4 as *mut i32 (PtrToPtr)
     analyze_fn(
         "
@@ -551,9 +551,9 @@ fn test_eq_alloc() {
 
 #[test]
 fn test_eq_alloc_bot() {
-    // _4 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _4 = std::mem::size_of::<i32>()
     // _3 = move _4 as u64 (IntToInt)
-    // _2 = malloc(move _3) -> [return: bb2, unwind continue]
+    // _2 = malloc(move _3)
     // _1 = move _2 as *mut i32 (PtrToPtr)
     analyze_fn(
         "
@@ -622,7 +622,7 @@ fn test_eq_add() {
     // _1 = [move _2, move _4]
     // _8 = &mut _1
     // _7 = move _8 as &mut [i8] (PointerCoercion(Unsize))
-    // _6 = core::slice::<impl [i8]>::as_mut_ptr(move _7) -> [return: bb1, unwind continue]
+    // _6 = core::slice::<impl [i8]>::as_mut_ptr(move _7)
     // _10 = _6
     // _9 = move _10 as i64 (PointerExposeAddress)
     // _13 = const 1_i32
@@ -813,7 +813,7 @@ fn test_fn_arg() {
     // _1 = const 0_i32
     // _4 = &mut _1
     // _3 = &raw mut (*_4)
-    // _2 = foo::g(move _3) -> [return: bb1, unwind continue]
+    // _2 = foo::g(move _3)
     analyze_fn(
         "
         fn g(mut x: *mut libc::c_int) {}
@@ -839,7 +839,7 @@ fn test_fn_ret() {
     // _1 = const 0_i32
     // _4 = &mut _1
     // _3 = &raw mut (*_4)
-    // _2 = foo::g(move _3) -> [return: bb1, unwind continue]
+    // _2 = foo::g(move _3)
     analyze_fn(
         "
         fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
@@ -870,10 +870,10 @@ fn test_fn_ptr() {
     // _2 = foo::g as fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
     // _1 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _2)
     // _3 = const 0_i32
-    // _5 = std::option::Option::<fn(*mut i32) -> *mut i32>::unwrap(_1) -> [return: bb1, unwind continue]
+    // _5 = std::option::Option::<fn(*mut i32) -> *mut i32>::unwrap(_1)
     // _7 = &mut _3
     // _6 = &raw mut (*_7)
-    // _4 = move _5(move _6) -> [return: bb2, unwind continue]
+    // _4 = move _5(move _6)
     analyze_fn(
         "
         fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
@@ -920,7 +920,7 @@ fn test_fn_ptrs() {
     // _2 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _5)
     // _8 = &mut _1
     // _7 = &raw mut (*_8)
-    // _6 = foo::g(move _7) -> [return: bb4, unwind continue]
+    // _6 = foo::g(move _7)
     analyze_fn(
         "
         fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
@@ -968,6 +968,33 @@ fn test_fn_ptrs() {
             assert_eq!(t[4].fn_ty, tg.fn_ty);
             assert_eq!(t[5].fn_ty, tg.fn_ty);
             assert_eq!(th.fn_ty, tg.fn_ty);
+        },
+    );
+}
+
+#[test]
+fn test_offset() {
+    // _1 = [const 0_i32; 2]
+    // _4 = &mut _1
+    // _3 = move _4 as &mut [i32] (PointerCoercion(Unsize))
+    // _2 = core::slice::<impl [i32]>::as_mut_ptr(move _3)
+    // _6 = _2
+    // _8 = const 1_i32
+    // _7 = move _8 as isize (IntToInt)
+    // _5 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _6, move _7)
+    // _2 = move _5
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 2] = [0; 2];
+        let mut y: *mut libc::c_int = x.as_mut_ptr();
+        y = y.offset(1 as libc::c_int as isize);
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(t[6].var_ty, x[1]);
         },
     );
 }

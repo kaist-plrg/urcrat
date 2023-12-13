@@ -5,6 +5,7 @@ use std::{
 
 use disjoint_set::DisjointSet;
 use etrace::some_or;
+use lazy_static::lazy_static;
 use rustc_hir::{ForeignItemKind, ItemKind};
 use rustc_middle::{
     mir::{
@@ -587,7 +588,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let output = sig.output().skip_binder();
                 if let Some(local_def_id) = def_id.as_local() {
                     if seg1.contains("{extern#") {
-                        self.transfer_c_call(seg0, inputs, output, d_id);
+                        self.transfer_c_call(caller, seg0, inputs, output, args, d_id);
                     } else {
                         let callee = VarId::Global(local_def_id);
                         self.transfer_intra_call(caller, callee, args, d_id);
@@ -636,12 +637,31 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         self.fn_cond_join(ft, ret.fn_ty);
     }
 
-    fn transfer_c_call(&mut self, name: &str, inputs: &[Ty<'_>], output: Ty<'_>, dst: VarId) {
-        if output.is_primitive() && inputs.iter().filter(|t| !t.is_primitive()).count() < 2 {
+    fn transfer_c_call(
+        &mut self,
+        caller: LocalDefId,
+        name: &str,
+        inputs: &[Ty<'_>],
+        output: Ty<'_>,
+        args: &[Operand<'_>],
+        dst: VarId,
+    ) {
+        if (output.is_unit() || output.is_never() || output.is_primitive())
+            && inputs.iter().filter(|t| !t.is_primitive()).count() < 2
+        {
             return;
         }
-        if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive()) {
+        if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive())
+            || ALLOC_C_FNS.contains(name)
+        {
             self.x_eq_alloc(dst);
+            return;
+        }
+        if NO_OP_C_FNS.contains(name) {
+            return;
+        }
+        if RET_0_C_FNS.contains(name) {
+            self.transfer_operand(caller, dst, false, &args[0]);
             return;
         }
         tracing::info!("{}", name);
@@ -656,13 +676,16 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         args: &[Operand<'_>],
         dst: VarId,
     ) {
-        if output.is_primitive() && inputs.iter().filter(|t| !t.is_primitive()).count() < 2 {
+        if (output.is_unit() || output.is_never() || output.is_primitive())
+            && inputs.iter().filter(|t| !t.is_primitive()).count() < 2
+        {
             return;
         }
         match name {
-            (_, "slice", _, "as_mut_ptr") | ("", "option", _, "unwrap") => {
-                let a = &args[0];
-                self.transfer_operand(caller, dst, false, a);
+            (_, "slice", _, "as_ptr" | "as_mut_ptr")
+            | ("ptr", _, _, "offset")
+            | ("", "option", _, "unwrap") => {
+                self.transfer_operand(caller, dst, false, &args[0]);
             }
             _ => tracing::info!("{:?}", name),
         }
@@ -863,6 +886,12 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     fn var_join(&mut self, e1: VarId, e2: VarId) {
         self.var_ecrs.join(e1, e2, &mut self.fn_ecrs);
     }
+}
+
+lazy_static! {
+    static ref NO_OP_C_FNS: HashSet<&'static str> = [].into_iter().collect();
+    static ref RET_0_C_FNS: HashSet<&'static str> = [].into_iter().collect();
+    static ref ALLOC_C_FNS: HashSet<&'static str> = [].into_iter().collect();
 }
 
 #[cfg(test)]
