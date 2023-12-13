@@ -1031,6 +1031,40 @@ fn test_copy_for_deref() {
 }
 
 #[test]
+fn test_copy_for_deref_arr() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _6 = &mut _2
+    // _5 = &raw mut (*_6)
+    // _4 = [move _5]
+    // _9 = const 0_i32
+    // _8 = move _9 as usize (IntToInt)
+    // _10 = const 1_usize
+    // _11 = Lt(_8, _10)
+    // _12 = deref_copy _4[_8]
+    // _7 = (*_12)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: [*mut *mut libc::c_int; 1] = [&mut y];
+        let mut w: *mut libc::c_int = *z[0 as libc::c_int as usize];
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[4].var_ty, x[2]);
+            assert_eq!(t[5].var_ty, x[2]);
+            assert_eq!(t[6].var_ty, x[2]);
+            assert_eq!(t[12].var_ty, x[2]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
 fn test_write_volatile() {
     // _1 = const 0_i32
     // _3 = &mut _1

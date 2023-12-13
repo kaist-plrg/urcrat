@@ -509,9 +509,13 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             }
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
-                assert!(r.is_indirect_first_projection());
+                assert!(!l_deref);
                 let r_id = VarId::Local(func, r.local.as_u32());
-                self.x_eq_deref_y(l_id, r_id);
+                if r.is_indirect_first_projection() {
+                    self.x_eq_deref_y(l_id, r_id);
+                } else {
+                    self.x_eq_y(l_id, r_id);
+                }
             }
         }
     }
@@ -550,9 +554,12 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let r_id = VarId::Global(def_id.as_local().unwrap());
-                        assert!(!l_deref);
-                        self.x_eq_y(l_id, r_id);
+                        let name = self.def_id_to_string(*def_id);
+                        if !name.contains("{extern#") {
+                            let r_id = VarId::Global(def_id.as_local().unwrap());
+                            assert!(!l_deref);
+                            self.x_eq_y(l_id, r_id);
+                        }
                     }
                     ConstValue::Slice { .. } => unreachable!(),
                     ConstValue::ByRef { .. } => unreachable!(),
@@ -594,7 +601,11 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let inputs = sig.inputs().skip_binder();
                 let output = sig.output().skip_binder();
                 if let Some(local_def_id) = def_id.as_local() {
-                    if seg1.contains("{extern#") {
+                    if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
+                        let span = self.tcx.span_of_impl(impl_def_id).unwrap();
+                        let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
+                        assert_eq!(code, "BitfieldStruct");
+                    } else if seg1.contains("{extern#") {
                         self.transfer_c_call(caller, seg0, inputs, output, args, d_id);
                     } else {
                         let callee = VarId::Global(local_def_id);
