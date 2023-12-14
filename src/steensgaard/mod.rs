@@ -106,12 +106,12 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         };
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
-                println!("{:?}", stmt);
+                // println!("{:?}", stmt);
                 // println!("{:?} {:?}", stmt, stmt.source_info.span);
                 analyzer.transfer_stmt(local_def_id, stmt);
             }
             if let Some(term) = &bbd.terminator {
-                println!("{:?}", term.kind);
+                // println!("{:?}", term.kind);
                 // println!("{:?} {:?}", term.kind, term.source_info.span);
                 analyzer.transfer_term(local_def_id, term);
             }
@@ -485,7 +485,11 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     self.x_eq_ref_y(l_id, r_id);
                 }
             }
-            Rvalue::ThreadLocalRef(_) => unreachable!(),
+            Rvalue::ThreadLocalRef(def_id) => {
+                assert!(!l_deref);
+                let r_id = VarId::Global(def_id.as_local().unwrap());
+                self.x_eq_ref_y(l_id, r_id);
+            }
             Rvalue::AddressOf(_, r) => {
                 assert!(!l_deref);
                 assert!(r.is_indirect_first_projection());
@@ -672,23 +676,38 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     ) {
         if (output.is_unit() || output.is_never() || output.is_primitive())
             && inputs.iter().filter(|t| !t.is_primitive()).count() < 2
+            || name.contains("printf")
+            || NO_OP_C_FNS.contains(name)
         {
-            return;
-        }
-        if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive())
+        } else if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive())
             || ALLOC_C_FNS.contains(name)
         {
             self.x_eq_alloc(dst);
-            return;
-        }
-        if NO_OP_C_FNS.contains(name) {
-            return;
-        }
-        if RET_0_C_FNS.contains(name) {
+        } else if name == "realloc" {
             self.transfer_operand(caller, dst, false, &args[0]);
-            return;
+            self.x_eq_alloc(dst);
+        } else if RET_0_C_FNS.contains(name) {
+            self.transfer_operand(caller, dst, false, &args[0]);
+        } else if name == "bcopy" {
+            let l = args[1].place().unwrap();
+            let r = args[0].place().unwrap();
+            assert!(!l.is_indirect_first_projection());
+            assert!(!r.is_indirect_first_projection());
+            let l_id = VarId::Local(caller, l.local.as_u32());
+            let r_id = VarId::Local(caller, r.local.as_u32());
+            self.deref_x_eq_deref_y(l_id, r_id);
+        } else if COPY_C_FNS.contains(name) {
+            let l = args[0].place().unwrap();
+            let r = args[1].place().unwrap();
+            assert!(!l.is_indirect_first_projection());
+            assert!(!r.is_indirect_first_projection());
+            let l_id = VarId::Local(caller, l.local.as_u32());
+            let r_id = VarId::Local(caller, r.local.as_u32());
+            self.deref_x_eq_deref_y(l_id, r_id);
+            self.x_eq_y(dst, l_id);
+        } else {
+            tracing::info!("{}", name);
         }
-        tracing::info!("{}", name);
     }
 
     fn transfer_rust_call(
@@ -709,7 +728,9 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             (_, "slice", _, "as_ptr" | "as_mut_ptr")
             | ("ptr", _, _, "offset" | "offset_from")
             | ("ops", "deref", _, "deref" | "deref_mut")
-            | ("", "option", _, "unwrap") => {
+            | ("", "option", _, "unwrap")
+            | ("", "result", _, "unwrap")
+            | ("", "vec", _, "as_mut_ptr" | "leak") => {
                 self.transfer_operand(caller, dst, false, &args[0]);
             }
             ("", "", "ptr", "write_volatile") => {
@@ -727,6 +748,9 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let a_id = VarId::Local(caller, a.local.as_u32());
                 self.x_eq_deref_y(dst, a_id);
             }
+            ("", "", "vec", "from_elem") => {
+                self.x_eq_alloc(dst);
+            }
             ("", "unix", _, "memcpy") => {
                 let l = args[0].place().unwrap();
                 let r = args[1].place().unwrap();
@@ -737,7 +761,17 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.deref_x_eq_deref_y(l_id, r_id);
                 self.x_eq_y(dst, l_id);
             }
-            (_, _, "AsmCastTrait", _) => {}
+            ("", "num", _, name) if name.starts_with("overflowing_") => {
+                self.transfer_operand(caller, dst, false, &args[0]);
+                self.transfer_operand(caller, dst, false, &args[1]);
+            }
+            (_, _, "AsmCastTrait", _)
+            | ("", "cast", "ToPrimitive", _)
+            | ("", "cmp", "PartialEq", _)
+            | ("", "cmp", "PartialOrd", _)
+            | ("", "convert", _, _)
+            | ("ops", "arith", _, _)
+            | ("", "f128_t", _, _) => {}
             _ => tracing::info!("{:?}", name),
         }
     }
@@ -940,9 +974,92 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
 }
 
 lazy_static! {
-    static ref NO_OP_C_FNS: HashSet<&'static str> = [].into_iter().collect();
-    static ref RET_0_C_FNS: HashSet<&'static str> = [].into_iter().collect();
-    static ref ALLOC_C_FNS: HashSet<&'static str> = [].into_iter().collect();
+    static ref NO_OP_C_FNS: HashSet<&'static str> = [
+        "memcmp",
+        "wmemcmp",
+        "strcmp",
+        "wcscmp",
+        "strcasecmp",
+        "wcscasecmp",
+        "strncmp",
+        "wcsncmp",
+        "strncasecmp",
+        "wcsncasecmp",
+        "strverscmp",
+        "bcmp",
+        "strtol",
+        "wcstol",
+        "strtoul",
+        "wcstoul",
+        "strtoll",
+        "wcstoll",
+        "strtoq",
+        "wcstoq",
+        "strtoull",
+        "wcstoull",
+        "strtouq",
+        "wcstouq",
+        "strtoimax",
+        "wcstoimax",
+        "strtoumax",
+        "wcstoumax",
+        "fputs",
+        "fopen",
+        "fwrite",
+        "__xstat",
+        "__assert_fail",
+    ]
+    .into_iter()
+    .collect();
+    static ref RET_0_C_FNS: HashSet<&'static str> = [
+        "memset",
+        "wmemset",
+        "memchr",
+        "wmemchr",
+        "rawmemchr",
+        "memrchr",
+        "strchr",
+        "wcschr",
+        "strchrnul",
+        "wcschrnul",
+        "strrchr",
+        "wcsrchr",
+        "strstr",
+        "wcsstr",
+        "wcswcs",
+        "strcasestr",
+        "memmem",
+        "strpbrk",
+        "wcspbrk",
+        "index",
+        "rindex",
+        "strtok",
+        "wcstok",
+        "strtok_r",
+        "basename",
+        "dirname",
+    ]
+    .into_iter()
+    .collect();
+    static ref ALLOC_C_FNS: HashSet<&'static str> = [
+        "dcgettext",
+        "strdup",
+        "wcsdup",
+        "strdupa",
+        "strndup",
+        "strndupa",
+        "getenv",
+        "signal",
+    ]
+    .into_iter()
+    .collect();
+    static ref COPY_C_FNS: HashSet<&'static str> = [
+        "memcpy", "wmemcpy", "mempcpy", "wmempcpy", "memmove", "wmemmove", "memccpy", "strcpy",
+        "wcscpy", "stpcpy", "wcpcpy", "strncpy", "wcsncpy", "stpncpy", "wcpncpy", "strncat",
+        "wcsncat", "strlcpy", "wcslcpy", "strlcat", "wcslcat", "strcat", "wcscat"
+    ]
+    .into_iter()
+    .collect();
 }
 
 #[cfg(test)]

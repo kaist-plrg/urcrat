@@ -15,6 +15,7 @@ where F: FnOnce(Vec<VarId>, Vec<Type>, AnalysisResults, TyCtxt<'_>) + Send {
         extern crate libc;
         extern \"C\" {{
             fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+            fn realloc(_: *mut libc::c_void, _: libc::c_ulong) -> *mut libc::c_void;
         }}
         unsafe extern \"C\" fn {}({}) {{
             {}
@@ -587,6 +588,87 @@ fn test_eq_alloc_bot() {
 }
 
 #[test]
+fn test_eq_alloca_bot() {
+    // _4 = std::mem::size_of::<i32>()
+    // _3 = move _4 as u64 (IntToInt)
+    // _2 = move _3 as usize (IntToInt)
+    // _1 = std::vec::from_elem::<i32>(const 0_i32, move _2)
+    // _8 = move _1
+    // _7 = std::vec::Vec::<i32>::leak::<'_>(move _8)
+    // _6 = _7
+    // _5 = core::slice::<impl [i32]>::as_mut_ptr(move _6)
+    // _9 = _5
+    analyze_fn(
+        "
+        let mut fresh0 = ::std::vec::from_elem(
+            0,
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong as usize,
+        );
+        let mut x: *mut libc::c_int = fresh0.leak().as_mut_ptr() as *mut libc::c_int;
+        let mut y: *mut libc::c_int = x;
+        ",
+        |_, t, _, _| {
+            assert_eq!(t[5].var_ty, t[1].var_ty);
+            assert_eq!(t[6].var_ty, t[1].var_ty);
+            assert_eq!(t[7].var_ty, t[1].var_ty);
+            assert_eq!(t[8].var_ty, t[1].var_ty);
+            assert_eq!(t[9].var_ty, t[1].var_ty);
+        },
+    );
+}
+
+#[test]
+fn test_eq_realloc() {
+    // _4 = std::mem::size_of::<i32>()
+    // _3 = move _4 as u64 (IntToInt)
+    // _2 = malloc(move _3)
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    // _7 = _1 as *mut libc::c_void (PtrToPtr)
+    // _9 = std::mem::size_of::<i32>()
+    // _8 = move _9 as u64 (IntToInt)
+    // _6 = realloc(move _7, move _8)
+    // _5 = move _6 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = malloc(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        let mut y: *mut libc::c_int = realloc(
+            x as *mut libc::c_void,
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        ",
+        |_, t, _, _| {
+            assert_eq!(t[2].var_ty, t[1].var_ty);
+            assert_eq!(t[5].var_ty, t[1].var_ty);
+            assert_eq!(t[6].var_ty, t[1].var_ty);
+            assert_eq!(t[7].var_ty, t[1].var_ty);
+        },
+    );
+}
+
+#[test]
+fn test_eq_realloc_bot() {
+    // _3 = const 0_usize as *mut libc::c_void (PointerFromExposedAddress)
+    // _5 = std::mem::size_of::<i32>()
+    // _4 = move _5 as u64 (IntToInt)
+    // _2 = realloc(move _3, move _4)
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = realloc(
+            0 as *mut libc::c_void,
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        let mut y: *mut libc::c_int = x;
+        ",
+        |_, t, _, _| {
+            assert_eq!(t[1].var_ty, t[2].var_ty);
+        },
+    );
+}
+
+#[test]
 fn test_eq_bstr() {
     // _2 = const 0_i32
     // _1 = move _2 as i8 (IntToInt)
@@ -666,6 +748,48 @@ fn test_eq_add() {
             assert_eq!(t[10].var_ty, x[1]);
             assert_eq!(t[11].var_ty, x[1]);
             assert_eq!(t[14].var_ty, x[1]);
+        },
+    );
+}
+
+#[test]
+fn test_eq_overflowing_add() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = _2 as i64 (PointerExposeAddress)
+    // _6 = const 0_i32
+    // _5 = move _6 as i64 (IntToInt)
+    // _10 = const 0_i64
+    // _9 = core::num::<impl i64>::overflowing_add(_4, move _10) -> [return: bb1, unwind continue]
+    // _7 = (_9.0: i64)
+    // _8 = (_9.1: bool)
+    // _11 = &mut _5
+    // (*_11) = _7
+    // _13 = _5
+    // _12 = move _13 as *mut i32 (PointerFromExposedAddress)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: libc::c_long = y as libc::c_long;
+        let mut w: libc::c_long = 0 as libc::c_int as libc::c_long;
+        let (fresh0, fresh1) = z.overflowing_add(0 as libc::c_long);
+        *&mut w = fresh0;
+        let mut v: *mut libc::c_int = w as *mut libc::c_int;
+        ",
+        |x, t, _, _| {
+            assert_eq!(t[11].var_ty, x[5]);
+
+            assert_eq!(t[2].var_ty, x[1]);
+            assert_eq!(t[3].var_ty, x[1]);
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[1]);
+            assert_eq!(t[8].var_ty, x[1]);
+            assert_eq!(t[9].var_ty, x[1]);
+            assert_eq!(t[12].var_ty, x[1]);
+            assert_eq!(t[13].var_ty, x[1]);
         },
     );
 }
@@ -751,6 +875,27 @@ fn test_eq_static() {
     // _1 = &raw mut (*_2)
     analyze_fn(
         "
+        static mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        ",
+        |_, t, _, tcx| {
+            let (def_id, _) = find_item("x", tcx);
+            let x = VarId::Global(def_id);
+            assert_eq!(t[1].var_ty, x);
+            assert_eq!(t[2].var_ty, x);
+            assert_eq!(t[3].var_ty, x);
+        },
+    );
+}
+
+#[test]
+fn test_eq_thread_local_static() {
+    // _3 = &/*tls*/ mut foo::x
+    // _2 = &mut (*_3)
+    // _1 = &raw mut (*_2)
+    analyze_fn(
+        "
+        #[thread_local]
         static mut x: libc::c_int = 0 as libc::c_int;
         let mut y: *mut libc::c_int = &mut x;
         ",
