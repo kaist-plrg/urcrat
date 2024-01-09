@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{HashMap, HashSet},
     path::Path,
 };
 
@@ -21,7 +21,7 @@ pub fn analyze(path: &Path) {
     compile_util::run_compiler(config, |tcx| {
         let mut visitor = TyVisitor::new(tcx);
         tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-        let foreign_tys: BTreeSet<_> = visitor
+        let foreign_tys: HashSet<_> = visitor
             .foreign_types
             .into_iter()
             .flat_map(|id| graph::reachable_vertices(&visitor.type_graph, id, visitor.tys.len()))
@@ -51,9 +51,9 @@ pub fn analyze(path: &Path) {
 struct TyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     tys: Vec<DefId>,
-    ty_ids: BTreeMap<DefId, usize>,
-    foreign_types: BTreeSet<usize>,
-    type_graph: BTreeMap<usize, BTreeSet<usize>>,
+    ty_ids: HashMap<DefId, usize>,
+    foreign_types: HashSet<usize>,
+    type_graph: HashMap<usize, HashSet<usize>>,
 }
 
 impl<'tcx> TyVisitor<'tcx> {
@@ -61,9 +61,9 @@ impl<'tcx> TyVisitor<'tcx> {
         Self {
             tcx,
             tys: Vec::new(),
-            ty_ids: BTreeMap::new(),
-            foreign_types: BTreeSet::new(),
-            type_graph: BTreeMap::new(),
+            ty_ids: HashMap::new(),
+            foreign_types: HashSet::new(),
+            type_graph: HashMap::new(),
         }
     }
 
@@ -126,21 +126,21 @@ impl<'tcx> Visitor<'tcx> for TyVisitor<'tcx> {
 struct UnionVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     typeck: &'a TypeckResults<'tcx>,
-    foreign_tys: &'a BTreeSet<DefId>,
-    map: BTreeMap<String, BTreeSet<String>>,
+    foreign_tys: &'a HashSet<DefId>,
+    map: HashMap<String, HashSet<String>>,
 }
 
 impl<'tcx, 'a> UnionVisitor<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
         typeck: &'a TypeckResults<'tcx>,
-        foreign_tys: &'a BTreeSet<DefId>,
+        foreign_tys: &'a HashSet<DefId>,
     ) -> Self {
         Self {
             tcx,
             typeck,
             foreign_tys,
-            map: BTreeMap::new(),
+            map: HashMap::new(),
         }
     }
 

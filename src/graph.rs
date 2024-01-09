@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use etrace::some_or;
 use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
@@ -43,11 +43,11 @@ pub fn transitive_closure<T: Idx + Ord>(
     new_graph
 }
 
-pub fn reachable_vertices<T: Idx + Ord>(
-    graph: &BTreeMap<T, BTreeSet<T>>,
+pub fn reachable_vertices<T: Idx + std::hash::Hash>(
+    graph: &HashMap<T, HashSet<T>>,
     source: T,
     size: usize,
-) -> BTreeSet<T> {
+) -> HashSet<T> {
     let mut dists = vec![usize::MAX; size];
     dists[source.index()] = 0;
 
@@ -100,12 +100,12 @@ fn symmetric_closure<T: Clone + Eq + PartialOrd + Ord>(
     clo
 }
 
-pub fn inverse<T: Clone + Eq + PartialOrd + Ord>(
-    map: &BTreeMap<T, BTreeSet<T>>,
-) -> BTreeMap<T, BTreeSet<T>> {
-    let mut inv: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+pub fn inverse<T: Clone + Eq + std::hash::Hash>(
+    map: &HashMap<T, HashSet<T>>,
+) -> HashMap<T, HashSet<T>> {
+    let mut inv: HashMap<_, HashSet<_>> = HashMap::new();
     for node in map.keys() {
-        inv.insert(node.clone(), BTreeSet::new());
+        inv.insert(node.clone(), HashSet::new());
     }
     for (node, succs) in map {
         for succ in succs {

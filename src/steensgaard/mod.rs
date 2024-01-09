@@ -391,7 +391,6 @@ impl<'a, T: Clone + Domain> Ecrs<'a, T> {
 }
 
 struct Analyzer<'tcx, 'a> {
-    #[allow(unused)]
     tcx: TyCtxt<'tcx>,
     id: usize,
 
