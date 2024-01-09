@@ -158,6 +158,13 @@ pub struct AccPath {
     pub projections: Vec<AccProj>,
 }
 
+impl AccPath {
+    #[inline]
+    pub fn new(root: Local, projections: Vec<AccProj>) -> Self {
+        Self { root, projections }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccProj {
     Int(usize),

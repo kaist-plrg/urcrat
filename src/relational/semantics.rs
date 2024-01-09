@@ -1,10 +1,10 @@
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, GlobalAlloc, Scalar},
-        CastKind, ConstantKind, Location, Operand, ProjectionElem, Rvalue, Statement,
-        StatementKind, Terminator,
+        interpret::{ConstValue, Scalar},
+        CastKind, ConstantKind, Location, Operand, Place, PlaceElem, ProjectionElem, Rvalue,
+        Statement, StatementKind, Terminator,
     },
-    ty::TyKind,
+    ty::{IntTy, TyKind, UintTy},
 };
 
 use super::*;
@@ -13,18 +13,33 @@ use crate::*;
 impl<'tcx> Analyzer<'tcx> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
-        l.projection.iter().filter(|proj| match proj {
-            ProjectionElem::Deref => todo!(),
-            ProjectionElem::Field(_, _) => todo!(),
-            ProjectionElem::Index(_) => todo!(),
-            ProjectionElem::ConstantIndex { .. } => todo!(),
-            ProjectionElem::Subslice { .. } => todo!(),
-            ProjectionElem::Downcast(_, _) => todo!(),
-            ProjectionElem::OpaqueCast(_) => todo!(),
-        });
+        let (l, l_deref) = AccPath::from_place(*l, state);
         match r {
             Rvalue::Use(r) => {
-                todo!()
+                let r = self.transfer_op(r, state);
+                let graph = state.graph_mut();
+                match r {
+                    OpVal::Place(r, r_deref) => match (l_deref, r_deref) {
+                        (true, true) => panic!(),
+                        (true, false) => graph.deref_x_eq_y(&l, &r),
+                        (false, true) => graph.x_eq_deref_y(&l, &r),
+                        (false, false) => graph.x_eq_y(&l, &r),
+                    },
+                    OpVal::Int(n) => {
+                        if l_deref {
+                            graph.deref_x_eq_int(&l, n);
+                        } else {
+                            graph.x_eq_int(&l, n);
+                        }
+                    }
+                    OpVal::Other => {
+                        if l_deref {
+                            graph.deref_x_eq(&l);
+                        } else {
+                            graph.x_eq(&l);
+                        }
+                    }
+                }
             }
             Rvalue::Cast(kind, r, _) => match kind {
                 CastKind::PointerExposeAddress => todo!(),
@@ -72,38 +87,45 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn transfer_operand(&self, l_id: usize, l_deref: bool, r: &Operand<'_>, state: &mut AbsRelMem) {
-        match r {
-            Operand::Copy(r) | Operand::Move(r) => {
-                let r_deref = r.is_indirect_first_projection();
-                let r_id = r.local.as_usize();
-                // match (l_deref, r_deref) {
-                //     (false, false) => self.x_eq_y(l_id, r_id),
-                //     (false, true) => self.x_eq_deref_y(l_id, r_id),
-                //     (true, false) => self.deref_x_eq_y(l_id, r_id),
-                //     (true, true) => self.deref_x_eq_deref_y(l_id, r_id),
-                // }
+    fn transfer_op(&self, op: &Operand<'_>, state: &mut AbsMem) -> OpVal {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let (path, is_deref) = AccPath::from_place(*place, state);
+                OpVal::Place(path, is_deref)
             }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => {}
+                ConstantKind::Unevaluated(_, _) => OpVal::Other,
                 ConstantKind::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
-                        Scalar::Int(_) => {}
-                        Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
-                            GlobalAlloc::Static(def_id) => {
-                                todo!()
+                        Scalar::Int(i) => match ty.kind() {
+                            TyKind::Int(int_ty) => {
+                                let v = match int_ty {
+                                    IntTy::Isize => i.try_to_i64().unwrap() as _,
+                                    IntTy::I8 => i.try_to_i8().unwrap() as _,
+                                    IntTy::I16 => i.try_to_i16().unwrap() as _,
+                                    IntTy::I32 => i.try_to_i32().unwrap() as _,
+                                    IntTy::I64 => i.try_to_i64().unwrap() as _,
+                                    IntTy::I128 => i.try_to_i128().unwrap(),
+                                };
+                                OpVal::Int(Int::Signed(v))
                             }
-                            GlobalAlloc::Memory(_) => {
-                                todo!()
+                            TyKind::Uint(uint_ty) => {
+                                let v = match uint_ty {
+                                    UintTy::Usize => i.try_to_u64().unwrap() as _,
+                                    UintTy::U8 => i.try_to_u8().unwrap() as _,
+                                    UintTy::U16 => i.try_to_u16().unwrap() as _,
+                                    UintTy::U32 => i.try_to_u32().unwrap() as _,
+                                    UintTy::U64 => i.try_to_u64().unwrap() as _,
+                                    UintTy::U128 => i.try_to_u128().unwrap(),
+                                };
+                                OpVal::Int(Int::Unsigned(v))
                             }
-                            _ => unreachable!(),
+                            _ => OpVal::Other,
                         },
+                        Scalar::Ptr(_, _) => OpVal::Other,
                     },
-                    ConstValue::ZeroSized => {
-                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        todo!()
-                    }
+                    ConstValue::ZeroSized => OpVal::Other,
                     ConstValue::Slice { .. } => unreachable!(),
                     ConstValue::ByRef { .. } => unreachable!(),
                 },
@@ -114,8 +136,45 @@ impl<'tcx> Analyzer<'tcx> {
     pub fn transfer_term(&self, term: &Terminator<'tcx>) -> Vec<(Location, AbsMem)> {
         todo!()
     }
+}
 
-    fn x_eq_y(&self, x: usize, y: usize, state: &mut AbsRelMem) {}
+enum OpVal {
+    Place(AccPath, bool),
+    Int(Int),
+    Other,
+}
 
-    fn deref_x_eq_y(&self, x: usize, y: usize, state: &mut AbsRelMem) {}
+impl AccPath {
+    fn from_place(place: Place<'_>, state: &mut AbsMem) -> (Self, bool) {
+        let root = place.local;
+        let projections = place
+            .projection
+            .iter()
+            .filter_map(|e| AccProj::from_elem(e, state))
+            .collect();
+        let is_deref = place.is_indirect_first_projection();
+        (AccPath::new(root, projections), is_deref)
+    }
+}
+
+impl AccProj {
+    fn from_elem(proj: PlaceElem<'_>, state: &mut AbsMem) -> Option<Self> {
+        match proj {
+            ProjectionElem::Deref => None,
+            ProjectionElem::Field(i, _) => Some(AccProj::Int(i.index())),
+            ProjectionElem::Index(local) => {
+                let path = AccPath::new(local, vec![]);
+                if let Some(i) = state.graph_mut().get_int_value(&path) {
+                    Some(AccProj::Int(i.as_usize()))
+                } else {
+                    // TODO: aliasing
+                    Some(AccProj::Symbolic([local].into_iter().collect()))
+                }
+            }
+            ProjectionElem::ConstantIndex { .. } => unreachable!(),
+            ProjectionElem::Subslice { .. } => unreachable!(),
+            ProjectionElem::Downcast(_, _) => unreachable!(),
+            ProjectionElem::OpaqueCast(_) => unreachable!(),
+        }
+    }
 }

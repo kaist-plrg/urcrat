@@ -5,115 +5,12 @@ use rustc_middle::mir::Local;
 use super::*;
 
 #[derive(Debug, Clone)]
-pub struct AbsMem {
-    pub non_rel: AbsNonRelMem,
-    pub rel: AbsRelMem,
-}
-
-impl AbsMem {
-    #[inline]
-    pub fn bot() -> Self {
-        Self {
-            non_rel: AbsNonRelMem::bot(),
-            rel: AbsRelMem::bot(),
-        }
-    }
-
-    #[inline]
-    pub fn join(&self, other: &Self) -> Self {
-        Self {
-            non_rel: self.non_rel.join(&other.non_rel),
-            rel: self.rel.join(&other.rel),
-        }
-    }
-
-    #[inline]
-    pub fn ord(&self, other: &Self) -> bool {
-        self.non_rel.ord(&other.non_rel) && self.rel.ord(&other.rel)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AbsNonRelMem {
-    pub values: HashMap<usize, AbsValue>,
-}
-
-impl AbsNonRelMem {
-    #[inline]
-    pub fn bot() -> Self {
-        Self {
-            values: HashMap::new(),
-        }
-    }
-
-    pub fn join(&self, other: &Self) -> Self {
-        let keys: HashSet<_> = self.values.keys().chain(other.values.keys()).collect();
-        let values = keys
-            .into_iter()
-            .map(|k| {
-                let bot = AbsValue::bot();
-                let v1 = self.values.get(k).unwrap_or(&bot);
-                let v2 = other.values.get(k).unwrap_or(&bot);
-                (*k, v1.join(*v2))
-            })
-            .collect();
-        Self { values }
-    }
-
-    pub fn ord(&self, other: &Self) -> bool {
-        self.values.iter().all(|(k, v1)| {
-            let bot = AbsValue::bot();
-            let v2 = other.values.get(k).unwrap_or(&bot);
-            v1.ord(v2)
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AbsValue {
-    Top,
-    Signed(i128),
-    Unsigned(u128),
-    Bot,
-}
-
-impl AbsValue {
-    #[inline]
-    pub fn top() -> Self {
-        Self::Top
-    }
-
-    #[inline]
-    pub fn bot() -> Self {
-        Self::Bot
-    }
-
-    pub fn join(self, other: Self) -> Self {
-        match (self, other) {
-            (x, Self::Bot) | (Self::Bot, x) => x,
-            (Self::Signed(x), Self::Signed(y)) if x == y => self,
-            (Self::Unsigned(x), Self::Unsigned(y)) if x == y => self,
-            _ => Self::Top,
-        }
-    }
-
-    pub fn ord(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Bot, _) | (_, Self::Top) => true,
-            (Self::Signed(x), Self::Signed(y)) if x == y => true,
-            (Self::Unsigned(x), Self::Unsigned(y)) if x == y => true,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AbsRelMem {
+pub enum AbsMem {
     Bot,
     Mem(Graph),
 }
 
-impl AbsRelMem {
+impl AbsMem {
     #[inline]
     pub fn top() -> Self {
         Self::Mem(Graph::default())
@@ -122,6 +19,14 @@ impl AbsRelMem {
     #[inline]
     pub fn bot() -> Self {
         Self::Bot
+    }
+
+    #[inline]
+    pub fn graph_mut(&mut self) -> &mut Graph {
+        match self {
+            Self::Bot => panic!(),
+            Self::Mem(g) => g,
+        }
     }
 
     pub fn join(&self, other: &Self) -> Self {
@@ -151,6 +56,15 @@ impl Location {
 pub enum Int {
     Signed(i128),
     Unsigned(u128),
+}
+
+impl Int {
+    pub fn as_usize(self) -> usize {
+        match self {
+            Self::Signed(x) => x as usize,
+            Self::Unsigned(x) => x as usize,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +135,7 @@ impl Graph {
         (id, &mut self.nodes[id])
     }
 
-    fn x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
+    pub fn x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
         let (id, _) = self.get_local_node(y.root);
         let loc = self.get_pointed_loc(id, &y.projections);
 
@@ -229,7 +143,7 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
-    fn x_eq_deref_y(&mut self, x: &AccPath, y: &AccPath) {
+    pub fn x_eq_deref_y(&mut self, x: &AccPath, y: &AccPath) {
         let (id, _) = self.get_local_node(y.root);
         let mut loc = self.get_pointed_loc(id, &[]);
         loc.projections.extend(y.projections.to_owned());
@@ -239,7 +153,7 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
-    fn deref_x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
+    pub fn deref_x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
         let (id, _) = self.get_local_node(y.root);
         let loc_y = self.get_pointed_loc(id, &y.projections);
 
@@ -252,7 +166,7 @@ impl Graph {
         *obj = Obj::Ptr(loc_y);
     }
 
-    fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath) {
+    pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath) {
         let (id, _) = self.get_local_node(y.root);
         let loc = Location::new(id, y.projections.to_owned());
 
@@ -260,13 +174,13 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
-    fn x_eq_int(&mut self, x: &AccPath, n: Int) {
+    pub fn x_eq_int(&mut self, x: &AccPath, n: Int) {
         let id = self.get_int_node(n);
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(Location::new(id, vec![]));
     }
 
-    fn deref_x_eq_int(&mut self, x: &AccPath, n: Int) {
+    pub fn deref_x_eq_int(&mut self, x: &AccPath, n: Int) {
         let n_id = self.get_int_node(n);
         let (id, _) = self.get_local_node(x.root);
         let mut loc = self.get_pointed_loc(id, &[]);
@@ -275,7 +189,20 @@ impl Graph {
         *obj = Obj::Ptr(Location::new(n_id, vec![]));
     }
 
-    fn get_value(&mut self, x: &AccPath) -> Option<Int> {
+    pub fn x_eq(&mut self, x: &AccPath) {
+        let obj = self.get_obj(x);
+        *obj = Obj::new();
+    }
+
+    pub fn deref_x_eq(&mut self, x: &AccPath) {
+        let (id, _) = self.get_local_node(x.root);
+        let mut loc = self.get_pointed_loc(id, &[]);
+        loc.projections.extend(x.projections.to_owned());
+        let obj = self.get_obj(x);
+        *obj = Obj::new();
+    }
+
+    pub fn get_int_value(&mut self, x: &AccPath) -> Option<Int> {
         let (id, _) = self.get_local_node(x.root);
         let loc = self.get_pointed_loc(id, &x.projections);
         if loc.projections.is_empty() {
