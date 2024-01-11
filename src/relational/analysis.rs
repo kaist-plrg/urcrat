@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -9,7 +9,7 @@ use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{BasicBlock, Body, Local, Location},
-    ty::{AdtKind, Ty, TyCtxt, TyKind},
+    ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_mir_dataflow::Analysis;
 use rustc_session::config::Input;
@@ -49,17 +49,30 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
         let rpo_map = compute_rpo_map(body, &loop_blocks);
         let dead_locals = get_dead_locals(body, tcx);
-        let ty_structures = body
+        let local_tys = body
             .local_decls
             .iter()
-            .map(|local| TyStructure::from_ty(local.ty, def_id, tcx))
+            .map(|decl| TyStructure::from_ty(decl.ty, def_id, tcx))
+            .collect();
+        let local_ptr_tys = body
+            .local_decls
+            .iter_enumerated()
+            .filter_map(|(local, decl)| {
+                let (TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _)) =
+                    decl.ty.kind()
+                else {
+                    return None;
+                };
+                Some((local, TyStructure::from_ty(*ty, def_id, tcx)))
+            })
             .collect();
         let analyzer = Analyzer {
             tcx,
             def_id,
             rpo_map,
             dead_locals,
-            ty_structures,
+            local_tys,
+            local_ptr_tys,
         };
         analyzer.analyze_body(body);
 
@@ -76,12 +89,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisResults;
 
+#[allow(missing_debug_implementations)]
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub def_id: DefId,
     pub rpo_map: HashMap<BasicBlock, usize>,
     pub dead_locals: Vec<BitSet<Local>>,
-    pub ty_structures: Vec<TyStructure>,
+    pub local_tys: Vec<TyStructure>,
+    pub local_ptr_tys: HashMap<Local, TyStructure>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
@@ -91,7 +106,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut work_list = WorkList::new(&self.rpo_map);
         work_list.push(Location::START);
 
-        let mut states: HashMap<Location, AbsMem> = HashMap::new();
+        let states: HashMap<Location, AbsMem> = HashMap::new();
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
@@ -111,7 +126,7 @@ impl<'tcx> Analyzer<'tcx> {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
                 let joined = next_state.join(&new_next_state);
                 if next_location.statement_index == 0 {
-                    let dead_locals = &self.dead_locals[next_location.block.as_usize()];
+                    let _dead_locals = &self.dead_locals[next_location.block.as_usize()];
                     // joined.clear_dead_locals(dead_locals);
                 }
                 if !joined.ord(next_state) {
@@ -121,9 +136,9 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn def_id_to_string(&self, def_id: DefId) -> String {
-        self.tcx.def_path(def_id).to_string_no_crate_verbose()
-    }
+    // fn def_id_to_string(&self, def_id: DefId) -> String {
+    //     self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    // }
 }
 
 #[derive(Debug)]
@@ -152,27 +167,8 @@ impl<'a> WorkList<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccPath {
-    pub root: Local,
-    pub projections: Vec<AccProj>,
-}
-
-impl AccPath {
-    #[inline]
-    pub fn new(root: Local, projections: Vec<AccProj>) -> Self {
-        Self { root, projections }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccProj {
-    Int(usize),
-    Symbolic(HashSet<Local>),
-}
-
 #[derive(Debug, Clone)]
-enum TyStructure {
+pub enum TyStructure {
     Adt(Vec<TyStructure>),
     Array(Box<TyStructure>, usize),
     Leaf,

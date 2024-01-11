@@ -23,13 +23,9 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    // steensgaard::analyze_path(&file);
-    relational::analyze_str(
-        "
-    union U { x: i32, y: f32 }
-    fn f(u: U) -> i32 {
-        u.x + u.y as i32
-    }
-    ",
-    );
+    steensgaard::analyze_path(&file);
+    // relational::analyze_str(
+    //     "
+    //     ",
+    // );
 }

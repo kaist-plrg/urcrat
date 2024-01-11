@@ -22,18 +22,18 @@ impl AbsMem {
     }
 
     #[inline]
-    pub fn graph_mut(&mut self) -> &mut Graph {
+    pub fn g(&mut self) -> &mut Graph {
         match self {
             Self::Bot => panic!(),
             Self::Mem(g) => g,
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    pub fn join(&self, _other: &Self) -> Self {
         todo!()
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    pub fn ord(&self, _other: &Self) -> bool {
         todo!()
     }
 }
@@ -43,12 +43,12 @@ type NodeId = usize;
 #[derive(Debug, Clone)]
 pub struct Location {
     root: NodeId,
-    projections: Vec<AccProj>,
+    projection: Vec<AccElem>,
 }
 
 impl Location {
-    fn new(root: NodeId, projections: Vec<AccProj>) -> Self {
-        Self { root, projections }
+    fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
+        Self { root, projection }
     }
 }
 
@@ -56,14 +56,13 @@ impl Location {
 pub enum Int {
     Signed(i128),
     Unsigned(u128),
+    Bool(bool),
 }
 
 impl Int {
     pub fn as_usize(self) -> usize {
-        match self {
-            Self::Signed(x) => x as usize,
-            Self::Unsigned(x) => x as usize,
-        }
+        let Self::Unsigned(x) = self else { panic!() };
+        x as usize
     }
 }
 
@@ -135,86 +134,125 @@ impl Graph {
         (id, &mut self.nodes[id])
     }
 
-    pub fn x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.root);
-        let loc = self.get_pointed_loc(id, &y.projections);
+    pub fn assign(&mut self, l: &AccPath, l_deref: bool, r: &OpVal) {
+        match r {
+            OpVal::Place(r, r_deref) => match (l_deref, r_deref) {
+                (true, true) => panic!(),
+                (true, false) => self.deref_x_eq_y(l, r),
+                (false, true) => self.x_eq_deref_y(l, r),
+                (false, false) => self.x_eq_y(l, r),
+            },
+            OpVal::Int(n) => {
+                if l_deref {
+                    self.deref_x_eq_int(l, *n);
+                } else {
+                    self.x_eq_int(l, *n);
+                }
+            }
+            OpVal::Other => {
+                if l_deref {
+                    self.deref_x_eq(l);
+                } else {
+                    self.x_eq(l);
+                }
+            }
+        }
+    }
+
+    pub fn assign_with_suffixes(
+        &mut self,
+        l: &AccPath,
+        l_deref: bool,
+        r: &OpVal,
+        suffixes: &[Vec<AccElem>],
+    ) {
+        for suffix in suffixes {
+            let l = l.extended(suffix);
+            let r = r.extended(suffix);
+            self.assign(&l, l_deref, &r);
+        }
+    }
+
+    fn x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
+        let (id, _) = self.get_local_node(y.local);
+        let loc = self.get_pointed_loc(id, &y.projection);
 
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(loc);
     }
 
-    pub fn x_eq_deref_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.root);
+    fn x_eq_deref_y(&mut self, x: &AccPath, y: &AccPath) {
+        let (id, _) = self.get_local_node(y.local);
         let mut loc = self.get_pointed_loc(id, &[]);
-        loc.projections.extend(y.projections.to_owned());
-        let loc = self.get_pointed_loc(loc.root, &loc.projections);
+        loc.projection.extend(y.projection.to_owned());
+        let loc = self.get_pointed_loc(loc.root, &loc.projection);
 
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(loc);
     }
 
-    pub fn deref_x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.root);
-        let loc_y = self.get_pointed_loc(id, &y.projections);
+    fn deref_x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
+        let (id, _) = self.get_local_node(y.local);
+        let loc_y = self.get_pointed_loc(id, &y.projection);
 
-        let (id, _) = self.get_local_node(x.root);
+        let (id, _) = self.get_local_node(x.local);
         let mut loc_x = self.get_pointed_loc(id, &[]);
-        loc_x.projections.extend(x.projections.to_owned());
+        loc_x.projection.extend(x.projection.to_owned());
 
         let node = &mut self.nodes[loc_x.root];
-        let obj = Self::get_obj_iter(&mut node.obj, &loc_x.projections);
+        let obj = project_obj(&mut node.obj, &loc_x.projection);
         *obj = Obj::Ptr(loc_y);
     }
 
     pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.root);
-        let loc = Location::new(id, y.projections.to_owned());
+        let (id, _) = self.get_local_node(y.local);
+        let loc = Location::new(id, y.projection.to_owned());
 
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(loc);
     }
 
-    pub fn x_eq_int(&mut self, x: &AccPath, n: Int) {
+    fn x_eq_int(&mut self, x: &AccPath, n: Int) {
         let id = self.get_int_node(n);
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(Location::new(id, vec![]));
     }
 
-    pub fn deref_x_eq_int(&mut self, x: &AccPath, n: Int) {
+    fn deref_x_eq_int(&mut self, x: &AccPath, n: Int) {
         let n_id = self.get_int_node(n);
-        let (id, _) = self.get_local_node(x.root);
+        let (id, _) = self.get_local_node(x.local);
         let mut loc = self.get_pointed_loc(id, &[]);
-        loc.projections.extend(x.projections.to_owned());
+        loc.projection.extend(x.projection.to_owned());
         let obj = self.get_obj(x);
         *obj = Obj::Ptr(Location::new(n_id, vec![]));
     }
 
-    pub fn x_eq(&mut self, x: &AccPath) {
+    fn x_eq(&mut self, x: &AccPath) {
         let obj = self.get_obj(x);
         *obj = Obj::new();
     }
 
-    pub fn deref_x_eq(&mut self, x: &AccPath) {
-        let (id, _) = self.get_local_node(x.root);
+    fn deref_x_eq(&mut self, x: &AccPath) {
+        let (id, _) = self.get_local_node(x.local);
         let mut loc = self.get_pointed_loc(id, &[]);
-        loc.projections.extend(x.projections.to_owned());
+        loc.projection.extend(x.projection.to_owned());
         let obj = self.get_obj(x);
         *obj = Obj::new();
     }
 
     pub fn get_int_value(&mut self, x: &AccPath) -> Option<Int> {
-        let (id, _) = self.get_local_node(x.root);
-        let loc = self.get_pointed_loc(id, &x.projections);
-        if loc.projections.is_empty() {
+        let (id, _) = self.get_local_node(x.local);
+        let loc = self.get_pointed_loc(id, &x.projection);
+        if loc.projection.is_empty() {
             self.nodes[loc.root].at_addr
         } else {
             None
         }
     }
 
-    fn get_pointed_loc(&mut self, node_id: NodeId, projs: &[AccProj]) -> Location {
+    fn get_pointed_loc(&mut self, node_id: NodeId, proj: &[AccElem]) -> Location {
         let next_id = self.nodes.len();
-        let obj = Self::get_obj_iter(&mut self.nodes[node_id].obj, projs);
+        let obj = project_obj(&mut self.nodes[node_id].obj, proj);
         let loc = if let Obj::Ptr(loc) = obj {
             loc.clone()
         } else {
@@ -229,31 +267,31 @@ impl Graph {
     }
 
     fn get_obj(&mut self, x: &AccPath) -> &mut Obj {
-        let (_, node) = self.get_local_node(x.root);
-        Self::get_obj_iter(&mut node.obj, &x.projections)
+        let (_, node) = self.get_local_node(x.local);
+        project_obj(&mut node.obj, &x.projection)
     }
+}
 
-    fn get_obj_iter<'a>(obj: &'a mut Obj, projs: &[AccProj]) -> &'a mut Obj {
-        if let Some(proj) = projs.get(0) {
-            let inner = match proj {
-                AccProj::Int(n) => {
-                    if !matches!(obj, Obj::Compound(_)) {
-                        *obj = Obj::new();
-                    }
-                    let Obj::Compound(fields) = obj else { unreachable!() };
-                    fields.entry(*n).or_insert(Obj::new())
+fn project_obj<'a>(obj: &'a mut Obj, proj: &[AccElem]) -> &'a mut Obj {
+    if let Some(elem) = proj.get(0) {
+        let inner = match elem {
+            AccElem::Int(n) => {
+                if !matches!(obj, Obj::Compound(_)) {
+                    *obj = Obj::new();
                 }
-                AccProj::Symbolic(local) => {
-                    if !matches!(obj, Obj::SymbolicIndex(_, _)) {
-                        *obj = Obj::SymbolicIndex(local.clone(), Box::new(Obj::new()));
-                    }
-                    let Obj::SymbolicIndex(_, box obj) = obj else { unreachable!() };
-                    obj
+                let Obj::Compound(fields) = obj else { unreachable!() };
+                fields.entry(*n).or_insert(Obj::new())
+            }
+            AccElem::Symbolic(local) => {
+                if !matches!(obj, Obj::SymbolicIndex(_, _)) {
+                    *obj = Obj::SymbolicIndex(local.clone(), Box::new(Obj::new()));
                 }
-            };
-            Self::get_obj_iter(inner, &projs[1..])
-        } else {
-            obj
-        }
+                let Obj::SymbolicIndex(_, box obj) = obj else { unreachable!() };
+                obj
+            }
+        };
+        project_obj(inner, &proj[1..])
+    } else {
+        obj
     }
 }
