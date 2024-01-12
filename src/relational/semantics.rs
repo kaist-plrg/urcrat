@@ -79,12 +79,8 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::Ref(_, _, r) => {
                 assert!(suffixes.is_empty());
                 assert!(!l_deref);
-                let (path, is_deref) = AccPath::from_place(*r, state);
-                if is_deref {
-                    state.gm().x_eq_ref_deref_y(&l, &path);
-                } else {
-                    state.gm().x_eq_ref_y(&l, &path);
-                }
+                let (r, r_deref) = AccPath::from_place(*r, state);
+                state.gm().x_eq_ref_y(&l, &r, r_deref);
             }
             Rvalue::ThreadLocalRef(_) => {
                 assert!(suffixes.is_empty());
@@ -270,11 +266,7 @@ impl<'tcx> Analyzer<'tcx> {
                             };
                             let v = Int::from_u128(v, ty);
                             let mut state = state.clone();
-                            if is_deref {
-                                state.gm().filter_deref_x_int(&discr, v);
-                            } else {
-                                state.gm().filter_x_int(&discr, v);
-                            }
+                            state.gm().filter_x_int(&discr, is_deref, v);
                             (location, state)
                         })
                         .chain(std::iter::once((
