@@ -8,7 +8,7 @@ use rustc_data_structures::graph::WithSuccessors;
 use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{BasicBlock, Body, Local, Location},
+    mir::{BasicBlock, Body, Local, Location, Operand},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_mir_dataflow::Analysis;
@@ -68,13 +68,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             .collect();
         let analyzer = Analyzer {
             tcx,
+            body,
             def_id,
             rpo_map,
             dead_locals,
             local_tys,
             local_ptr_tys,
         };
-        analyzer.analyze_body(body);
+        analyzer.analyze();
 
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
@@ -92,6 +93,7 @@ pub struct AnalysisResults;
 #[allow(missing_debug_implementations)]
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    pub body: &'tcx Body<'tcx>,
     pub def_id: DefId,
     pub rpo_map: HashMap<BasicBlock, usize>,
     pub dead_locals: Vec<BitSet<Local>>,
@@ -100,7 +102,7 @@ pub struct Analyzer<'tcx> {
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    fn analyze_body(&self, body: &Body<'tcx>) {
+    fn analyze(&self) {
         let bot = AbsMem::bot();
 
         let mut work_list = WorkList::new(&self.rpo_map);
@@ -110,17 +112,13 @@ impl<'tcx> Analyzer<'tcx> {
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
-            let bbd = &body.basic_blocks[location.block];
+            let mut next_state = state.clone();
+            let bbd = &self.body.basic_blocks[location.block];
             let nexts = if let Some(stmt) = bbd.statements.get(location.statement_index) {
-                let mut next_state = state.clone();
                 self.transfer_stmt(stmt, &mut next_state);
-
-                let mut next_location = location;
-                next_location.statement_index += 1;
-
-                vec![(next_location, next_state)]
+                vec![(location.successor_within_block(), next_state)]
             } else {
-                self.transfer_term(bbd.terminator())
+                self.transfer_term(bbd.terminator(), &next_state)
             };
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
@@ -134,6 +132,10 @@ impl<'tcx> Analyzer<'tcx> {
                 }
             }
         }
+    }
+
+    pub fn ty(&self, operand: &Operand<'tcx>) -> Ty<'tcx> {
+        operand.ty(&self.body.local_decls, self.tcx)
     }
 
     // fn def_id_to_string(&self, def_id: DefId) -> String {

@@ -23,7 +23,15 @@ impl AbsMem {
     }
 
     #[inline]
-    pub fn g(&mut self) -> &mut Graph {
+    pub fn g(&self) -> &Graph {
+        match self {
+            Self::Bot => panic!(),
+            Self::Mem(g) => g,
+        }
+    }
+
+    #[inline]
+    pub fn gm(&mut self) -> &mut Graph {
         match self {
             Self::Bot => panic!(),
             Self::Mem(g) => g,
@@ -134,6 +142,23 @@ impl Obj {
             inner.project_mut(&proj[1..])
         } else {
             self
+        }
+    }
+
+    fn substitute(&mut self, old_id: NodeId, new_id: NodeId) {
+        match self {
+            Obj::Ptr(loc) => {
+                if loc.root == old_id {
+                    assert!(loc.projection.is_empty());
+                    loc.root = new_id;
+                }
+            }
+            Obj::Compound(fs) => {
+                for obj in fs.values_mut() {
+                    obj.substitute(old_id, new_id);
+                }
+            }
+            Obj::Index(_, box obj) => obj.substitute(old_id, new_id),
         }
     }
 }
@@ -359,7 +384,8 @@ impl Graph {
         let (id, _) = self.get_local_node_mut(x.local);
         let mut loc = self.get_pointed_loc_mut(id, &[]);
         loc.projection.extend(x.projection.to_owned());
-        let obj = self.get_obj_mut(x);
+        let node = &mut self.nodes[loc.root];
+        let obj = node.obj.project_mut(&loc.projection);
         *obj = Obj::Ptr(Location::new(n_id, vec![]));
     }
 
@@ -372,8 +398,49 @@ impl Graph {
         let (id, _) = self.get_local_node_mut(x.local);
         let mut loc = self.get_pointed_loc_mut(id, &[]);
         loc.projection.extend(x.projection.to_owned());
-        let obj = self.get_obj_mut(x);
+        let node = &mut self.nodes[loc.root];
+        let obj = node.obj.project_mut(&loc.projection);
         *obj = Obj::new();
+    }
+
+    pub fn filter_x_int(&mut self, x: &AccPath, n: Int) {
+        let obj = self.get_obj_mut(x);
+        let Obj::Ptr(ptr) = obj else { unreachable!() };
+        assert!(ptr.projection.is_empty());
+        let id = ptr.root;
+
+        if let Some(n_id) = self.ints.get(&n) {
+            let n_id = *n_id;
+            self.substitute(id, n_id);
+        } else {
+            self.nodes[id].at_addr = Some(n);
+            self.ints.insert(n, id);
+        }
+    }
+
+    pub fn filter_deref_x_int(&mut self, x: &AccPath, n: Int) {
+        let (id, _) = self.get_local_node_mut(x.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
+        loc.projection.extend(x.projection.to_owned());
+        let node = &mut self.nodes[loc.root];
+        let obj = node.obj.project_mut(&loc.projection);
+        let Obj::Ptr(ptr) = obj else { unreachable!() };
+        assert!(ptr.projection.is_empty());
+        let id = ptr.root;
+
+        if let Some(n_id) = self.ints.get(&n) {
+            let n_id = *n_id;
+            self.substitute(id, n_id);
+        } else {
+            self.nodes[id].at_addr = Some(n);
+            self.ints.insert(n, id);
+        }
+    }
+
+    fn substitute(&mut self, old_id: NodeId, new_id: NodeId) {
+        for node in &mut self.nodes {
+            node.obj.substitute(old_id, new_id);
+        }
     }
 
     pub fn find_aliases(&self, local: Local) -> HashSet<Local> {
@@ -398,9 +465,21 @@ impl Graph {
         }
     }
 
-    pub fn get_int_value(&self, x: &AccPath) -> Option<Int> {
+    pub fn get_x_as_int(&self, x: &AccPath) -> Option<Int> {
         let id = self.locals.get(&x.local)?;
         let loc = self.get_pointed_loc(*id, &x.projection)?;
+        if loc.projection.is_empty() {
+            self.nodes[loc.root].at_addr
+        } else {
+            None
+        }
+    }
+
+    pub fn get_deref_x_as_int(&self, x: &AccPath) -> Option<Int> {
+        let id = self.locals.get(&x.local)?;
+        let mut loc = self.get_pointed_loc(*id, &[])?;
+        loc.projection.extend(x.projection.to_owned());
+        let loc = self.get_pointed_loc(loc.root, &loc.projection)?;
         if loc.projection.is_empty() {
             self.nodes[loc.root].at_addr
         } else {

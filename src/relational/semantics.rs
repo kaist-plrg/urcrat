@@ -5,9 +5,9 @@ use rustc_middle::{
     mir::{
         interpret::{ConstValue, Scalar},
         AggregateKind, BinOp, CastKind, ConstantKind, Local, Location, Operand, Place, PlaceElem,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, UnOp,
+        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
     },
-    ty::{adjustment::PointerCoercion, IntTy, TyKind, UintTy},
+    ty::{adjustment::PointerCoercion, IntTy, Ty, TyKind, UintTy},
 };
 
 use super::*;
@@ -20,13 +20,13 @@ impl<'tcx> Analyzer<'tcx> {
         let suffixes = self.get_path_suffixes(&l);
         match r {
             Rvalue::Use(r) => {
-                let r = self.transfer_op(r, false, state);
-                state.g().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                let r = self.transfer_op(r, state);
+                state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
             }
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
                     assert!(suffixes.is_empty());
-                    let r = self.transfer_op(r, true, state);
+                    let r = self.transfer_op(r, state);
                     if let OpVal::Int(v) = r {
                         let v = match ty.kind() {
                             TyKind::Int(int_ty) => match int_ty {
@@ -47,33 +47,33 @@ impl<'tcx> Analyzer<'tcx> {
                             },
                             _ => unreachable!(),
                         };
-                        state.g().assign(&l, l_deref, &OpVal::Int(v));
+                        state.gm().assign(&l, l_deref, &OpVal::Int(v));
                     } else {
-                        state.g().assign(&l, l_deref, &OpVal::Other);
+                        state.gm().assign(&l, l_deref, &OpVal::Other);
                     }
                 }
                 CastKind::PointerCoercion(coercion) => {
                     if *coercion == PointerCoercion::MutToConstPointer {
-                        let r = self.transfer_op(r, false, state);
-                        state.g().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                        let r = self.transfer_op(r, state);
+                        state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                     } else {
                         state
-                            .g()
+                            .gm()
                             .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
                     }
                 }
                 _ => {
                     state
-                        .g()
+                        .gm()
                         .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
                 }
             },
             Rvalue::Repeat(r, len) => {
-                let r = self.transfer_op(r, false, state);
+                let r = self.transfer_op(r, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 for i in 0..len {
                     let l = l.extended(&[AccElem::Int(i as _)]);
-                    state.g().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                    state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                 }
             }
             Rvalue::Ref(_, _, r) => {
@@ -81,14 +81,14 @@ impl<'tcx> Analyzer<'tcx> {
                 assert!(!l_deref);
                 let (path, is_deref) = AccPath::from_place(*r, state);
                 if is_deref {
-                    state.g().x_eq_ref_deref_y(&l, &path);
+                    state.gm().x_eq_ref_deref_y(&l, &path);
                 } else {
-                    state.g().x_eq_ref_y(&l, &path);
+                    state.gm().x_eq_ref_y(&l, &path);
                 }
             }
             Rvalue::ThreadLocalRef(_) => {
                 assert!(suffixes.is_empty());
-                state.g().assign(&l, l_deref, &OpVal::Other);
+                state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::AddressOf(_, r) => {
                 assert!(suffixes.is_empty());
@@ -96,13 +96,13 @@ impl<'tcx> Analyzer<'tcx> {
                 let (path, is_deref) = AccPath::from_place(*r, state);
                 assert!(is_deref);
                 let v = OpVal::Place(path, false);
-                state.g().assign(&l, l_deref, &v);
+                state.gm().assign(&l, l_deref, &v);
             }
             Rvalue::Len(_) => unreachable!(),
             Rvalue::BinaryOp(op, box (r1, r2)) => {
                 assert!(suffixes.is_empty());
-                let r1 = self.transfer_op(r1, true, state);
-                let r2 = self.transfer_op(r2, true, state);
+                let r1 = self.transfer_op(r1, state);
+                let r2 = self.transfer_op(r2, state);
                 if let (OpVal::Int(v1), OpVal::Int(v2)) = (r1, r2) {
                     let v = match op {
                         BinOp::Add => v1.add(v2),
@@ -123,29 +123,29 @@ impl<'tcx> Analyzer<'tcx> {
                         BinOp::Gt => v1.gt(v2),
                         _ => unreachable!(),
                     };
-                    state.g().assign(&l, l_deref, &OpVal::Int(v));
+                    state.gm().assign(&l, l_deref, &OpVal::Int(v));
                 } else {
-                    state.g().assign(&l, l_deref, &OpVal::Other);
+                    state.gm().assign(&l, l_deref, &OpVal::Other);
                 }
             }
             Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
                 assert!(suffixes.is_empty());
-                let r = self.transfer_op(r, true, state);
+                let r = self.transfer_op(r, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
                         UnOp::Not => v.not(),
                         UnOp::Neg => v.neg(),
                     };
-                    state.g().assign(&l, l_deref, &OpVal::Int(v));
+                    state.gm().assign(&l, l_deref, &OpVal::Int(v));
                 } else {
-                    state.g().assign(&l, l_deref, &OpVal::Other);
+                    state.gm().assign(&l, l_deref, &OpVal::Other);
                 }
             }
             Rvalue::NullaryOp(_, _) => unreachable!(),
             Rvalue::Discriminant(_) => {
                 assert!(suffixes.is_empty());
-                state.g().assign(&l, l_deref, &OpVal::Other);
+                state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::Aggregate(box kind, rs) => {
                 let idx = if let AggregateKind::Adt(_, _, _, _, idx) = kind {
@@ -156,14 +156,14 @@ impl<'tcx> Analyzer<'tcx> {
                 if let Some(field) = idx {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
-                    let v = self.transfer_op(op, false, state);
+                    let v = self.transfer_op(op, state);
                     let l = l.extended(&[AccElem::Int(field.index())]);
-                    state.g().assign_with_suffixes(&l, l_deref, &v, &suffixes);
+                    state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
-                        let v = self.transfer_op(op, false, state);
+                        let v = self.transfer_op(op, state);
                         let l = l.extended(&[AccElem::Int(field.index())]);
-                        state.g().assign_with_suffixes(&l, l_deref, &v, &suffixes);
+                        state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
                 }
             }
@@ -174,22 +174,22 @@ impl<'tcx> Analyzer<'tcx> {
                 let (path, is_deref) = AccPath::from_place(*r, state);
                 assert!(!is_deref);
                 let v = OpVal::Place(path, false);
-                state.g().assign(&l, l_deref, &v);
+                state.gm().assign(&l, l_deref, &v);
             }
         }
     }
 
-    fn transfer_op(&self, op: &Operand<'_>, get_int: bool, state: &mut AbsMem) -> OpVal {
+    fn transfer_op(&self, op: &Operand<'_>, state: &AbsMem) -> OpVal {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
                 let (path, is_deref) = AccPath::from_place(*place, state);
-                if get_int {
-                    assert!(!is_deref);
-                    if let Some(i) = state.g().get_int_value(&path) {
-                        OpVal::Int(i)
-                    } else {
-                        OpVal::Place(path, is_deref)
-                    }
+                let int_opt = if is_deref {
+                    state.g().get_deref_x_as_int(&path)
+                } else {
+                    state.g().get_x_as_int(&path)
+                };
+                if let Some(i) = int_opt {
+                    OpVal::Int(i)
                 } else {
                     OpVal::Place(path, is_deref)
                 }
@@ -234,8 +234,94 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    pub fn transfer_term(&self, _term: &Terminator<'tcx>) -> Vec<(Location, AbsMem)> {
-        todo!()
+    pub fn transfer_term(
+        &self,
+        term: &Terminator<'tcx>,
+        state: &AbsMem,
+    ) -> Vec<(Location, AbsMem)> {
+        match &term.kind {
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::Assert { target, .. }
+            | TerminatorKind::InlineAsm {
+                destination: Some(target),
+                ..
+            } => {
+                let location = Location {
+                    block: *target,
+                    statement_index: 0,
+                };
+                vec![(location, state.clone())]
+            }
+            TerminatorKind::Return
+            | TerminatorKind::InlineAsm {
+                destination: None, ..
+            }
+            | TerminatorKind::Call { target: None, .. } => vec![],
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let ty = self.ty(discr);
+                match self.transfer_op(discr, state) {
+                    OpVal::Place(discr, is_deref) => targets
+                        .iter()
+                        .map(|(v, target)| {
+                            let location = Location {
+                                block: target,
+                                statement_index: 0,
+                            };
+                            let v = Int::from_u128(v, ty);
+                            let mut state = state.clone();
+                            if is_deref {
+                                state.gm().filter_deref_x_int(&discr, v);
+                            } else {
+                                state.gm().filter_x_int(&discr, v);
+                            }
+                            (location, state)
+                        })
+                        .chain(std::iter::once((
+                            Location {
+                                block: targets.otherwise(),
+                                statement_index: 0,
+                            },
+                            state.clone(),
+                        )))
+                        .collect(),
+                    OpVal::Int(i) => {
+                        let target_opt = targets.iter().find(|(v, _)| i == Int::from_u128(*v, ty));
+                        let target = if let Some((_, target)) = target_opt {
+                            target
+                        } else {
+                            targets.otherwise()
+                        };
+                        let location = Location {
+                            block: target,
+                            statement_index: 0,
+                        };
+                        vec![(location, state.clone())]
+                    }
+                    OpVal::Other => targets
+                        .all_targets()
+                        .iter()
+                        .map(|target| {
+                            let location = Location {
+                                block: *target,
+                                statement_index: 0,
+                            };
+                            (location, state.clone())
+                        })
+                        .collect(),
+                }
+            }
+            TerminatorKind::Call {
+                func: _func,
+                args: _args,
+                destination: _destination,
+                target: Some(_),
+                ..
+            } => {
+                todo!()
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn get_path_suffixes(&self, path: &AccPath) -> Vec<Vec<AccElem>> {
@@ -337,7 +423,7 @@ impl AccPath {
         Self { local, projection }
     }
 
-    fn from_place(place: Place<'_>, state: &mut AbsMem) -> (Self, bool) {
+    fn from_place(place: Place<'_>, state: &AbsMem) -> (Self, bool) {
         let root = place.local;
         let projections = place
             .projection
@@ -368,13 +454,13 @@ pub enum AccElem {
 }
 
 impl AccElem {
-    fn from_elem(proj: PlaceElem<'_>, state: &mut AbsMem) -> Option<Self> {
+    fn from_elem(proj: PlaceElem<'_>, state: &AbsMem) -> Option<Self> {
         match proj {
             ProjectionElem::Deref => None,
             ProjectionElem::Field(i, _) => Some(AccElem::Int(i.index())),
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
-                if let Some(i) = state.g().get_int_value(&path) {
+                if let Some(i) = state.g().get_x_as_int(&path) {
                     Some(AccElem::Int(i.as_usize()))
                 } else {
                     Some(AccElem::Symbolic(state.g().find_aliases(local)))
@@ -517,5 +603,34 @@ impl Int {
     fn neg(self) -> Self {
         let Int::Signed(v) = self else { unreachable!() };
         Int::Signed(-v)
+    }
+
+    fn from_u128(v: u128, ty: Ty<'_>) -> Self {
+        match ty.kind() {
+            TyKind::Int(int_ty) => {
+                let v = match int_ty {
+                    IntTy::Isize => v as isize as i128,
+                    IntTy::I8 => v as i8 as i128,
+                    IntTy::I16 => v as i16 as i128,
+                    IntTy::I32 => v as i32 as i128,
+                    IntTy::I64 => v as i64 as i128,
+                    IntTy::I128 => v as i128,
+                };
+                Int::Signed(v)
+            }
+            TyKind::Uint(uint_ty) => {
+                let v = match uint_ty {
+                    UintTy::Usize => v as usize as u128,
+                    UintTy::U8 => v as u8 as u128,
+                    UintTy::U16 => v as u16 as u128,
+                    UintTy::U32 => v as u32 as u128,
+                    UintTy::U64 => v as u64 as u128,
+                    UintTy::U128 => v,
+                };
+                Int::Unsigned(v)
+            }
+            TyKind::Bool => Int::Bool(v != 0),
+            _ => unreachable!(),
+        }
     }
 }
