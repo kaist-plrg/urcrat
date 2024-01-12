@@ -20,22 +20,14 @@ impl<'tcx> Analyzer<'tcx> {
         let suffixes = self.get_path_suffixes(&l);
         match r {
             Rvalue::Use(r) => {
-                let r = self.transfer_op(r, state);
+                let r = self.transfer_op(r, false, state);
                 state.g().assign_with_suffixes(&l, l_deref, &r, &suffixes);
             }
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
                     assert!(suffixes.is_empty());
-                    let r = self.transfer_op(r, state);
-                    let int_opt = match r {
-                        OpVal::Place(path, deref) => {
-                            assert!(!deref);
-                            state.g().get_int_value(&path)
-                        }
-                        OpVal::Int(i) => Some(i),
-                        OpVal::Other => None,
-                    };
-                    if let Some(v) = int_opt {
+                    let r = self.transfer_op(r, true, state);
+                    if let OpVal::Int(v) = r {
                         let v = match ty.kind() {
                             TyKind::Int(int_ty) => match int_ty {
                                 IntTy::Isize => v.cast_to_i64(),
@@ -62,7 +54,7 @@ impl<'tcx> Analyzer<'tcx> {
                 }
                 CastKind::PointerCoercion(coercion) => {
                     if *coercion == PointerCoercion::MutToConstPointer {
-                        let r = self.transfer_op(r, state);
+                        let r = self.transfer_op(r, false, state);
                         state.g().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                     } else {
                         state
@@ -77,7 +69,7 @@ impl<'tcx> Analyzer<'tcx> {
                 }
             },
             Rvalue::Repeat(r, len) => {
-                let r = self.transfer_op(r, state);
+                let r = self.transfer_op(r, false, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 for i in 0..len {
                     let l = l.extended(&[AccElem::Int(i as _)]);
@@ -86,10 +78,12 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::Ref(_, _, r) => {
                 assert!(suffixes.is_empty());
-                if r.is_indirect_first_projection() {
-                    todo!()
+                assert!(!l_deref);
+                let (path, is_deref) = AccPath::from_place(*r, state);
+                if is_deref {
+                    state.g().x_eq_ref_deref_y(&l, &path);
                 } else {
-                    todo!()
+                    state.g().x_eq_ref_y(&l, &path);
                 }
             }
             Rvalue::ThreadLocalRef(_) => {
@@ -107,8 +101,8 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::Len(_) => unreachable!(),
             Rvalue::BinaryOp(op, box (r1, r2)) => {
                 assert!(suffixes.is_empty());
-                let r1 = self.transfer_op(r1, state);
-                let r2 = self.transfer_op(r2, state);
+                let r1 = self.transfer_op(r1, true, state);
+                let r2 = self.transfer_op(r2, true, state);
                 if let (OpVal::Int(v1), OpVal::Int(v2)) = (r1, r2) {
                     let v = match op {
                         BinOp::Add => v1.add(v2),
@@ -137,7 +131,7 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
                 assert!(suffixes.is_empty());
-                let r = self.transfer_op(r, state);
+                let r = self.transfer_op(r, true, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
                         UnOp::Not => v.not(),
@@ -162,12 +156,12 @@ impl<'tcx> Analyzer<'tcx> {
                 if let Some(field) = idx {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
-                    let v = self.transfer_op(op, state);
+                    let v = self.transfer_op(op, false, state);
                     let l = l.extended(&[AccElem::Int(field.index())]);
                     state.g().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
-                        let v = self.transfer_op(op, state);
+                        let v = self.transfer_op(op, false, state);
                         let l = l.extended(&[AccElem::Int(field.index())]);
                         state.g().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
@@ -185,11 +179,20 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn transfer_op(&self, op: &Operand<'_>, state: &mut AbsMem) -> OpVal {
+    fn transfer_op(&self, op: &Operand<'_>, get_int: bool, state: &mut AbsMem) -> OpVal {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
                 let (path, is_deref) = AccPath::from_place(*place, state);
-                OpVal::Place(path, is_deref)
+                if get_int {
+                    assert!(!is_deref);
+                    if let Some(i) = state.g().get_int_value(&path) {
+                        OpVal::Int(i)
+                    } else {
+                        OpVal::Place(path, is_deref)
+                    }
+                } else {
+                    OpVal::Place(path, is_deref)
+                }
             }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
@@ -358,7 +361,7 @@ impl AccPath {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccElem {
     Int(usize),
     Symbolic(HashSet<Local>),
@@ -374,8 +377,7 @@ impl AccElem {
                 if let Some(i) = state.g().get_int_value(&path) {
                     Some(AccElem::Int(i.as_usize()))
                 } else {
-                    // TODO: aliasing
-                    Some(AccElem::Symbolic([local].into_iter().collect()))
+                    Some(AccElem::Symbolic(state.g().find_aliases(local)))
                 }
             }
             ProjectionElem::ConstantIndex { .. } => unreachable!(),

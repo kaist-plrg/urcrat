@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use etrace::some_or;
 use rustc_middle::mir::Local;
 
 use super::*;
@@ -40,7 +41,7 @@ impl AbsMem {
 
 type NodeId = usize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     root: NodeId,
     projection: Vec<AccElem>,
@@ -123,7 +124,7 @@ impl Graph {
         }
     }
 
-    fn get_local_node(&mut self, l: Local) -> (NodeId, &mut Node) {
+    fn get_local_node_mut(&mut self, l: Local) -> (NodeId, &mut Node) {
         let id = if let Some(id) = self.locals.get(&l) {
             *id
         } else {
@@ -174,75 +175,106 @@ impl Graph {
     }
 
     fn x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.local);
-        let loc = self.get_pointed_loc(id, &y.projection);
+        let (id, _) = self.get_local_node_mut(y.local);
+        let loc = self.get_pointed_loc_mut(id, &y.projection);
 
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::Ptr(loc);
     }
 
     fn x_eq_deref_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.local);
-        let mut loc = self.get_pointed_loc(id, &[]);
+        let (id, _) = self.get_local_node_mut(y.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
         loc.projection.extend(y.projection.to_owned());
-        let loc = self.get_pointed_loc(loc.root, &loc.projection);
+        let loc = self.get_pointed_loc_mut(loc.root, &loc.projection);
 
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::Ptr(loc);
     }
 
     fn deref_x_eq_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.local);
-        let loc_y = self.get_pointed_loc(id, &y.projection);
+        let (id, _) = self.get_local_node_mut(y.local);
+        let loc_y = self.get_pointed_loc_mut(id, &y.projection);
 
-        let (id, _) = self.get_local_node(x.local);
-        let mut loc_x = self.get_pointed_loc(id, &[]);
+        let (id, _) = self.get_local_node_mut(x.local);
+        let mut loc_x = self.get_pointed_loc_mut(id, &[]);
         loc_x.projection.extend(x.projection.to_owned());
 
         let node = &mut self.nodes[loc_x.root];
-        let obj = project_obj(&mut node.obj, &loc_x.projection);
+        let obj = project_obj_mut(&mut node.obj, &loc_x.projection);
         *obj = Obj::Ptr(loc_y);
     }
 
     pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath) {
-        let (id, _) = self.get_local_node(y.local);
+        let (id, _) = self.get_local_node_mut(y.local);
         let loc = Location::new(id, y.projection.to_owned());
 
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
+        *obj = Obj::Ptr(loc);
+    }
+
+    pub fn x_eq_ref_deref_y(&mut self, x: &AccPath, y: &AccPath) {
+        let (id, _) = self.get_local_node_mut(y.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
+        loc.projection.extend(y.projection.to_owned());
+
+        let obj = self.get_obj_mut(x);
         *obj = Obj::Ptr(loc);
     }
 
     fn x_eq_int(&mut self, x: &AccPath, n: Int) {
         let id = self.get_int_node(n);
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::Ptr(Location::new(id, vec![]));
     }
 
     fn deref_x_eq_int(&mut self, x: &AccPath, n: Int) {
         let n_id = self.get_int_node(n);
-        let (id, _) = self.get_local_node(x.local);
-        let mut loc = self.get_pointed_loc(id, &[]);
+        let (id, _) = self.get_local_node_mut(x.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
         loc.projection.extend(x.projection.to_owned());
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::Ptr(Location::new(n_id, vec![]));
     }
 
     fn x_eq(&mut self, x: &AccPath) {
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::new();
     }
 
     fn deref_x_eq(&mut self, x: &AccPath) {
-        let (id, _) = self.get_local_node(x.local);
-        let mut loc = self.get_pointed_loc(id, &[]);
+        let (id, _) = self.get_local_node_mut(x.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
         loc.projection.extend(x.projection.to_owned());
-        let obj = self.get_obj(x);
+        let obj = self.get_obj_mut(x);
         *obj = Obj::new();
     }
 
-    pub fn get_int_value(&mut self, x: &AccPath) -> Option<Int> {
-        let (id, _) = self.get_local_node(x.local);
-        let loc = self.get_pointed_loc(id, &x.projection);
+    pub fn find_aliases(&self, local: Local) -> HashSet<Local> {
+        let mut aliases = HashSet::new();
+        let loc1 = self.loc_pointed_by_local(local).unwrap();
+        for l in self.locals.keys() {
+            let loc2 = some_or!(self.loc_pointed_by_local(*l), continue);
+            if loc1 == loc2 {
+                aliases.insert(*l);
+            }
+        }
+        aliases
+    }
+
+    fn loc_pointed_by_local(&self, local: Local) -> Option<&Location> {
+        let id = self.locals.get(&local)?;
+        let node = &self.nodes[*id];
+        if let Obj::Ptr(loc) = &node.obj {
+            Some(loc)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_int_value(&self, x: &AccPath) -> Option<Int> {
+        let id = self.locals.get(&x.local)?;
+        let loc = self.get_pointed_loc(*id, &x.projection)?;
         if loc.projection.is_empty() {
             self.nodes[loc.root].at_addr
         } else {
@@ -250,9 +282,15 @@ impl Graph {
         }
     }
 
-    fn get_pointed_loc(&mut self, node_id: NodeId, proj: &[AccElem]) -> Location {
+    fn get_pointed_loc(&self, node_id: NodeId, proj: &[AccElem]) -> Option<Location> {
+        let obj = project_obj(&self.nodes[node_id].obj, proj)?;
+        let Obj::Ptr(loc) = obj else { return None };
+        Some(loc.clone())
+    }
+
+    fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem]) -> Location {
         let next_id = self.nodes.len();
-        let obj = project_obj(&mut self.nodes[node_id].obj, proj);
+        let obj = project_obj_mut(&mut self.nodes[node_id].obj, proj);
         let loc = if let Obj::Ptr(loc) = obj {
             loc.clone()
         } else {
@@ -266,13 +304,34 @@ impl Graph {
         loc
     }
 
-    fn get_obj(&mut self, x: &AccPath) -> &mut Obj {
-        let (_, node) = self.get_local_node(x.local);
-        project_obj(&mut node.obj, &x.projection)
+    fn get_obj_mut(&mut self, x: &AccPath) -> &mut Obj {
+        let (_, node) = self.get_local_node_mut(x.local);
+        project_obj_mut(&mut node.obj, &x.projection)
     }
 }
 
-fn project_obj<'a>(obj: &'a mut Obj, proj: &[AccElem]) -> &'a mut Obj {
+fn project_obj<'a>(obj: &'a Obj, proj: &[AccElem]) -> Option<&'a Obj> {
+    if let Some(elem) = proj.get(0) {
+        let inner = match elem {
+            AccElem::Int(n) => {
+                let Obj::Compound(fields) = obj else { return None };
+                fields.get(n)?
+            }
+            AccElem::Symbolic(local1) => {
+                let Obj::SymbolicIndex(local2, box obj) = obj else { return None };
+                if local1 != local2 {
+                    return None;
+                };
+                obj
+            }
+        };
+        project_obj(inner, &proj[1..])
+    } else {
+        Some(obj)
+    }
+}
+
+fn project_obj_mut<'a>(obj: &'a mut Obj, proj: &[AccElem]) -> &'a mut Obj {
     if let Some(elem) = proj.get(0) {
         let inner = match elem {
             AccElem::Int(n) => {
@@ -282,15 +341,19 @@ fn project_obj<'a>(obj: &'a mut Obj, proj: &[AccElem]) -> &'a mut Obj {
                 let Obj::Compound(fields) = obj else { unreachable!() };
                 fields.entry(*n).or_insert(Obj::new())
             }
-            AccElem::Symbolic(local) => {
+            AccElem::Symbolic(local1) => {
                 if !matches!(obj, Obj::SymbolicIndex(_, _)) {
-                    *obj = Obj::SymbolicIndex(local.clone(), Box::new(Obj::new()));
+                    *obj = Obj::SymbolicIndex(local1.clone(), Box::new(Obj::new()));
                 }
-                let Obj::SymbolicIndex(_, box obj) = obj else { unreachable!() };
+                let Obj::SymbolicIndex(local2, box obj) = obj else { unreachable!() };
+                if local1 != local2 {
+                    *local2 = local1.clone();
+                    *obj = Obj::new();
+                }
                 obj
             }
         };
-        project_obj(inner, &proj[1..])
+        project_obj_mut(inner, &proj[1..])
     } else {
         obj
     }
