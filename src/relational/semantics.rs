@@ -17,7 +17,8 @@ impl<'tcx> Analyzer<'tcx> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let (l, l_deref) = AccPath::from_place(*l, state);
-        let suffixes = self.get_path_suffixes(&l);
+        let suffixes = self.get_path_suffixes(&l, l_deref);
+        let empty_suffix = || suffixes.iter().all(|s| s.is_empty());
         match r {
             Rvalue::Use(r) => {
                 let r = self.transfer_op(r, state);
@@ -25,7 +26,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
-                    assert!(suffixes.is_empty());
+                    assert!(empty_suffix());
                     let r = self.transfer_op(r, state);
                     if let OpVal::Int(v) = r {
                         let v = match ty.kind() {
@@ -77,17 +78,17 @@ impl<'tcx> Analyzer<'tcx> {
                 }
             }
             Rvalue::Ref(_, _, r) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 assert!(!l_deref);
                 let (r, r_deref) = AccPath::from_place(*r, state);
                 state.gm().x_eq_ref_y(&l, &r, r_deref);
             }
             Rvalue::ThreadLocalRef(_) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::AddressOf(_, r) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 assert_eq!(r.projection.len(), 1);
                 let (path, is_deref) = AccPath::from_place(*r, state);
                 assert!(is_deref);
@@ -96,7 +97,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::Len(_) => unreachable!(),
             Rvalue::BinaryOp(op, box (r1, r2)) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 let r1 = self.transfer_op(r1, state);
                 let r2 = self.transfer_op(r2, state);
                 if let (OpVal::Int(v1), OpVal::Int(v2)) = (r1, r2) {
@@ -126,7 +127,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 let r = self.transfer_op(r, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
@@ -140,7 +141,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::NullaryOp(_, _) => unreachable!(),
             Rvalue::Discriminant(_) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::Aggregate(box kind, rs) => {
@@ -165,7 +166,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
-                assert!(suffixes.is_empty());
+                assert!(empty_suffix());
                 assert!(r.projection.is_empty());
                 let (path, is_deref) = AccPath::from_place(*r, state);
                 assert!(!is_deref);
@@ -313,67 +314,6 @@ impl<'tcx> Analyzer<'tcx> {
                 todo!()
             }
             _ => unreachable!(),
-        }
-    }
-
-    fn get_path_suffixes(&self, path: &AccPath) -> Vec<Vec<AccElem>> {
-        let ty = &self.local_tys[path.local.index()];
-        let mut suffixes = get_path_suffixes(ty, &path.projection);
-        for suffix in &mut suffixes {
-            suffix.reverse();
-        }
-        suffixes
-    }
-}
-
-fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
-    match ty {
-        TyStructure::Adt(tys) => {
-            if let Some(elem) = proj.get(0) {
-                let AccElem::Int(n) = elem else { unreachable!() };
-                let mut suffixes = get_path_suffixes(&tys[*n], &proj[1..]);
-                for suffix in &mut suffixes {
-                    suffix.push(AccElem::Int(*n));
-                }
-                suffixes
-            } else {
-                tys.iter()
-                    .enumerate()
-                    .flat_map(|(i, ty)| {
-                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
-                        for suffix in &mut suffixes {
-                            suffix.push(AccElem::Int(i));
-                        }
-                        suffixes
-                    })
-                    .collect()
-            }
-        }
-        TyStructure::Array(box ty, len) => {
-            if let Some(elem) = proj.get(0) {
-                if let AccElem::Int(n) = elem {
-                    assert!(n < len);
-                }
-                let mut suffixes = get_path_suffixes(ty, &proj[1..]);
-                for suffix in &mut suffixes {
-                    suffix.push(elem.clone());
-                }
-                suffixes
-            } else {
-                (0..*len)
-                    .flat_map(|i| {
-                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
-                        for suffix in &mut suffixes {
-                            suffix.push(AccElem::Int(i));
-                        }
-                        suffixes
-                    })
-                    .collect()
-            }
-        }
-        TyStructure::Leaf => {
-            assert!(proj.is_empty());
-            vec![vec![]]
         }
     }
 }

@@ -1062,4 +1062,4 @@ lazy_static! {
 }
 
 #[cfg(test)]
-mod test;
+mod tests;

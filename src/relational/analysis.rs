@@ -33,6 +33,7 @@ fn analyze_input(input: Input) -> AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
 
+    let mut functions = HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if item.ident.name.as_str() == "main" {
@@ -69,13 +70,12 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let analyzer = Analyzer {
             tcx,
             body,
-            def_id,
             rpo_map,
             dead_locals,
             local_tys,
             local_ptr_tys,
         };
-        analyzer.analyze();
+        functions.insert(def_id, analyzer.analyze());
 
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
@@ -84,31 +84,33 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
-    AnalysisResults
+    AnalysisResults { functions }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AnalysisResults;
+#[derive(Debug, Clone)]
+pub struct AnalysisResults {
+    pub functions: HashMap<DefId, HashMap<Location, AbsMem>>,
+}
 
 #[allow(missing_debug_implementations)]
 pub struct Analyzer<'tcx> {
-    pub tcx: TyCtxt<'tcx>,
-    pub body: &'tcx Body<'tcx>,
-    pub def_id: DefId,
-    pub rpo_map: HashMap<BasicBlock, usize>,
-    pub dead_locals: Vec<BitSet<Local>>,
-    pub local_tys: Vec<TyStructure>,
-    pub local_ptr_tys: HashMap<Local, TyStructure>,
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx Body<'tcx>,
+    rpo_map: HashMap<BasicBlock, usize>,
+    dead_locals: Vec<BitSet<Local>>,
+    local_tys: Vec<TyStructure>,
+    local_ptr_tys: HashMap<Local, TyStructure>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    fn analyze(&self) {
+    fn analyze(&self) -> HashMap<Location, AbsMem> {
         let bot = AbsMem::bot();
 
         let mut work_list = WorkList::new(&self.rpo_map);
         work_list.push(Location::START);
 
-        let states: HashMap<Location, AbsMem> = HashMap::new();
+        let mut states: HashMap<Location, AbsMem> = HashMap::new();
+        states.insert(Location::START, AbsMem::top());
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
@@ -128,10 +130,26 @@ impl<'tcx> Analyzer<'tcx> {
                     // joined.clear_dead_locals(dead_locals);
                 }
                 if !joined.ord(next_state) {
+                    states.insert(next_location, joined);
                     work_list.push(next_location);
                 }
             }
         }
+
+        states
+    }
+
+    pub fn get_path_suffixes(&self, path: &AccPath, deref: bool) -> Vec<Vec<AccElem>> {
+        let ty = if deref {
+            &self.local_ptr_tys[&path.local]
+        } else {
+            &self.local_tys[path.local.index()]
+        };
+        let mut suffixes = get_path_suffixes(ty, &path.projection);
+        for suffix in &mut suffixes {
+            suffix.reverse();
+        }
+        suffixes
     }
 
     pub fn ty(&self, operand: &Operand<'tcx>) -> Ty<'tcx> {
@@ -205,6 +223,58 @@ impl TyStructure {
                 Self::Array(Box::new(Self::from_ty(*ty, def_id, tcx)), len)
             }
             _ => Self::Leaf,
+        }
+    }
+}
+
+fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
+    match ty {
+        TyStructure::Adt(tys) => {
+            if let Some(elem) = proj.get(0) {
+                let AccElem::Int(n) = elem else { unreachable!() };
+                let mut suffixes = get_path_suffixes(&tys[*n], &proj[1..]);
+                for suffix in &mut suffixes {
+                    suffix.push(AccElem::Int(*n));
+                }
+                suffixes
+            } else {
+                tys.iter()
+                    .enumerate()
+                    .flat_map(|(i, ty)| {
+                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
+                        for suffix in &mut suffixes {
+                            suffix.push(AccElem::Int(i));
+                        }
+                        suffixes
+                    })
+                    .collect()
+            }
+        }
+        TyStructure::Array(box ty, len) => {
+            if let Some(elem) = proj.get(0) {
+                if let AccElem::Int(n) = elem {
+                    assert!(n < len);
+                }
+                let mut suffixes = get_path_suffixes(ty, &proj[1..]);
+                for suffix in &mut suffixes {
+                    suffix.push(elem.clone());
+                }
+                suffixes
+            } else {
+                (0..*len)
+                    .flat_map(|i| {
+                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
+                        for suffix in &mut suffixes {
+                            suffix.push(AccElem::Int(i));
+                        }
+                        suffixes
+                    })
+                    .collect()
+            }
+        }
+        TyStructure::Leaf => {
+            assert!(proj.is_empty());
+            vec![vec![]]
         }
     }
 }

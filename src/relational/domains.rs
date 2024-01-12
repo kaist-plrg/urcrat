@@ -58,12 +58,12 @@ impl AbsMem {
 type NodeId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Location {
+pub struct AbsLoc {
     root: NodeId,
     projection: Vec<AccElem>,
 }
 
-impl Location {
+impl AbsLoc {
     fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
         Self { root, projection }
     }
@@ -85,7 +85,7 @@ impl Int {
 
 #[derive(Debug, Clone)]
 pub enum Obj {
-    Ptr(Location),
+    Ptr(AbsLoc),
     Compound(HashMap<usize, Obj>),
     Index(HashSet<Local>, Box<Obj>),
 }
@@ -321,7 +321,7 @@ impl Graph {
         }
     }
 
-    fn rvalue(&mut self, x: &AccPath, deref: bool) -> Location {
+    fn rvalue(&mut self, x: &AccPath, deref: bool) -> AbsLoc {
         let (id, _) = self.get_local_node_mut(x.local);
         if deref {
             let mut loc = self.get_pointed_loc_mut(id, &[]);
@@ -341,7 +341,7 @@ impl Graph {
     fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: Int) {
         let id = self.get_int_node(n);
         let obj = self.lvalue(x, deref);
-        *obj = Obj::Ptr(Location::new(id, vec![]));
+        *obj = Obj::Ptr(AbsLoc::new(id, vec![]));
     }
 
     fn x_eq(&mut self, x: &AccPath, deref: bool) {
@@ -356,7 +356,7 @@ impl Graph {
             loc.projection.extend(y.projection.to_owned());
             loc
         } else {
-            Location::new(id, y.projection.to_owned())
+            AbsLoc::new(id, y.projection.to_owned())
         };
 
         let obj = self.lvalue(x, false);
@@ -396,7 +396,7 @@ impl Graph {
         aliases
     }
 
-    fn loc_pointed_by_local(&self, local: Local) -> Option<&Location> {
+    fn loc_pointed_by_local(&self, local: Local) -> Option<&AbsLoc> {
         let id = self.locals.get(&local)?;
         let node = &self.nodes[*id];
         if let Obj::Ptr(loc) = &node.obj {
@@ -428,19 +428,19 @@ impl Graph {
         }
     }
 
-    fn get_pointed_loc(&self, node_id: NodeId, proj: &[AccElem]) -> Option<Location> {
+    fn get_pointed_loc(&self, node_id: NodeId, proj: &[AccElem]) -> Option<AbsLoc> {
         let obj = self.nodes[node_id].obj.project(proj)?;
         let Obj::Ptr(loc) = obj else { return None };
         Some(loc.clone())
     }
 
-    fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem]) -> Location {
+    fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem]) -> AbsLoc {
         let next_id = self.nodes.len();
         let obj = self.nodes[node_id].obj.project_mut(proj);
         let loc = if let Obj::Ptr(loc) = obj {
             loc.clone()
         } else {
-            let loc = Location::new(next_id, vec![]);
+            let loc = AbsLoc::new(next_id, vec![]);
             *obj = Obj::Ptr(loc.clone());
             loc
         };
@@ -471,7 +471,7 @@ fn join_objs(
                     remaining.push(idp);
                     id
                 };
-                *obj = Obj::Ptr(Location::new(nid, l));
+                *obj = Obj::Ptr(AbsLoc::new(nid, l));
             }
         }
         (Obj::Compound(fs1), Obj::Compound(fs2)) => {
