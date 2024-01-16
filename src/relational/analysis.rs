@@ -50,7 +50,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             for stmt in &bbd.statements {
                 println!("{:?}", stmt);
             }
-            if bbd.terminator().kind != TerminatorKind::Return {
+            if !matches!(
+                bbd.terminator().kind,
+                TerminatorKind::Return | TerminatorKind::Assert { .. }
+            ) {
                 println!("{:?}", bbd.terminator().kind);
             }
         }

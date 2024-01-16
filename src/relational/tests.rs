@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rustc_middle::{
-    mir::{Local, Location, TerminatorKind},
+    mir::{Location, TerminatorKind},
     ty::TyCtxt,
 };
 use rustc_span::def_id::DefId;
@@ -93,7 +93,7 @@ fn test_eq_ref() {
             assert_eq!(n[&2].as_ptr(), &AbsLoc::new_root(i[&1]));
             assert_eq!(n[&3].as_ptr(), &AbsLoc::new_root(i[&1]));
 
-            assert_eq!(g.get_local_as_int(1), Some(Int::Signed(0)));
+            assert_eq!(g.get_local_as_int(1), Some(0));
         },
     );
 }
@@ -139,7 +139,7 @@ fn test_eq_deref() {
             assert_eq!(n[&2].as_ptr(), &AbsLoc::new_root(i[&1]));
             assert_eq!(n[&3].as_ptr(), &AbsLoc::new_root(i[&1]));
 
-            assert_eq!(g.get_local_as_int(1), Some(Int::Signed(0)));
+            assert_eq!(g.get_local_as_int(1), Some(0));
         },
     );
 }
@@ -160,7 +160,7 @@ fn test_deref_eq() {
             let n11 = &g.nodes[n[&1].as_ptr().root()];
             assert_eq!(n11.as_ptr(), n[&2].as_ptr());
 
-            assert_eq!(g.get_local_as_int(2), Some(Int::Signed(0)));
+            assert_eq!(g.get_local_as_int(2), Some(0));
         },
     );
 }
@@ -332,45 +332,82 @@ fn test_eq_array() {
             let n = get_nodes(&g, 1..=11);
             assert_eq!(n[&1].field(0).as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&1].field(1).as_ptr(), n[&2].as_ptr());
+            assert_eq!(n[&3].as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&4].as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&7].as_ptr(), n[&2].as_ptr());
-            assert_eq!(n[&5].as_ptr(), n[&10].as_ptr());
-            assert_eq!(n[&6].as_ptr(), n[&11].as_ptr());
+            assert_eq!(n[&10].as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&8].as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&9].as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&11].as_ptr(), n[&6].as_ptr());
 
-            assert_eq!(g.get_local_as_int(2), Some(Int::Signed(0)));
-            assert_eq!(g.get_local_as_int(3), Some(Int::Unsigned(0)));
-            assert_eq!(g.get_local_as_int(5), Some(Int::Unsigned(2)));
-            assert_eq!(g.get_local_as_int(6), Some(Int::Bool(true)));
-            assert_eq!(g.get_local_as_int(8), Some(Int::Unsigned(1)));
-            assert_eq!(g.get_local_as_int(9), Some(Int::Signed(1)));
+            assert_eq!(g.get_local_as_int(2), Some(0));
+            assert_eq!(g.get_local_as_int(5), Some(2));
+            assert_eq!(g.get_local_as_int(6), Some(1));
         },
     );
 }
 
 #[test]
 fn test_eq_array_symbolic() {
-    // _1 = const 0_usize as *mut i32 (PointerFromExposedAddress)
-    // _2 = (*_1)
-    // _3 = [const 0_i32; 1]
-    // _4 = const 2_i32
-    // _5 = _2 as usize (IntToInt)
-    // _6 = const 1_usize
-    // _7 = Lt(_5, _6)
-    // _3[_5] = move _4
-    analyze_fn(
+    // _2 = [const 0_i32; 1]
+    // _3 = const 1_i32
+    // _4 = _1 as usize (IntToInt)
+    // _5 = const 1_usize
+    // _6 = Lt(_4, _5)
+    // _2[_4] = move _3
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
         "
-        let mut x: *mut libc::c_int = 0 as *mut libc::c_int;
-        let mut y: libc::c_int = *x;
-        let mut z: [libc::c_int; 1] = [0; 1];
-        z[y as usize] = 2 as libc::c_int;
+        let mut y: [libc::c_int; 1] = [0; 1];
+        y[x as usize] = 1 as libc::c_int;
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=7);
-            assert_eq!(n[&3].symbolic_obj().as_ptr(), n[&4].as_ptr());
-            assert_eq!(
-                n[&3].symbolic_index(),
-                &HashSet::from_iter([Local::from_usize(5)])
-            );
+            let n = get_nodes(&g, 1..=6);
+            assert_eq!(n[&1].as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&3].as_ptr(), n[&5].as_ptr());
+
+            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([1, 4]));
+
+            assert_eq!(g.get_local_as_int(3), Some(1));
+            assert_eq!(g.get_local_as_int(6), None);
+        },
+    );
+}
+
+#[test]
+fn test_eq_array_symbolic_invalidated() {
+    // _2 = [const 0_i32; 1]
+    // _3 = const 1_i32
+    // _5 = _1
+    // _4 = move _5 as usize (IntToInt)
+    // _6 = const 1_usize
+    // _7 = Lt(_4, _6)
+    // _2[_4] = move _3
+    // _8 = const 2_i32
+    // _1 = move _8
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: [libc::c_int; 1] = [0; 1];
+        y[x as usize] = 1 as libc::c_int;
+        x = 2 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=8);
+            assert_eq!(n[&1].as_ptr(), n[&8].as_ptr());
+            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&4].as_ptr(), n[&5].as_ptr());
+
+            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([4, 5]));
+
+            assert_eq!(g.get_local_as_int(1), Some(2));
+            assert_eq!(g.get_local_as_int(3), Some(1));
+            assert_eq!(g.get_local_as_int(4), None);
+            assert_eq!(g.get_local_as_int(6), Some(1));
+            assert_eq!(g.get_local_as_int(7), None);
         },
     );
 }
@@ -430,8 +467,8 @@ fn test_filter() {
         };
         ",
         |g, _, _| {
-            assert_eq!(g.get_local_as_int(2), Some(Int::Signed(1)));
-            assert_eq!(g.get_local_as_int(3), Some(Int::Signed(2)));
+            assert_eq!(g.get_local_as_int(2), Some(1));
+            assert_eq!(g.get_local_as_int(3), Some(2));
             assert_eq!(g.get_local_as_int(4), None);
         },
     );

@@ -16,6 +16,9 @@ use crate::*;
 impl<'tcx> Analyzer<'tcx> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
+        if l.projection.is_empty() {
+            state.gm().invalidate_symbolic(l.local);
+        }
         let (l, l_deref) = AccPath::from_place(*l, state);
         let suffixes = self.get_path_suffixes(&l, l_deref);
         let empty_suffix = || suffixes.iter().all(|s| s.is_empty());
@@ -27,28 +30,31 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
                     assert!(empty_suffix());
+                    let rty = self.ty(r);
                     let r = self.transfer_op(r, state);
                     if let OpVal::Int(v) = r {
                         let v = match ty.kind() {
                             TyKind::Int(int_ty) => match int_ty {
-                                IntTy::Isize => v.cast_to_i64(),
-                                IntTy::I8 => v.cast_to_i8(),
-                                IntTy::I16 => v.cast_to_i16(),
-                                IntTy::I32 => v.cast_to_i32(),
-                                IntTy::I64 => v.cast_to_i64(),
-                                IntTy::I128 => v.cast_to_i128(),
+                                IntTy::Isize => to_isize(v, rty),
+                                IntTy::I8 => to_i8(v, rty),
+                                IntTy::I16 => to_i16(v, rty),
+                                IntTy::I32 => to_i32(v, rty),
+                                IntTy::I64 => to_i64(v, rty),
+                                IntTy::I128 => to_i128(v, rty),
                             },
                             TyKind::Uint(uint_ty) => match uint_ty {
-                                UintTy::Usize => v.cast_to_u64(),
-                                UintTy::U8 => v.cast_to_u8(),
-                                UintTy::U16 => v.cast_to_u16(),
-                                UintTy::U32 => v.cast_to_u32(),
-                                UintTy::U64 => v.cast_to_u64(),
-                                UintTy::U128 => v.cast_to_u128(),
+                                UintTy::Usize => to_usize(v, rty),
+                                UintTy::U8 => to_u8(v, rty),
+                                UintTy::U16 => to_u16(v, rty),
+                                UintTy::U32 => to_u32(v, rty),
+                                UintTy::U64 => to_u64(v, rty),
+                                UintTy::U128 => to_u128(v, rty),
                             },
                             _ => unreachable!(),
                         };
                         state.gm().assign(&l, l_deref, &OpVal::Int(v));
+                    } else if matches!(ty.kind(), TyKind::Uint(UintTy::Usize)) {
+                        state.gm().assign(&l, l_deref, &r);
                     } else {
                         state.gm().assign(&l, l_deref, &OpVal::Other);
                     }
@@ -99,26 +105,27 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::Len(_) => unreachable!(),
             Rvalue::BinaryOp(op, box (r1, r2)) => {
                 assert!(empty_suffix());
+                let ty = self.ty(r1);
                 let r1 = self.transfer_op(r1, state);
                 let r2 = self.transfer_op(r2, state);
                 if let (OpVal::Int(v1), OpVal::Int(v2)) = (r1, r2) {
                     let v = match op {
-                        BinOp::Add => v1.add(v2),
-                        BinOp::Sub => v1.sub(v2),
-                        BinOp::Mul => v1.mul(v2),
-                        BinOp::Div => v1.div(v2),
-                        BinOp::Rem => v1.rem(v2),
-                        BinOp::BitXor => v1.bit_xor(v2),
-                        BinOp::BitAnd => v1.bit_and(v2),
-                        BinOp::BitOr => v1.bit_or(v2),
-                        BinOp::Shl => v1.shl(v2),
-                        BinOp::Shr => v1.shr(v2),
-                        BinOp::Eq => v1.eq(v2),
-                        BinOp::Lt => v1.lt(v2),
-                        BinOp::Le => v1.le(v2),
-                        BinOp::Ne => v1.ne(v2),
-                        BinOp::Ge => v1.ge(v2),
-                        BinOp::Gt => v1.gt(v2),
+                        BinOp::Add => v1 + v2,
+                        BinOp::Sub => v1 - v2,
+                        BinOp::Mul => v1 * v2,
+                        BinOp::Div => div(v1, v2, ty),
+                        BinOp::Rem => rem(v1, v2, ty),
+                        BinOp::BitXor => v1 ^ v2,
+                        BinOp::BitAnd => v1 & v2,
+                        BinOp::BitOr => v1 | v2,
+                        BinOp::Shl => shl(v1, v2, ty),
+                        BinOp::Shr => shr(v1, v2, ty),
+                        BinOp::Eq => (v1 == v2) as u128,
+                        BinOp::Lt => lt(v1, v2, ty),
+                        BinOp::Le => le(v1, v2, ty),
+                        BinOp::Ne => (v1 != v2) as u128,
+                        BinOp::Ge => ge(v1, v2, ty),
+                        BinOp::Gt => gt(v1, v2, ty),
                         _ => unreachable!(),
                     };
                     state.gm().assign(&l, l_deref, &OpVal::Int(v));
@@ -129,11 +136,12 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
                 assert!(empty_suffix());
+                let ty = self.ty(r);
                 let r = self.transfer_op(r, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
-                        UnOp::Not => v.not(),
-                        UnOp::Neg => v.neg(),
+                        UnOp::Not => !v,
+                        UnOp::Neg => neg(v, ty),
                     };
                     state.gm().assign(&l, l_deref, &OpVal::Int(v));
                 } else {
@@ -207,9 +215,9 @@ impl<'tcx> Analyzer<'tcx> {
                                     IntTy::I16 => i.try_to_i16().unwrap() as _,
                                     IntTy::I32 => i.try_to_i32().unwrap() as _,
                                     IntTy::I64 => i.try_to_i64().unwrap() as _,
-                                    IntTy::I128 => i.try_to_i128().unwrap(),
+                                    IntTy::I128 => i.try_to_i128().unwrap() as _,
                                 };
-                                OpVal::Int(Int::Signed(v))
+                                OpVal::Int(v)
                             }
                             TyKind::Uint(uint_ty) => {
                                 let v = match uint_ty {
@@ -220,7 +228,7 @@ impl<'tcx> Analyzer<'tcx> {
                                     UintTy::U64 => i.try_to_u64().unwrap() as _,
                                     UintTy::U128 => i.try_to_u128().unwrap(),
                                 };
-                                OpVal::Int(Int::Unsigned(v))
+                                OpVal::Int(v)
                             }
                             _ => OpVal::Other,
                         },
@@ -258,55 +266,51 @@ impl<'tcx> Analyzer<'tcx> {
                 destination: None, ..
             }
             | TerminatorKind::Call { target: None, .. } => vec![],
-            TerminatorKind::SwitchInt { discr, targets } => {
-                let ty = self.ty(discr);
-                match self.transfer_op(discr, state) {
-                    OpVal::Place(discr, is_deref) => targets
-                        .iter()
-                        .map(|(v, target)| {
-                            let location = Location {
-                                block: target,
-                                statement_index: 0,
-                            };
-                            let v = Int::from_u128(v, ty);
-                            let mut state = state.clone();
-                            state.gm().filter_x_int(&discr, is_deref, v);
-                            (location, state)
-                        })
-                        .chain(std::iter::once((
-                            Location {
-                                block: targets.otherwise(),
-                                statement_index: 0,
-                            },
-                            state.clone(),
-                        )))
-                        .collect(),
-                    OpVal::Int(i) => {
-                        let target_opt = targets.iter().find(|(v, _)| i == Int::from_u128(*v, ty));
-                        let target = if let Some((_, target)) = target_opt {
-                            target
-                        } else {
-                            targets.otherwise()
-                        };
+            TerminatorKind::SwitchInt { discr, targets } => match self.transfer_op(discr, state) {
+                OpVal::Place(discr, is_deref) => targets
+                    .iter()
+                    .map(|(v, target)| {
                         let location = Location {
                             block: target,
                             statement_index: 0,
                         };
-                        vec![(location, state.clone())]
-                    }
-                    OpVal::Other => targets
-                        .all_targets()
-                        .iter()
-                        .map(|target| {
-                            let location = Location {
-                                block: *target,
-                                statement_index: 0,
-                            };
-                            (location, state.clone())
-                        })
-                        .collect(),
+                        let mut state = state.clone();
+                        state.gm().filter_x_int(&discr, is_deref, v);
+                        (location, state)
+                    })
+                    .chain(std::iter::once((
+                        Location {
+                            block: targets.otherwise(),
+                            statement_index: 0,
+                        },
+                        state.clone(),
+                    )))
+                    .collect(),
+                OpVal::Int(i) => {
+                    let target_opt = targets.iter().find(|(v, _)| i == *v);
+                    let target = if let Some((_, target)) = target_opt {
+                        target
+                    } else {
+                        targets.otherwise()
+                    };
+                    let location = Location {
+                        block: target,
+                        statement_index: 0,
+                    };
+                    vec![(location, state.clone())]
                 }
-            }
+                OpVal::Other => targets
+                    .all_targets()
+                    .iter()
+                    .map(|target| {
+                        let location = Location {
+                            block: *target,
+                            statement_index: 0,
+                        };
+                        (location, state.clone())
+                    })
+                    .collect(),
+            },
             TerminatorKind::Call {
                 func: _func,
                 args: _args,
@@ -324,7 +328,7 @@ impl<'tcx> Analyzer<'tcx> {
 #[derive(Debug, Clone)]
 pub enum OpVal {
     Place(AccPath, bool),
-    Int(Int),
+    Int(u128),
     Other,
 }
 
@@ -405,7 +409,7 @@ impl AccElem {
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
                 if let Some(i) = state.g().get_x_as_int(&path) {
-                    Some(AccElem::Int(i.as_usize()))
+                    Some(AccElem::Int(i as usize))
                 } else {
                     Some(AccElem::Symbolic(state.g().find_aliases(local)))
                 }
@@ -418,163 +422,158 @@ impl AccElem {
     }
 }
 
-macro_rules! create_cast_method {
-    ($method_name:ident, $sign:ident, $typ:ty) => {
-        fn $method_name(self) -> Self {
+macro_rules! create_div_fn {
+    ($name:ident, $op:tt) => {
+        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+            match ty.kind() {
+                TyKind::Int(int_ty) => {
+                    match int_ty {
+                        IntTy::Isize => (n as isize $op m as isize) as u128,
+                        IntTy::I8 => (n as i8 $op m as i8) as u128,
+                        IntTy::I16 => (n as i16 $op m as i16) as u128,
+                        IntTy::I32 => (n as i32 $op m as i32) as u128,
+                        IntTy::I64 => (n as i64 $op m as i64) as u128,
+                        IntTy::I128 => (n as i128 $op m as i128) as u128,
+                    }
+                }
+                TyKind::Uint(uint_ty) => {
+                    match uint_ty {
+                        UintTy::Usize => (n as usize $op m as usize) as u128,
+                        UintTy::U8 => (n as u8 $op m as u8) as u128,
+                        UintTy::U16 => (n as u16 $op m as u16) as u128,
+                        UintTy::U32 => (n as u32 $op m as u32) as u128,
+                        UintTy::U64 => (n as u64 $op m as u64) as u128,
+                        UintTy::U128 => n $op m,
+                    }
+                }
+                _ => panic!(),
+            }
+        }
+    }
+}
+
+create_div_fn!(div, /);
+create_div_fn!(rem, %);
+
+macro_rules! create_shift_fn {
+    ($name:ident, $op:tt) => {
+        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+            match ty.kind() {
+                TyKind::Int(int_ty) => {
+                    match int_ty {
+                        IntTy::Isize => ((n as isize) $op m) as u128,
+                        IntTy::I8 => ((n as i8) $op m) as u128,
+                        IntTy::I16 => ((n as i16) $op m) as u128,
+                        IntTy::I32 => ((n as i32) $op m) as u128,
+                        IntTy::I64 => ((n as i64) $op m) as u128,
+                        IntTy::I128 => ((n as i128) $op m) as u128,
+                    }
+                }
+                TyKind::Uint(uint_ty) => {
+                    match uint_ty {
+                        UintTy::Usize => ((n as usize) $op m) as u128,
+                        UintTy::U8 => ((n as u8) $op m) as u128,
+                        UintTy::U16 => ((n as u16) $op m) as u128,
+                        UintTy::U32 => ((n as u32) $op m) as u128,
+                        UintTy::U64 => ((n as u64) $op m) as u128,
+                        UintTy::U128 => n $op m,
+                    }
+                }
+                _ => panic!(),
+            }
+        }
+    }
+}
+
+create_shift_fn!(shl, <<);
+create_shift_fn!(shr, >>);
+
+macro_rules! create_cmp_fn {
+    ($name:ident, $op:tt) => {
+        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+            match ty.kind() {
+                TyKind::Int(int_ty) => {
+                    match int_ty {
+                        IntTy::Isize => ((n as isize) $op m as isize) as u128,
+                        IntTy::I8 => ((n as i8) $op m as i8) as u128,
+                        IntTy::I16 => ((n as i16) $op m as i16) as u128,
+                        IntTy::I32 => ((n as i32) $op m as i32) as u128,
+                        IntTy::I64 => ((n as i64) $op m as i64) as u128,
+                        IntTy::I128 => ((n as i128) $op m as i128) as u128,
+                    }
+                }
+                TyKind::Uint(uint_ty) => {
+                    match uint_ty {
+                        UintTy::Usize => ((n as usize) $op m as usize) as u128,
+                        UintTy::U8 => ((n as u8) $op m as u8) as u128,
+                        UintTy::U16 => ((n as u16) $op m as u16) as u128,
+                        UintTy::U32 => ((n as u32) $op m as u32) as u128,
+                        UintTy::U64 => ((n as u64) $op m as u64) as u128,
+                        UintTy::U128 => (n $op m) as u128,
+                    }
+                }
+                TyKind::Bool => ((n != 0) $op (m != 0)) as u128,
+                _ => panic!(),
+            }
+        }
+    }
+}
+
+create_cmp_fn!(lt, <);
+create_cmp_fn!(le, <=);
+create_cmp_fn!(ge, >=);
+create_cmp_fn!(gt, >);
+
+macro_rules! create_cast_fn {
+    ($name:ident, $typ:ty) => {
+        fn $name(n: u128, ty: Ty<'_>) -> u128 {
             #[allow(trivial_numeric_casts)]
-            match self {
-                Int::Signed(v) => Int::$sign(v as $typ as _),
-                Int::Unsigned(v) => Int::$sign(v as $typ as _),
-                Int::Bool(v) => Int::$sign(v as $typ as _),
+            match ty.kind() {
+                TyKind::Int(int_ty) => match int_ty {
+                    IntTy::Isize => (n as isize) as $typ as u128,
+                    IntTy::I8 => (n as i8) as $typ as u128,
+                    IntTy::I16 => (n as i16) as $typ as u128,
+                    IntTy::I32 => (n as i32) as $typ as u128,
+                    IntTy::I64 => (n as i64) as $typ as u128,
+                    IntTy::I128 => (n as i128) as $typ as u128,
+                },
+                TyKind::Uint(uint_ty) => match uint_ty {
+                    UintTy::Usize => (n as usize) as $typ as u128,
+                    UintTy::U8 => (n as u8) as $typ as u128,
+                    UintTy::U16 => (n as u16) as $typ as u128,
+                    UintTy::U32 => (n as u32) as $typ as u128,
+                    UintTy::U64 => (n as u64) as $typ as u128,
+                    UintTy::U128 => n as $typ as u128,
+                },
+                _ => panic!(),
             }
         }
     };
 }
 
-macro_rules! create_arith_method {
-    ($method_name:ident, $op:tt) => {
-        fn $method_name(self, other: Self) -> Self {
-            match (self, other) {
-                (Int::Signed(v1), Int::Signed(v2)) => Int::Signed(v1 $op v2),
-                (Int::Unsigned(v1), Int::Unsigned(v2)) => Int::Unsigned(v1 $op v2),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
+create_cast_fn!(to_i8, i8);
+create_cast_fn!(to_i16, i16);
+create_cast_fn!(to_i32, i32);
+create_cast_fn!(to_i64, i64);
+create_cast_fn!(to_i128, i128);
+create_cast_fn!(to_isize, isize);
+create_cast_fn!(to_u8, u8);
+create_cast_fn!(to_u16, u16);
+create_cast_fn!(to_u32, u32);
+create_cast_fn!(to_u64, u64);
+create_cast_fn!(to_u128, u128);
+create_cast_fn!(to_usize, usize);
 
-macro_rules! create_logic_method {
-    ($method_name:ident, $op:tt) => {
-        fn $method_name(self, other: Self) -> Self {
-            match (self, other) {
-                (Int::Signed(v1), Int::Signed(v2)) => Int::Signed(v1 $op v2),
-                (Int::Unsigned(v1), Int::Unsigned(v2)) => Int::Unsigned(v1 $op v2),
-                (Int::Bool(v1), Int::Bool(v2)) => Int::Bool(v1 $op v2),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-macro_rules! create_shift_method {
-    ($method_name:ident, $op:tt) => {
-        fn $method_name(self, other: Self) -> Self {
-            match (self, other) {
-                (Int::Signed(v1), Int::Signed(v2)) => Int::Signed(v1 $op v2),
-                (Int::Signed(v1), Int::Unsigned(v2)) => Int::Signed(v1 $op v2),
-                (Int::Unsigned(v1), Int::Signed(v2)) => Int::Unsigned(v1 $op v2),
-                (Int::Unsigned(v1), Int::Unsigned(v2)) => Int::Unsigned(v1 $op v2),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-macro_rules! create_cmp_method {
-    ($method_name:ident, $op:tt) => {
-        fn $method_name(self, other: Self) -> Self {
-            match (self, other) {
-                (Int::Signed(v1), Int::Signed(v2)) => Int::Bool(v1 $op v2),
-                (Int::Unsigned(v1), Int::Unsigned(v2)) => Int::Bool(v1 $op v2),
-                (Int::Bool(v1), Int::Bool(v2)) => Int::Bool(v1 $op v2),
-                _ => unreachable!(),
-            }
-        }
-    }
-}
-
-impl Int {
-    create_cast_method!(cast_to_i8, Signed, i8);
-
-    create_cast_method!(cast_to_i16, Signed, i16);
-
-    create_cast_method!(cast_to_i32, Signed, i32);
-
-    create_cast_method!(cast_to_i64, Signed, i64);
-
-    create_cast_method!(cast_to_i128, Signed, i128);
-
-    create_cast_method!(cast_to_u8, Unsigned, u8);
-
-    create_cast_method!(cast_to_u16, Unsigned, u16);
-
-    create_cast_method!(cast_to_u32, Unsigned, u32);
-
-    create_cast_method!(cast_to_u64, Unsigned, u64);
-
-    create_cast_method!(cast_to_u128, Unsigned, u128);
-
-    create_arith_method!(add, +);
-
-    create_arith_method!(sub, -);
-
-    create_arith_method!(mul, *);
-
-    create_arith_method!(div, /);
-
-    create_arith_method!(rem, %);
-
-    create_logic_method!(bit_xor, ^);
-
-    create_logic_method!(bit_and, &);
-
-    create_logic_method!(bit_or, |);
-
-    create_shift_method!(shl, <<);
-
-    create_shift_method!(shr, >>);
-
-    create_cmp_method!(eq, ==);
-
-    create_cmp_method!(lt, <);
-
-    create_cmp_method!(le, <=);
-
-    create_cmp_method!(ne, !=);
-
-    create_cmp_method!(ge, >);
-
-    create_cmp_method!(gt, >=);
-
-    fn not(self) -> Self {
-        match self {
-            Int::Signed(v) => Int::Signed(!v),
-            Int::Unsigned(v) => Int::Unsigned(!v),
-            Int::Bool(v) => Int::Bool(!v),
-        }
-    }
-
-    fn neg(self) -> Self {
-        let Int::Signed(v) = self else { unreachable!() };
-        Int::Signed(-v)
-    }
-
-    fn from_u128(v: u128, ty: Ty<'_>) -> Self {
-        match ty.kind() {
-            TyKind::Int(int_ty) => {
-                let v = match int_ty {
-                    IntTy::Isize => v as isize as i128,
-                    IntTy::I8 => v as i8 as i128,
-                    IntTy::I16 => v as i16 as i128,
-                    IntTy::I32 => v as i32 as i128,
-                    IntTy::I64 => v as i64 as i128,
-                    IntTy::I128 => v as i128,
-                };
-                Int::Signed(v)
-            }
-            TyKind::Uint(uint_ty) => {
-                let v = match uint_ty {
-                    UintTy::Usize => v as usize as u128,
-                    UintTy::U8 => v as u8 as u128,
-                    UintTy::U16 => v as u16 as u128,
-                    UintTy::U32 => v as u32 as u128,
-                    UintTy::U64 => v as u64 as u128,
-                    UintTy::U128 => v,
-                };
-                Int::Unsigned(v)
-            }
-            TyKind::Bool => Int::Bool(v != 0),
-            _ => unreachable!(),
-        }
+fn neg(n: u128, ty: Ty<'_>) -> u128 {
+    match ty.kind() {
+        TyKind::Int(int_ty) => match int_ty {
+            IntTy::Isize => -(n as isize) as u128,
+            IntTy::I8 => -(n as i8) as u128,
+            IntTy::I16 => -(n as i16) as u128,
+            IntTy::I32 => -(n as i32) as u128,
+            IntTy::I64 => -(n as i64) as u128,
+            IntTy::I128 => -(n as i128) as u128,
+        },
+        _ => panic!(),
     }
 }

@@ -95,30 +95,6 @@ impl AbsLoc {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Int {
-    Signed(i128),
-    Unsigned(u128),
-    Bool(bool),
-}
-
-impl std::fmt::Debug for Int {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Signed(x) => write!(f, "{}", x),
-            Self::Unsigned(x) => write!(f, "{}u", x),
-            Self::Bool(x) => write!(f, "{}", x),
-        }
-    }
-}
-
-impl Int {
-    pub fn as_usize(self) -> usize {
-        let Self::Unsigned(x) = self else { panic!() };
-        x as usize
-    }
-}
-
 #[derive(Clone)]
 pub enum Obj {
     Ptr(AbsLoc),
@@ -219,6 +195,24 @@ impl Obj {
         }
     }
 
+    fn invalidate_symbolic(&mut self, local: Local) {
+        match self {
+            Self::Ptr(_) => {}
+            Self::Compound(fs) => {
+                for obj in fs.values_mut() {
+                    obj.invalidate_symbolic(local);
+                }
+            }
+            Self::Index(ls, box obj) => {
+                if ls.remove(&local) && ls.is_empty() {
+                    *self = Obj::new();
+                    return;
+                }
+                obj.invalidate_symbolic(local);
+            }
+        }
+    }
+
     pub fn as_ptr(&self) -> &AbsLoc {
         let Obj::Ptr(loc) = self else { panic!() };
         loc
@@ -229,9 +223,9 @@ impl Obj {
         fs.get(&i).unwrap()
     }
 
-    pub fn symbolic_index(&self) -> &HashSet<Local> {
+    pub fn symbolic_index(&self) -> HashSet<usize> {
         let Obj::Index(ls, _) = self else { panic!() };
-        ls
+        ls.iter().map(|l| l.index()).collect()
     }
 
     pub fn symbolic_obj(&self) -> &Obj {
@@ -243,7 +237,7 @@ impl Obj {
 #[derive(Clone)]
 pub struct Node {
     pub obj: Obj,
-    pub at_addr: Option<Int>,
+    pub at_addr: Option<u128>,
 }
 
 impl std::fmt::Debug for Node {
@@ -273,7 +267,7 @@ impl Node {
         self.obj.field(i)
     }
 
-    pub fn symbolic_index(&self) -> &HashSet<Local> {
+    pub fn symbolic_index(&self) -> HashSet<usize> {
         self.obj.symbolic_index()
     }
 
@@ -286,7 +280,7 @@ impl Node {
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub locals: HashMap<Local, NodeId>,
-    pub ints: HashMap<Int, NodeId>,
+    pub ints: HashMap<u128, NodeId>,
 }
 
 impl Graph {
@@ -365,7 +359,7 @@ impl Graph {
         (id, &mut self.nodes[id])
     }
 
-    fn get_int_node(&mut self, n: Int) -> NodeId {
+    fn get_int_node(&mut self, n: u128) -> NodeId {
         if let Some(id) = self.ints.get(&n) {
             *id
         } else {
@@ -441,7 +435,7 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
-    fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: Int) {
+    fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: u128) {
         let id = self.get_int_node(n);
         let obj = self.lvalue(x, deref);
         *obj = Obj::Ptr(AbsLoc::new(id, vec![]));
@@ -466,7 +460,7 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
-    pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: Int) {
+    pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: u128) {
         let ptr = self.set_obj_ptr(|this| this.lvalue(x, deref));
         assert!(ptr.projection.is_empty());
         let id = ptr.root;
@@ -508,11 +502,11 @@ impl Graph {
         }
     }
 
-    pub fn get_local_as_int(&self, x: usize) -> Option<Int> {
+    pub fn get_local_as_int(&self, x: usize) -> Option<u128> {
         self.get_x_as_int(&AccPath::new(Local::from_usize(x), vec![]))
     }
 
-    pub fn get_x_as_int(&self, x: &AccPath) -> Option<Int> {
+    pub fn get_x_as_int(&self, x: &AccPath) -> Option<u128> {
         let id = self.locals.get(&x.local)?;
         let loc = self.get_pointed_loc(*id, &x.projection)?;
         if loc.projection.is_empty() {
@@ -522,7 +516,7 @@ impl Graph {
         }
     }
 
-    pub fn get_deref_x_as_int(&self, x: &AccPath) -> Option<Int> {
+    pub fn get_deref_x_as_int(&self, x: &AccPath) -> Option<u128> {
         let id = self.locals.get(&x.local)?;
         let mut loc = self.get_pointed_loc(*id, &[])?;
         loc.projection.extend(x.projection.to_owned());
@@ -531,6 +525,12 @@ impl Graph {
             self.nodes[loc.root].at_addr
         } else {
             None
+        }
+    }
+
+    pub fn invalidate_symbolic(&mut self, local: Local) {
+        for node in &mut self.nodes {
+            node.obj.invalidate_symbolic(local);
         }
     }
 
