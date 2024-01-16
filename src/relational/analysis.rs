@@ -8,7 +8,7 @@ use rustc_data_structures::graph::WithSuccessors;
 use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{BasicBlock, Body, Local, Location, Operand},
+    mir::{BasicBlock, Body, Local, Location, Operand, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_mir_dataflow::Analysis;
@@ -46,6 +46,15 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let def_id = item.owner_id.def_id.to_def_id();
         let body = tcx.optimized_mir(def_id);
 
+        for bbd in body.basic_blocks.iter() {
+            for stmt in &bbd.statements {
+                println!("{:?}", stmt);
+            }
+            if bbd.terminator().kind != TerminatorKind::Return {
+                println!("{:?}", bbd.terminator().kind);
+            }
+        }
+
         let pre_rpo_map = get_rpo_map(body);
         let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
         let rpo_map = compute_rpo_map(body, &loop_blocks);
@@ -76,12 +85,6 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             local_ptr_tys,
         };
         functions.insert(def_id, analyzer.analyze());
-
-        for bbd in body.basic_blocks.iter() {
-            for stmt in &bbd.statements {
-                println!("{:?}", stmt);
-            }
-        }
     }
 
     AnalysisResults { functions }
@@ -232,16 +235,12 @@ fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
         TyStructure::Adt(tys) => {
             if let Some(elem) = proj.get(0) {
                 let AccElem::Int(n) = elem else { unreachable!() };
-                let mut suffixes = get_path_suffixes(&tys[*n], &proj[1..]);
-                for suffix in &mut suffixes {
-                    suffix.push(AccElem::Int(*n));
-                }
-                suffixes
+                get_path_suffixes(&tys[*n], &proj[1..])
             } else {
                 tys.iter()
                     .enumerate()
                     .flat_map(|(i, ty)| {
-                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
+                        let mut suffixes = get_path_suffixes(ty, &[]);
                         for suffix in &mut suffixes {
                             suffix.push(AccElem::Int(i));
                         }
@@ -255,15 +254,11 @@ fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
                 if let AccElem::Int(n) = elem {
                     assert!(n < len);
                 }
-                let mut suffixes = get_path_suffixes(ty, &proj[1..]);
-                for suffix in &mut suffixes {
-                    suffix.push(elem.clone());
-                }
-                suffixes
+                get_path_suffixes(ty, &proj[1..])
             } else {
                 (0..*len)
                     .flat_map(|i| {
-                        let mut suffixes = get_path_suffixes(ty, &proj[1..]);
+                        let mut suffixes = get_path_suffixes(ty, &[]);
                         for suffix in &mut suffixes {
                             suffix.push(AccElem::Int(i));
                         }

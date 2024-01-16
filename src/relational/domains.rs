@@ -57,23 +57,59 @@ impl AbsMem {
 
 type NodeId = usize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AbsLoc {
     root: NodeId,
     projection: Vec<AccElem>,
 }
 
-impl AbsLoc {
-    fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
-        Self { root, projection }
+impl std::fmt::Debug for AbsLoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.root)?;
+        if !self.projection.is_empty() {
+            for elem in self.projection.iter() {
+                write!(f, ".{:?}", elem)?;
+            }
+        }
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+impl AbsLoc {
+    #[inline]
+    fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
+        Self { root, projection }
+    }
+
+    #[inline]
+    pub fn new_root(root: NodeId) -> Self {
+        Self {
+            root,
+            projection: vec![],
+        }
+    }
+
+    #[inline]
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Int {
     Signed(i128),
     Unsigned(u128),
     Bool(bool),
+}
+
+impl std::fmt::Debug for Int {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signed(x) => write!(f, "{}", x),
+            Self::Unsigned(x) => write!(f, "{}u", x),
+            Self::Bool(x) => write!(f, "{}", x),
+        }
+    }
 }
 
 impl Int {
@@ -83,11 +119,32 @@ impl Int {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Obj {
     Ptr(AbsLoc),
     Compound(HashMap<usize, Obj>),
     Index(HashSet<Local>, Box<Obj>),
+}
+
+impl std::fmt::Debug for Obj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ptr(l) => write!(f, "{:?}", l),
+            Self::Compound(fs) => {
+                write!(f, "[")?;
+                let mut v = fs.keys().copied().collect::<Vec<_>>();
+                v.sort();
+                for (i, k) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", k, fs[k])?;
+                }
+                write!(f, "]")
+            }
+            Self::Index(ls, obj) => write!(f, "[{:?}: {:?}]", ls, obj),
+        }
+    }
 }
 
 impl Obj {
@@ -161,12 +218,42 @@ impl Obj {
             Obj::Index(_, box obj) => obj.substitute(old_id, new_id),
         }
     }
+
+    pub fn as_ptr(&self) -> &AbsLoc {
+        let Obj::Ptr(loc) = self else { panic!() };
+        loc
+    }
+
+    pub fn field(&self, i: usize) -> &Obj {
+        let Obj::Compound(fs) = self else { panic!() };
+        fs.get(&i).unwrap()
+    }
+
+    pub fn symbolic_index(&self) -> &HashSet<Local> {
+        let Obj::Index(ls, _) = self else { panic!() };
+        ls
+    }
+
+    pub fn symbolic_obj(&self) -> &Obj {
+        let Obj::Index(_, box obj) = self else { panic!() };
+        obj
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Node {
     pub obj: Obj,
     pub at_addr: Option<Int>,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(addr) = self.at_addr {
+            write!(f, "{:?}@{:?}", self.obj, addr)
+        } else {
+            write!(f, "{:?}", self.obj)
+        }
+    }
 }
 
 impl Node {
@@ -176,6 +263,22 @@ impl Node {
             obj: Obj::new(),
             at_addr: None,
         }
+    }
+
+    pub fn as_ptr(&self) -> &AbsLoc {
+        self.obj.as_ptr()
+    }
+
+    pub fn field(&self, i: usize) -> &Obj {
+        self.obj.field(i)
+    }
+
+    pub fn symbolic_index(&self) -> &HashSet<Local> {
+        self.obj.symbolic_index()
+    }
+
+    pub fn symbolic_obj(&self) -> &Obj {
+        self.obj.symbolic_obj()
     }
 }
 
@@ -364,11 +467,9 @@ impl Graph {
     }
 
     pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: Int) {
-        let obj = self.lvalue(x, deref);
-        let Obj::Ptr(ptr) = obj else { unreachable!() };
+        let ptr = self.set_obj_ptr(|this| this.lvalue(x, deref));
         assert!(ptr.projection.is_empty());
         let id = ptr.root;
-
         if let Some(n_id) = self.ints.get(&n) {
             let n_id = *n_id;
             self.substitute(id, n_id);
@@ -386,7 +487,8 @@ impl Graph {
 
     pub fn find_aliases(&self, local: Local) -> HashSet<Local> {
         let mut aliases = HashSet::new();
-        let loc1 = self.loc_pointed_by_local(local).unwrap();
+        aliases.insert(local);
+        let loc1 = some_or!(self.loc_pointed_by_local(local), return aliases);
         for l in self.locals.keys() {
             let loc2 = some_or!(self.loc_pointed_by_local(*l), continue);
             if loc1 == loc2 {
@@ -404,6 +506,10 @@ impl Graph {
         } else {
             None
         }
+    }
+
+    pub fn get_local_as_int(&self, x: usize) -> Option<Int> {
+        self.get_x_as_int(&AccPath::new(Local::from_usize(x), vec![]))
     }
 
     pub fn get_x_as_int(&self, x: &AccPath) -> Option<Int> {
@@ -435,8 +541,13 @@ impl Graph {
     }
 
     fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem]) -> AbsLoc {
+        self.set_obj_ptr(|this| this.nodes[node_id].obj.project_mut(proj))
+    }
+
+    #[inline]
+    fn set_obj_ptr<F: Fn(&mut Self) -> &mut Obj>(&mut self, f: F) -> AbsLoc {
         let next_id = self.nodes.len();
-        let obj = self.nodes[node_id].obj.project_mut(proj);
+        let obj = f(self);
         let loc = if let Obj::Ptr(loc) = obj {
             loc.clone()
         } else {
@@ -448,6 +559,14 @@ impl Graph {
             self.nodes.push(Node::new());
         }
         loc
+    }
+
+    pub fn get_local_id(&self, local: usize) -> usize {
+        *self.locals.get(&Local::from_usize(local)).unwrap()
+    }
+
+    pub fn get_local_node(&self, local: usize) -> &Node {
+        &self.nodes[self.get_local_id(local)]
     }
 }
 

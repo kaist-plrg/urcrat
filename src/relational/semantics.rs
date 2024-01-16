@@ -74,6 +74,7 @@ impl<'tcx> Analyzer<'tcx> {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 for i in 0..len {
                     let l = l.extended(&[AccElem::Int(i as _)]);
+                    let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                 }
             }
@@ -155,11 +156,13 @@ impl<'tcx> Analyzer<'tcx> {
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
                     let l = l.extended(&[AccElem::Int(field.index())]);
+                    let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
                         let v = self.transfer_op(op, state);
                         let l = l.extended(&[AccElem::Int(field.index())]);
+                        let suffixes = self.get_path_suffixes(&l, l_deref);
                         state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
                 }
@@ -351,7 +354,7 @@ pub struct AccPath {
 
 impl AccPath {
     #[inline]
-    fn new(local: Local, projection: Vec<AccElem>) -> Self {
+    pub fn new(local: Local, projection: Vec<AccElem>) -> Self {
         Self { local, projection }
     }
 
@@ -379,10 +382,19 @@ impl AccPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AccElem {
     Int(usize),
     Symbolic(HashSet<Local>),
+}
+
+impl std::fmt::Debug for AccElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccElem::Int(i) => write!(f, "{}", i),
+            AccElem::Symbolic(s) => write!(f, "{:?}", s),
+        }
+    }
 }
 
 impl AccElem {
