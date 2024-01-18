@@ -315,7 +315,7 @@ fn test_eq_ref_struct() {
 
             assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
 
-            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
             assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
 
             assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
@@ -410,7 +410,7 @@ fn test_deref_struct_eq() {
 
             assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
 
-            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
             assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
 
             assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
@@ -461,7 +461,7 @@ fn test_eq_ref_deref() {
 
             assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
 
-            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
             assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
 
             assert_eq!(n[&1].field(0).as_ptr(), n[&9].as_ptr());

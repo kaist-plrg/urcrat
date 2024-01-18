@@ -574,6 +574,12 @@ impl Graph {
         loc
     }
 
+    pub fn deref_local_id(&self, local: Local) -> Option<usize> {
+        let id = self.locals.get(&local)?;
+        let loc = self.get_pointed_loc(*id, &[])?;
+        Some(loc.root)
+    }
+
     fn obj_at_location(&self, loc: &AbsLoc) -> Option<&Obj> {
         self.nodes[loc.root].obj.project(&loc.projection)
     }
@@ -582,12 +588,17 @@ impl Graph {
         self.nodes[loc.root].obj.project_mut(&loc.projection)
     }
 
-    pub fn invalidate_deref(&mut self, local: Local, mut depth: u32) {
+    pub fn invalidate_deref(&mut self, local: Local, mut depth: u32, opt_id: Option<usize>) {
         let id = *some_or!(self.locals.get(&local), return);
         let mut locs = vec![AbsLoc::new(id, vec![])];
         while !locs.is_empty() {
             if depth == 0 {
                 for l in locs {
+                    if let Some(id) = opt_id {
+                        if id == l.root {
+                            continue;
+                        }
+                    }
                     let obj = self.obj_at_location_mut(&l);
                     *obj = Obj::default();
                 }

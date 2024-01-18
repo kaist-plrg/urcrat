@@ -20,9 +20,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
             state.gm().invalidate_symbolic(l.local);
         }
         if l.is_indirect_first_projection() {
-            println!("{:?}", self.find_may_aliases(l.local));
+            let graph = state.gm();
+            let l_id = graph.deref_local_id(l.local);
             for (local, depth) in self.find_may_aliases(l.local) {
-                state.gm().invalidate_deref(local, depth);
+                graph.invalidate_deref(local, depth, l_id);
             }
         }
         let (l, l_deref) = AccPath::from_place(*l, state);
