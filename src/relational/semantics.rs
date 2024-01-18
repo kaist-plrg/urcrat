@@ -13,11 +13,17 @@ use rustc_middle::{
 use super::*;
 use crate::*;
 
-impl<'tcx> Analyzer<'tcx> {
+impl<'tcx> Analyzer<'tcx, '_> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         if l.projection.is_empty() {
             state.gm().invalidate_symbolic(l.local);
+        }
+        if l.is_indirect_first_projection() {
+            println!("{:?}", self.find_may_aliases(l.local));
+            for (local, depth) in self.find_may_aliases(l.local) {
+                state.gm().invalidate_deref(local, depth);
+            }
         }
         let (l, l_deref) = AccPath::from_place(*l, state);
         let suffixes = self.get_path_suffixes(&l, l_deref);

@@ -150,7 +150,7 @@ impl std::fmt::Debug for FnId {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Type {
-    var_ty: VarId,
+    pub var_ty: VarId,
     fn_ty: FnId,
 }
 

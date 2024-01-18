@@ -77,7 +77,7 @@ impl std::fmt::Debug for AbsLoc {
 
 impl AbsLoc {
     #[inline]
-    fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
+    pub fn new(root: NodeId, projection: Vec<AccElem>) -> Self {
         Self { root, projection }
     }
 
@@ -95,7 +95,7 @@ impl AbsLoc {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Obj {
     Ptr(AbsLoc),
     Compound(HashMap<usize, Obj>),
@@ -123,12 +123,14 @@ impl std::fmt::Debug for Obj {
     }
 }
 
-impl Obj {
+impl Default for Obj {
     #[inline]
-    fn new() -> Self {
+    fn default() -> Self {
         Obj::Compound(HashMap::new())
     }
+}
 
+impl Obj {
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
         if let Some(elem) = proj.get(0) {
             let inner = match elem {
@@ -155,19 +157,19 @@ impl Obj {
             let inner = match elem {
                 AccElem::Int(n) => {
                     if !matches!(self, Obj::Compound(_)) {
-                        *self = Obj::new();
+                        *self = Obj::default();
                     }
                     let Obj::Compound(fields) = self else { unreachable!() };
-                    fields.entry(*n).or_insert(Obj::new())
+                    fields.entry(*n).or_insert(Obj::default())
                 }
                 AccElem::Symbolic(local1) => {
                     if !matches!(self, Obj::Index(_, _)) {
-                        *self = Obj::Index(local1.clone(), Box::new(Obj::new()));
+                        *self = Obj::Index(local1.clone(), Box::default());
                     }
                     let Obj::Index(local2, box obj) = self else { unreachable!() };
                     if local1 != local2 {
                         *local2 = local1.clone();
-                        *obj = Obj::new();
+                        *obj = Obj::default();
                     }
                     obj
                 }
@@ -205,11 +207,22 @@ impl Obj {
             }
             Self::Index(ls, box obj) => {
                 if ls.remove(&local) && ls.is_empty() {
-                    *self = Obj::new();
+                    *self = Obj::default();
                     return;
                 }
                 obj.invalidate_symbolic(local);
             }
+        }
+    }
+
+    fn pointing_locations(&self) -> Vec<AbsLoc> {
+        match self {
+            Self::Ptr(loc) => vec![loc.clone()],
+            Self::Compound(fs) => fs
+                .values()
+                .flat_map(|obj| obj.pointing_locations())
+                .collect(),
+            Self::Index(_, box obj) => obj.pointing_locations(),
         }
     }
 
@@ -234,7 +247,7 @@ impl Obj {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Node {
     pub obj: Obj,
     pub at_addr: Option<u128>,
@@ -254,7 +267,7 @@ impl Node {
     #[inline]
     fn new() -> Self {
         Node {
-            obj: Obj::new(),
+            obj: Obj::default(),
             at_addr: None,
         }
     }
@@ -309,7 +322,7 @@ impl Graph {
                 }
             }
 
-            let mut obj = Obj::new();
+            let mut obj = Obj::default();
             join_objs(
                 &node1.obj,
                 &node2.obj,
@@ -443,7 +456,7 @@ impl Graph {
 
     fn x_eq(&mut self, x: &AccPath, deref: bool) {
         let obj = self.lvalue(x, deref);
-        *obj = Obj::new();
+        *obj = Obj::default();
     }
 
     pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath, y_deref: bool) {
@@ -561,6 +574,37 @@ impl Graph {
         loc
     }
 
+    fn obj_at_location(&self, loc: &AbsLoc) -> Option<&Obj> {
+        self.nodes[loc.root].obj.project(&loc.projection)
+    }
+
+    fn obj_at_location_mut(&mut self, loc: &AbsLoc) -> &mut Obj {
+        self.nodes[loc.root].obj.project_mut(&loc.projection)
+    }
+
+    pub fn invalidate_deref(&mut self, local: Local, mut depth: u32) {
+        let id = *some_or!(self.locals.get(&local), return);
+        let mut locs = vec![AbsLoc::new(id, vec![])];
+        while !locs.is_empty() {
+            if depth == 0 {
+                for l in locs {
+                    let obj = self.obj_at_location_mut(&l);
+                    *obj = Obj::default();
+                }
+                return;
+            } else {
+                locs = locs
+                    .into_iter()
+                    .flat_map(|loc| {
+                        let obj = some_or!(self.obj_at_location(&loc), return vec![]);
+                        obj.pointing_locations()
+                    })
+                    .collect();
+                depth -= 1;
+            }
+        }
+    }
+
     pub fn get_local_id(&self, local: usize) -> usize {
         *self.locals.get(&Local::from_usize(local)).unwrap()
     }
@@ -597,7 +641,7 @@ fn join_objs(
             let Obj::Compound(fs) = obj else { unreachable!() };
             for (f, obj1) in fs1 {
                 let obj2 = some_or!(fs2.get(f), continue);
-                let mut nobj = Obj::new();
+                let mut nobj = Obj::default();
                 join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
                 fs.insert(*f, nobj);
             }
@@ -605,7 +649,7 @@ fn join_objs(
         (Obj::Index(l1, box obj1), Obj::Index(l2, box obj2)) => {
             let l: HashSet<_> = l1.intersection(l2).copied().collect();
             if !l.is_empty() {
-                let mut nobj = Obj::new();
+                let mut nobj = Obj::default();
                 join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
                 *obj = Obj::Index(l, Box::new(nobj));
             }

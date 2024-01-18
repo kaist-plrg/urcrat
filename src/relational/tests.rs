@@ -279,6 +279,203 @@ fn test_eq_struct_2() {
 }
 
 #[test]
+fn test_eq_ref_struct() {
+    // _3 = const 0_i32
+    // _4 = const 2_i32
+    // _2 = s { x: move _3, y: move _4 }
+    // _1 = _2
+    // _6 = &mut (_1.0: i32)
+    // _5 = &raw mut (*_6)
+    // _7 = const 1_i32
+    // (*_5) = move _7
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = {
+            let mut init = s {
+                x: 0 as libc::c_int,
+                y: 2 as libc::c_int,
+            };
+            init
+        };
+        let mut y: *mut libc::c_int = &mut x.x;
+        *y = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=7);
+            let i = get_ids(&g, 1..=7);
+
+            assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
+
+            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
+
+            assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
+
+            assert_eq!(n[&5].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+        },
+    );
+}
+
+#[test]
+fn test_eq_deref_struct() {
+    // _3 = const 1_i32
+    // _4 = const 2_i32
+    // _2 = s { x: move _3, y: move _4 }
+    // _1 = _2
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _7 = ((*_5).0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = {
+            let mut init = s {
+                x: 1 as libc::c_int,
+                y: 2 as libc::c_int,
+            };
+            init
+        };
+        let mut y: *mut s = &mut x;
+        let mut z: libc::c_int = (*y).x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=7);
+            let i = get_ids(&g, 1..=7);
+
+            assert_eq!(n[&1].field(0).as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&7].as_ptr(), n[&3].as_ptr());
+
+            assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
+
+            assert_eq!(n[&5].as_ptr(), &AbsLoc::new_root(i[&1]));
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&1]));
+        },
+    );
+}
+
+#[test]
+fn test_deref_struct_eq() {
+    // _3 = const 0_i32
+    // _4 = const 2_i32
+    // _2 = s { x: move _3, y: move _4 }
+    // _1 = _2
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _7 = const 1_i32
+    // ((*_5).0: i32) = move _7
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = {
+            let mut init = s {
+                x: 0 as libc::c_int,
+                y: 2 as libc::c_int,
+            };
+            init
+        };
+        let mut y: *mut s = &mut x;
+        (*y).x = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=7);
+            let i = get_ids(&g, 1..=7);
+
+            assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
+
+            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
+
+            assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
+
+            assert_eq!(n[&5].as_ptr(), &AbsLoc::new_root(i[&1]));
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&1]));
+        },
+    );
+}
+
+#[test]
+fn test_eq_ref_deref() {
+    // _3 = const 0_i32
+    // _4 = const 2_i32
+    // _2 = s { x: move _3, y: move _4 }
+    // _1 = _2
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _8 = &mut ((*_5).0: i32)
+    // _7 = &raw mut (*_8)
+    // _9 = const 1_i32
+    // (*_7) = move _9
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = {
+            let mut init = s {
+                x: 0 as libc::c_int,
+                y: 2 as libc::c_int,
+            };
+            init
+        };
+        let mut y: *mut s = &mut x;
+        let mut z: *mut libc::c_int = &mut (*y).x;
+        *z = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=9);
+            let i = get_ids(&g, 1..=9);
+
+            assert_eq!(n[&2].field(0).as_ptr(), n[&3].as_ptr());
+
+            // assert_eq!(n[&1].field(1).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].field(1).as_ptr(), n[&4].as_ptr());
+
+            assert_eq!(n[&1].field(0).as_ptr(), n[&9].as_ptr());
+
+            assert_eq!(n[&5].as_ptr(), &AbsLoc::new_root(i[&1]));
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&1]));
+
+            assert_eq!(n[&7].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+            assert_eq!(n[&8].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+        },
+    );
+}
+
+#[test]
 fn test_eq_union() {
     // _1 = const 0_i32
     // _2 = u { x: _1 }
@@ -372,6 +569,30 @@ fn test_eq_array_symbolic() {
 
             assert_eq!(g.get_local_as_int(3), Some(1));
             assert_eq!(g.get_local_as_int(6), None);
+        },
+    );
+}
+
+#[test]
+fn test_eq_array_symbolic_struct() {
+    // _2 = ((*_1).0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "mut x: *mut s",
+        "
+        let mut y: libc::c_int = (*x).x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=2);
+            let n11 = &g.nodes[n[&1].as_ptr().root()];
+            assert_eq!(n11.field(0).as_ptr(), n[&2].as_ptr());
         },
     );
 }
@@ -563,6 +784,36 @@ fn test_join_loop() {
             let n = get_nodes(&g, 1..=2);
             assert_eq!(n[&1].as_ptr(), n[&2].as_ptr());
             assert_eq!(g.get_local_as_int(1), None);
+        },
+    );
+}
+
+#[test]
+fn test_deref_eq_invalidate() {
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // switchInt(move _1) -> [0: bb2, otherwise: bb1]
+    // _5 = &mut _2
+    // _4 = &raw mut (*_5)
+    // goto -> bb3
+    // _6 = &mut _3
+    // _4 = &raw mut (*_6)
+    // goto -> bb3
+    // _7 = const 1_i32
+    // (*_4) = move _7
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: *mut libc::c_int = if x != 0 { &mut y } else { &mut z };
+        *w = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 2..=3);
+            assert_eq!(n[&2].obj, Obj::default());
+            assert_eq!(n[&3].obj, Obj::default());
         },
     );
 }

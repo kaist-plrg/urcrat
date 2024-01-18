@@ -13,6 +13,7 @@ use rustc_middle::{
 };
 use rustc_mir_dataflow::Analysis;
 use rustc_session::config::Input;
+use rustc_span::def_id::LocalDefId;
 
 use super::*;
 use crate::*;
@@ -32,6 +33,7 @@ fn analyze_input(input: Input) -> AnalysisResults {
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
+    let may_aliases = steensgaard::analyze(tcx);
 
     let mut functions = HashMap::new();
     for item_id in hir.items() {
@@ -43,7 +45,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             continue;
         }
 
-        let def_id = item.owner_id.def_id.to_def_id();
+        let local_def_id = item_id.owner_id.def_id;
+        let def_id = local_def_id.to_def_id();
         let body = tcx.optimized_mir(def_id);
 
         for bbd in body.basic_blocks.iter() {
@@ -86,6 +89,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             dead_locals,
             local_tys,
             local_ptr_tys,
+            local_def_id,
+            may_aliases: &may_aliases,
         };
         functions.insert(def_id, analyzer.analyze());
     }
@@ -99,16 +104,18 @@ pub struct AnalysisResults {
 }
 
 #[allow(missing_debug_implementations)]
-pub struct Analyzer<'tcx> {
+pub struct Analyzer<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     body: &'tcx Body<'tcx>,
     rpo_map: HashMap<BasicBlock, usize>,
     dead_locals: Vec<BitSet<Local>>,
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
+    local_def_id: LocalDefId,
+    may_aliases: &'a steensgaard::AnalysisResults,
 }
 
-impl<'tcx> Analyzer<'tcx> {
+impl<'tcx> Analyzer<'tcx, '_> {
     fn analyze(&self) -> HashMap<Location, AbsMem> {
         let bot = AbsMem::bot();
 
@@ -160,6 +167,41 @@ impl<'tcx> Analyzer<'tcx> {
 
     pub fn ty(&self, operand: &Operand<'tcx>) -> Ty<'tcx> {
         operand.ty(&self.body.local_decls, self.tcx)
+    }
+
+    pub fn find_may_aliases(&self, local: Local) -> HashSet<(Local, u32)> {
+        let id = self.may_aliases.local(self.local_def_id, local.as_u32());
+        let ty = self.may_aliases.var_ty(id);
+
+        let mut aliases = HashSet::new();
+        let mut done = HashSet::new();
+        let mut remainings = HashSet::new();
+        remainings.insert((ty.var_ty, 0u32));
+
+        while !remainings.is_empty() {
+            let mut new_remainings = HashSet::new();
+            for (id, depth) in remainings {
+                done.insert(id);
+                for (id1, id2) in &self.may_aliases.vars {
+                    if id != *id2 {
+                        continue;
+                    }
+                    let steensgaard::VarId::Local(f, l) = *id1 else { continue };
+                    if f == self.local_def_id {
+                        aliases.insert((Local::from_u32(l), depth));
+                    }
+                }
+                for (v, t) in &self.may_aliases.var_tys {
+                    let steensgaard::VarType::Ref(t) = t else { continue };
+                    if t.var_ty == id && !done.contains(v) {
+                        new_remainings.insert((*v, depth + 1));
+                    }
+                }
+            }
+            remainings = new_remainings;
+        }
+
+        aliases
     }
 
     // fn def_id_to_string(&self, def_id: DefId) -> String {
