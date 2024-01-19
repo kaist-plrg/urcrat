@@ -8,7 +8,10 @@ use rustc_data_structures::graph::WithSuccessors;
 use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
-    mir::{BasicBlock, Body, Local, Location, Operand, TerminatorKind},
+    mir::{
+        interpret::ConstValue, visit::Visitor, BasicBlock, Body, ConstantKind, Local, Location,
+        Operand, Terminator, TerminatorKind,
+    },
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_mir_dataflow::Analysis;
@@ -34,18 +37,29 @@ fn analyze_input(input: Input) -> AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
     let may_aliases = steensgaard::analyze(tcx);
+    let var_graph = may_aliases.get_alias_graph();
+
+    let func_ids: Vec<_> = hir
+        .items()
+        .filter_map(|item_id| {
+            let item = hir.item(item_id);
+            if item.ident.name.as_str() == "main" || !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                return None;
+            }
+            Some(item_id.owner_id.def_id)
+        })
+        .collect();
+
+    let _call_graph: HashMap<_, _> = func_ids
+        .iter()
+        .map(|def_id| {
+            let body = tcx.optimized_mir(def_id.to_def_id());
+            (*def_id, get_callees(*def_id, body, &var_graph, tcx))
+        })
+        .collect();
 
     let mut functions = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
-        if item.ident.name.as_str() == "main" {
-            continue;
-        }
-        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
-            continue;
-        }
-
-        let local_def_id = item_id.owner_id.def_id;
+    for local_def_id in func_ids.iter().copied() {
         let def_id = local_def_id.to_def_id();
         let body = tcx.optimized_mir(def_id);
 
@@ -203,10 +217,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
 
         aliases
     }
-
-    // fn def_id_to_string(&self, def_id: DefId) -> String {
-    //     self.tcx.def_path(def_id).to_string_no_crate_verbose()
-    // }
 }
 
 #[derive(Debug)]
@@ -249,7 +259,7 @@ impl TyStructure {
                 if adt_def.adt_kind() == AdtKind::Enum {
                     let def_id = adt_def.did();
                     let name = tcx.def_path(def_id).to_string_no_crate_verbose();
-                    assert!(name.contains("::Option") && def_id.is_local(), "{name}");
+                    assert!(name.contains("::Option") && !def_id.is_local(), "{name}");
                     Self::Adt(vec![Self::Leaf])
                 } else {
                     let variant = &adt_def.variants()[VariantIdx::from_usize(0)];
@@ -427,4 +437,60 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
             dead_locals
         })
         .collect()
+}
+
+struct CallVisitor<'tcx, 'a> {
+    tcx: TyCtxt<'tcx>,
+    callees: HashSet<LocalDefId>,
+    current_fn: LocalDefId,
+    var_graph: &'a steensgaard::AliasGraph,
+}
+
+impl CallVisitor<'_, '_> {
+    fn def_id_to_string(&self, def_id: DefId) -> String {
+        self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for CallVisitor<'tcx, '_> {
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        if let TerminatorKind::Call { func, .. } = &terminator.kind {
+            match func {
+                Operand::Copy(f) | Operand::Move(f) => {
+                    assert!(f.projection.is_empty());
+                    let callees = self.var_graph.find_fn_may_aliases(self.current_fn, f.local);
+                    self.callees.extend(callees);
+                }
+                Operand::Constant(box constant) => {
+                    if let ConstantKind::Val(value, ty) = constant.literal {
+                        assert_eq!(value, ConstValue::ZeroSized);
+                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let name = self.def_id_to_string(*def_id);
+                        if let Some(def_id) = def_id.as_local() {
+                            if !name.contains("{extern#") {
+                                self.callees.insert(def_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.super_terminator(terminator, location);
+    }
+}
+
+fn get_callees<'tcx>(
+    current_fn: LocalDefId,
+    body: &Body<'tcx>,
+    var_graph: &steensgaard::AliasGraph,
+    tcx: TyCtxt<'tcx>,
+) -> HashSet<LocalDefId> {
+    let mut visitor = CallVisitor {
+        tcx,
+        callees: HashSet::new(),
+        current_fn,
+        var_graph,
+    };
+    visitor.visit_body(body);
+    visitor.callees
 }

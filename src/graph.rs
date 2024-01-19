@@ -104,12 +104,9 @@ pub fn inverse<T: Clone + Eq + std::hash::Hash>(
     map: &HashMap<T, HashSet<T>>,
 ) -> HashMap<T, HashSet<T>> {
     let mut inv: HashMap<_, HashSet<_>> = HashMap::new();
-    for node in map.keys() {
-        inv.insert(node.clone(), HashSet::new());
-    }
     for (node, succs) in map {
         for succ in succs {
-            inv.get_mut(succ).unwrap().insert(node.clone());
+            inv.entry(succ.clone()).or_default().insert(node.clone());
         }
     }
     inv

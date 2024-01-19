@@ -10,7 +10,8 @@ use rustc_hir::{ForeignItemKind, ItemKind};
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
-        BinOp, ConstantKind, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        BinOp, ConstantKind, Local, Operand, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -404,8 +405,8 @@ struct Analyzer<'tcx, 'a> {
 pub struct AnalysisResults {
     pub vars: HashMap<VarId, VarId>,
     pub var_tys: HashMap<VarId, VarType>,
-    pub fns: HashMap<FnId, FnId>,
-    pub fn_tys: HashMap<FnId, FnType>,
+    fns: HashMap<FnId, FnId>,
+    fn_tys: HashMap<FnId, FnType>,
 }
 
 impl std::fmt::Debug for AnalysisResults {
@@ -447,6 +448,114 @@ impl AnalysisResults {
     pub fn var_ty(&self, id: VarId) -> Type {
         let VarType::Ref(ty) = self.var_tys[&id] else { panic!() };
         ty
+    }
+
+    pub fn get_alias_graph(&self) -> AliasGraph {
+        let id_to_node = self.vars.clone();
+        let node_to_ids = graph::inverse(&to_graph(&id_to_node));
+        let points_to: HashMap<_, _> = self
+            .var_tys
+            .iter()
+            .filter_map(|(k, v)| {
+                let VarType::Ref(ty) = v else { return None };
+                Some((*k, ty.var_ty))
+            })
+            .collect();
+        let pointed_by = graph::inverse(&to_graph(&points_to));
+        let points_to_fn: HashMap<_, _> = self
+            .var_tys
+            .iter()
+            .filter_map(|(k, v)| {
+                let VarType::Ref(ty) = v else { return None };
+                Some((*k, ty.fn_ty))
+            })
+            .collect();
+        let mut pointed_by_fn: HashMap<_, HashSet<_>> = HashMap::new();
+        for (var_id, fn_id) in &points_to_fn {
+            pointed_by_fn.entry(*fn_id).or_default().insert(*var_id);
+        }
+        AliasGraph {
+            id_to_node,
+            node_to_ids,
+            points_to,
+            pointed_by,
+            points_to_fn,
+            fn_pointed_by: pointed_by_fn,
+        }
+    }
+}
+
+fn to_graph<T: Copy + Eq + std::hash::Hash>(map: &HashMap<T, T>) -> HashMap<T, HashSet<T>> {
+    map.iter()
+        .map(|(k, v)| (*k, HashSet::from_iter([*v])))
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct AliasGraph {
+    id_to_node: HashMap<VarId, VarId>,
+    node_to_ids: HashMap<VarId, HashSet<VarId>>,
+    points_to: HashMap<VarId, VarId>,
+    pointed_by: HashMap<VarId, HashSet<VarId>>,
+    points_to_fn: HashMap<VarId, FnId>,
+    fn_pointed_by: HashMap<FnId, HashSet<VarId>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MayAlias {
+    pub function: LocalDefId,
+    pub local: Local,
+    pub depth: usize,
+}
+
+impl AliasGraph {
+    pub fn find_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<MayAlias> {
+        let id = VarId::Local(f, l.as_u32());
+        let node = self.id_to_node[&id];
+        let pointed_node = self.points_to[&node];
+
+        let mut aliases = HashSet::new();
+        let mut done = HashSet::new();
+        let mut remainings = HashSet::new();
+        remainings.insert((pointed_node, 0));
+
+        while !remainings.is_empty() {
+            let mut new_remainings = HashSet::new();
+            for (node, depth) in remainings {
+                done.insert(node);
+                for node in &self.node_to_ids[&node] {
+                    let VarId::Local(f, l) = *node else { continue };
+                    let alias = MayAlias {
+                        function: f,
+                        local: Local::from_u32(l),
+                        depth,
+                    };
+                    aliases.insert(alias);
+                }
+                for node in &self.pointed_by[&node] {
+                    if !done.contains(node) {
+                        new_remainings.insert((*node, depth + 1));
+                    }
+                }
+            }
+            remainings = new_remainings;
+        }
+
+        aliases
+    }
+
+    pub fn find_fn_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<LocalDefId> {
+        let id = VarId::Local(f, l.as_u32());
+        let node = self.id_to_node[&id];
+        let pointed_fn = self.points_to_fn[&node];
+        let nodes = &self.fn_pointed_by[&pointed_fn];
+        nodes
+            .iter()
+            .filter_map(|node| {
+                let VarId::Global(f) = node else { return None };
+                Some(*f)
+            })
+            .collect()
     }
 }
 
