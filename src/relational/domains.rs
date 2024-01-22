@@ -93,6 +93,11 @@ impl AbsLoc {
     pub fn root(&self) -> NodeId {
         self.root
     }
+
+    #[inline]
+    pub fn projection(&self) -> &[AccElem] {
+        &self.projection
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -454,7 +459,7 @@ impl Graph {
         *obj = Obj::Ptr(AbsLoc::new(id, vec![]));
     }
 
-    fn x_eq(&mut self, x: &AccPath, deref: bool) {
+    pub fn x_eq(&mut self, x: &AccPath, deref: bool) {
         let obj = self.lvalue(x, deref);
         *obj = Obj::default();
     }
@@ -471,6 +476,57 @@ impl Graph {
 
         let obj = self.lvalue(x, false);
         *obj = Obj::Ptr(loc);
+    }
+
+    pub fn x_eq_offset(&mut self, x: &AccPath, y: &AccPath, idx: OpVal) {
+        let (id, _) = self.get_local_node_mut(y.local);
+        let loc = self.get_pointed_loc_mut(id, &[]);
+        let mut loc = if loc.projection.is_empty() {
+            let Obj::Ptr(loc) = &mut self.nodes[id].obj else { panic!() };
+            loc.projection.push(AccElem::Int(0));
+            let loc = loc.clone();
+            self.obj_at_location_mut(&loc);
+            loc
+        } else {
+            loc
+        };
+        let elem = loc.projection.last_mut().unwrap();
+        if let AccElem::Int(n) = elem {
+            match idx {
+                OpVal::Place(idx, idx_deref) => {
+                    assert!(idx.projection.is_empty());
+                    assert!(!idx_deref);
+                    *elem = AccElem::Symbolic(self.find_aliases(idx.local));
+                    let obj = self.lvalue(x, false);
+                    *obj = Obj::Ptr(loc);
+                }
+                OpVal::Int(idx) => {
+                    *n += idx as usize;
+                    let obj = self.lvalue(x, false);
+                    *obj = Obj::Ptr(loc);
+                }
+                OpVal::Other => {
+                    let obj = self.lvalue(x, false);
+                    *obj = Obj::default();
+                }
+            }
+        } else {
+            let obj = self.lvalue(x, false);
+            *obj = Obj::default();
+        }
+    }
+
+    pub fn x_eq_offset_int(&mut self, x: &AccPath, y: &AccPath, idx: u128) {
+        let (id, _) = self.get_local_node_mut(y.local);
+        let mut loc = self.get_pointed_loc_mut(id, &[]);
+        let obj = self.lvalue(x, false);
+        let elem = loc.projection.last_mut().unwrap();
+        if let AccElem::Int(n) = elem {
+            *n += idx as usize;
+            *obj = Obj::Ptr(loc);
+        } else {
+            *obj = Obj::default();
+        }
     }
 
     pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: u128) {

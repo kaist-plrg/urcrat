@@ -61,22 +61,24 @@ impl<'tcx> Analyzer<'tcx, '_> {
                             _ => unreachable!(),
                         };
                         state.gm().assign(&l, l_deref, &OpVal::Int(v));
-                    } else if matches!(ty.kind(), TyKind::Uint(UintTy::Usize)) {
-                        state.gm().assign(&l, l_deref, &r);
                     } else {
-                        state.gm().assign(&l, l_deref, &OpVal::Other);
+                        state.gm().assign(&l, l_deref, &r);
                     }
                 }
-                CastKind::PointerCoercion(coercion) => {
-                    if *coercion == PointerCoercion::MutToConstPointer {
-                        let r = self.transfer_op(r, state);
-                        state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
-                    } else {
+                CastKind::PointerCoercion(coercion) => match coercion {
+                    PointerCoercion::ReifyFnPointer
+                    | PointerCoercion::UnsafeFnPointer
+                    | PointerCoercion::ClosureFnPointer(_) => {
                         state
                             .gm()
                             .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
                     }
-                }
+                    PointerCoercion::MutToConstPointer | PointerCoercion::Unsize => {
+                        let r = self.transfer_op(r, state);
+                        state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                    }
+                    PointerCoercion::ArrayToPointer => todo!(),
+                },
                 _ => {
                     state
                         .gm()
@@ -333,11 +335,12 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     block: *target,
                     statement_index: 0,
                 };
-                match func {
+                let need_update = match func {
                     Operand::Copy(func) | Operand::Move(func) => {
                         assert!(func.projection.is_empty());
                         let callees = self.resolve_indirect_calls(func.local);
                         self.transfer_intra_call(&callees, &mut state);
+                        true
                     }
                     Operand::Constant(box constant) => {
                         let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
@@ -357,23 +360,34 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 let code =
                                     self.tcx.sess.source_map().span_to_snippet(span).unwrap();
                                 assert_eq!(code, "BitfieldStruct");
+                                true
                             } else if seg1.contains("{extern#") {
-                                self.transfer_c_call(seg0, inputs, args, &mut state);
+                                self.transfer_c_call(inputs, args, &mut state);
+                                true
                             } else {
                                 self.transfer_intra_call(
                                     &HashSet::from_iter([local_def_id]),
                                     &mut state,
                                 );
+                                true
                             }
                         } else {
                             self.transfer_rust_call(
                                 (seg3, seg2, seg1, seg0),
                                 inputs,
                                 args,
+                                destination,
                                 &mut state,
-                            );
+                            )
                         }
                     }
+                };
+                if need_update {
+                    let (l, l_deref) = AccPath::from_place(*destination, &state);
+                    let suffixes = self.get_path_suffixes(&l, l_deref);
+                    state
+                        .gm()
+                        .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
                 }
                 vec![(location, state)]
             }
@@ -390,29 +404,51 @@ impl<'tcx> Analyzer<'tcx, '_> {
         }
     }
 
-    fn transfer_c_call(
-        &self,
-        _name: &str,
-        _inputs: &[Ty<'_>],
-        _args: &[Operand<'_>],
-        _state: &mut AbsMem,
-    ) {
-        todo!()
+    fn transfer_c_call(&self, inputs: &[Ty<'_>], args: &[Operand<'_>], state: &mut AbsMem) {
+        let graph = state.gm();
+        for (ty, arg) in inputs.iter().zip(args) {
+            if ty.is_mutable_ptr() {
+                if let Operand::Copy(arg) | Operand::Move(arg) = arg {
+                    for (local, depth) in self.find_may_aliases(arg.local) {
+                        graph.invalidate_deref(local, depth, None);
+                    }
+                }
+            }
+        }
     }
 
     fn transfer_rust_call(
         &self,
         name: (&str, &str, &str, &str),
         inputs: &[Ty<'_>],
-        _args: &[Operand<'_>],
-        _state: &mut AbsMem,
-    ) {
+        args: &[Operand<'_>],
+        dst: &Place<'_>,
+        state: &mut AbsMem,
+    ) -> bool {
         if inputs.iter().all(|t| t.is_primitive()) {
-            return;
+            return true;
         }
+        let (d, d_deref) = AccPath::from_place(*dst, state);
+        assert!(!d_deref);
         match name {
-            ("", "option", _, "unwrap") => {}
-            _ => todo!("{:?}", name),
+            ("", "option", _, "unwrap") | ("ptr", _, _, "is_null") => true,
+            ("", "slice", _, "as_ptr" | "as_mut_ptr") => {
+                let (Operand::Copy(a) | Operand::Move(a)) = args[0] else { panic!() };
+                let (mut a, a_deref) = AccPath::from_place(a, state);
+                assert!(!a_deref);
+                a.projection.push(AccElem::Int(0));
+                state.gm().x_eq_ref_y(&d, &a, true);
+                false
+            }
+            ("ptr", _, _, "offset") => {
+                let (Operand::Copy(ptr) | Operand::Move(ptr)) = args[0] else { panic!() };
+                let (ptr, ptr_deref) = AccPath::from_place(ptr, state);
+                assert!(!ptr_deref);
+                let idx = self.transfer_op(&args[1], state);
+                state.gm().x_eq_offset(&d, &ptr, idx);
+                false
+            }
+            _ => todo!("{:?} {:?}", self.local_def_id, name),
         }
     }
 }

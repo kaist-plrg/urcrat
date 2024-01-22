@@ -132,7 +132,7 @@ pub struct Analyzer<'tcx, 'a> {
     dead_locals: Vec<BitSet<Local>>,
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
-    local_def_id: LocalDefId,
+    pub local_def_id: LocalDefId,
     indirect_assigns: &'a HashMap<LocalDefId, HashSet<Local>>,
     reachability: &'a HashMap<LocalDefId, HashSet<LocalDefId>>,
     alias_graph: &'a steensgaard::AliasGraph,
@@ -274,9 +274,6 @@ impl TyStructure {
         match ty.kind() {
             TyKind::Adt(adt_def, generic_args) => {
                 if adt_def.adt_kind() == AdtKind::Enum {
-                    let def_id = adt_def.did();
-                    let name = tcx.def_path(def_id).to_string_no_crate_verbose();
-                    assert!(name.contains("::Option") && !def_id.is_local(), "{name}");
                     Self::Adt(vec![Self::Leaf])
                 } else {
                     let variant = &adt_def.variants()[VariantIdx::from_usize(0)];

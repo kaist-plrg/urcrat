@@ -826,7 +826,7 @@ fn test_call_invalidate() {
     // _1 = const 0_i32
     // _3 = &mut _1
     // _2 = &raw mut (*_3)
-    // _4 = foo::f(_2) -> [return: bb1, unwind continue]
+    // _4 = foo::f(_2)
     analyze_fn(
         "
         unsafe fn f(mut x: *mut libc::c_int) {
@@ -861,7 +861,7 @@ fn test_indirect_call_invalidate() {
     // _6 = &raw mut (*_7)
     // _10 = _2
     // _9 = std::option::Option::<unsafe fn(*mut i32)>::unwrap(move _10)
-    // _8 = move _9(_6) -> [return: bb5, unwind continue]
+    // _8 = move _9(_6)
     analyze_fn_with(
         "",
         "mut x: libc::c_int",
@@ -886,6 +886,147 @@ fn test_indirect_call_invalidate() {
             assert_eq!(n[&7].as_ptr(), &AbsLoc::new_root(i[&5]));
 
             assert_eq!(g.get_local_as_int(5), None);
+        },
+    );
+}
+
+#[test]
+fn test_memcpy_invalidate() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _4 = move _5 as *mut libc::c_void (PtrToPtr)
+    // _9 = &mut _2
+    // _8 = &raw mut (*_9)
+    // _7 = move _8 as *const libc::c_void (PtrToPtr)
+    // _11 = std::mem::size_of::<i32>()
+    // _10 = move _11 as u64 (IntToInt)
+    // _3 = foo::memcpy(move _4, move _7, move _10)
+    analyze_fn(
+        "
+        extern \"C\" {
+            fn memcpy(
+                _: *mut libc::c_void,
+                _: *const libc::c_void,
+                _: libc::c_ulong,
+            ) -> *mut libc::c_void;
+        }
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        memcpy(
+            &mut x as *mut libc::c_int as *mut libc::c_void,
+            &mut y as *mut libc::c_int as *const libc::c_void,
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        );
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(1), None);
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_as_mut_ptr() {
+    // _1 = [const 0_i32; 1]
+    // _4 = &mut _1
+    // _3 = move _4 as &mut [i32] (PointerCoercion(Unsize))
+    // _2 = core::slice::<impl [i32]>::as_mut_ptr(move _3)
+    // _5 = const 1_i32
+    // (*_2) = move _5
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 1] = [0; 1];
+        let mut y: *mut libc::c_int = x.as_mut_ptr();
+        *y = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=5);
+            assert_eq!(n[&1].field(0).as_ptr(), n[&5].as_ptr());
+
+            assert_eq!(g.get_local_as_int(5), Some(1));
+        },
+    );
+}
+
+#[test]
+fn test_offset_array() {
+    // _1 = [const 0_i32; 2]
+    // _4 = &mut _1
+    // _3 = move _4 as &mut [i32] (PointerCoercion(Unsize))
+    // _2 = core::slice::<impl [i32]>::as_mut_ptr(move _3)
+    // _5 = const 1_i32
+    // _7 = _2
+    // _9 = const 1_i32
+    // _8 = move _9 as isize (IntToInt)
+    // _6 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _7, move _8)
+    // (*_6) = move _5
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 2] = [0; 2];
+        let mut y: *mut libc::c_int = x.as_mut_ptr();
+        *y.offset(1 as libc::c_int as isize) = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=5);
+            assert_eq!(n[&1].field(1).as_ptr(), n[&5].as_ptr());
+
+            assert_eq!(g.get_local_as_int(5), Some(1));
+        },
+    );
+}
+
+#[test]
+fn test_offset_array_symbolic() {
+    // _2 = [const 0_i32; 1]
+    // _5 = &mut _2
+    // _4 = move _5 as &mut [i32] (PointerCoercion(Unsize))
+    // _3 = core::slice::<impl [i32]>::as_mut_ptr(move _4) -> [return: bb1, unwind continue]
+    // _6 = const 1_i32
+    // _8 = _3
+    // _9 = _1 as isize (IntToInt)
+    // _7 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _8, move _9) -> [return: bb2, unwind continue]
+    // (*_7) = move _6
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: [libc::c_int; 1] = [0; 1];
+        let mut z: *mut libc::c_int = y.as_mut_ptr();
+        *z.offset(x as isize) = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 2..=6);
+            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([1, 9]));
+
+            assert_eq!(g.get_local_as_int(6), Some(1));
+        },
+    );
+}
+
+#[test]
+fn test_offset() {
+    // _2 = const 0_i32
+    // _5 = const 1_i32
+    // _4 = move _5 as isize (IntToInt)
+    // _3 = std::ptr::mut_ptr::<impl *mut i32>::offset(_1, move _4)
+    // (*_3) = move _2
+    analyze_fn_with(
+        "",
+        "mut x: *mut libc::c_int",
+        "
+        *x.offset(1 as libc::c_int as isize) = 0 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=3);
+            assert_eq!(n[&1].obj.as_ptr().root(), n[&3].obj.as_ptr().root());
+            assert_eq!(n[&1].obj.as_ptr().projection()[0], AccElem::Int(0));
+            assert_eq!(n[&3].obj.as_ptr().projection()[0], AccElem::Int(1));
+
+            let n11 = &g.nodes[n[&3].as_ptr().root()].field(1);
+            assert_eq!(n11.as_ptr(), n[&2].as_ptr());
         },
     );
 }
