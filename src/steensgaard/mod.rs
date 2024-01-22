@@ -6,7 +6,7 @@ use std::{
 use disjoint_set::DisjointSet;
 use etrace::some_or;
 use lazy_static::lazy_static;
-use rustc_hir::{ForeignItemKind, ItemKind};
+use rustc_hir::{ForeignItemKind, Item, ItemKind, Node};
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
@@ -541,7 +541,12 @@ impl AliasGraph {
         aliases
     }
 
-    pub fn find_fn_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<LocalDefId> {
+    pub fn find_fn_may_aliases(
+        &self,
+        f: LocalDefId,
+        l: Local,
+        tcx: TyCtxt<'_>,
+    ) -> HashSet<LocalDefId> {
         let id = VarId::Local(f, l.as_u32());
         let node = self.id_to_node[&id];
         let pointed_fn = self.points_to_fn[&node];
@@ -550,7 +555,18 @@ impl AliasGraph {
             .iter()
             .filter_map(|node| {
                 let VarId::Global(f) = node else { return None };
-                Some(*f)
+                let node = tcx.hir().find_by_def_id(*f).unwrap();
+                if matches!(
+                    node,
+                    Node::Item(Item {
+                        kind: ItemKind::Fn(..),
+                        ..
+                    })
+                ) {
+                    Some(*f)
+                } else {
+                    None
+                }
             })
             .collect()
     }

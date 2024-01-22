@@ -429,7 +429,11 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (d, d_deref) = AccPath::from_place(*dst, state);
         assert!(!d_deref);
         match name {
-            ("", "option", _, _) | ("ptr", _, _, "is_null" | "offset_from") => true,
+            ("", "clone", "Clone", "clone")
+            | (_, "ffi", _, _)
+            | ("ops", _, _, _)
+            | ("", "option", _, _)
+            | ("ptr", _, _, "is_null" | "offset_from") => true,
             ("", "slice", _, "as_ptr" | "as_mut_ptr") => {
                 let ptr = args[0].place().unwrap();
                 let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);

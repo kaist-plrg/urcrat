@@ -194,7 +194,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
 
     pub fn resolve_indirect_calls(&self, local: Local) -> HashSet<LocalDefId> {
         self.alias_graph
-            .find_fn_may_aliases(self.local_def_id, local)
+            .find_fn_may_aliases(self.local_def_id, local, self.tcx)
     }
 
     pub fn locals_invalidated_by_call(&self, callee: LocalDefId) -> HashSet<(Local, usize)> {
@@ -485,17 +485,21 @@ impl<'tcx> Visitor<'tcx> for BodyVisitor<'tcx, '_> {
             match func {
                 Operand::Copy(f) | Operand::Move(f) => {
                     assert!(f.projection.is_empty());
-                    let callees = self.var_graph.find_fn_may_aliases(self.current_fn, f.local);
+                    let callees =
+                        self.var_graph
+                            .find_fn_may_aliases(self.current_fn, f.local, self.tcx);
                     self.callees.extend(callees);
                 }
                 Operand::Constant(box constant) => {
                     if let ConstantKind::Val(value, ty) = constant.literal {
                         assert_eq!(value, ConstValue::ZeroSized);
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let name = self.def_id_to_string(*def_id);
-                        if let Some(def_id) = def_id.as_local() {
-                            if !name.contains("{extern#") {
-                                self.callees.insert(def_id);
+                        if self.tcx.impl_of_method(*def_id).is_none() {
+                            let name = self.def_id_to_string(*def_id);
+                            if let Some(def_id) = def_id.as_local() {
+                                if !name.contains("{extern#") {
+                                    self.callees.insert(def_id);
+                                }
                             }
                         }
                     }
