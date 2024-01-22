@@ -68,6 +68,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let def_id = local_def_id.to_def_id();
         let body = tcx.optimized_mir(def_id);
 
+        println!("{:?}", def_id);
         // for bbd in body.basic_blocks.iter() {
         //     for stmt in &bbd.statements {
         //         println!("{:?}", stmt);

@@ -1050,3 +1050,33 @@ fn test_write_volatile() {
         },
     );
 }
+
+#[test]
+fn test_read_volatile() {
+    // _1 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _8 = &_1
+    // _7 = &raw const (*_8)
+    // _6 = std::ptr::read_volatile::<i32>(move _7)
+    // _9 = const 1_i32
+    // _5 = Add(move _6, move _9)
+    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        ::std::ptr::write_volatile(
+            &mut x as *mut libc::c_int,
+            ::std::ptr::read_volatile::<libc::c_int>(&x as *const libc::c_int)
+                + 1 as libc::c_int,
+        );
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=9);
+            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
+            assert_eq!(n[&1].obj.as_ptr(), n[&9].obj.as_ptr());
+            assert_eq!(g.get_local_as_int(1), Some(1));
+            assert_eq!(g.get_local_as_int(6), Some(0));
+        },
+    );
+}

@@ -406,7 +406,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let graph = state.gm();
         for (ty, arg) in inputs.iter().zip(args) {
             if ty.is_mutable_ptr() {
-                if let Operand::Copy(arg) | Operand::Move(arg) = arg {
+                if let Some(arg) = arg.place() {
                     for (local, depth) in self.find_may_aliases(arg.local) {
                         graph.invalidate_deref(local, depth, None);
                     }
@@ -429,12 +429,19 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (d, d_deref) = AccPath::from_place(*dst, state);
         assert!(!d_deref);
         match name {
-            ("", "clone", "Clone", "clone")
-            | (_, "ffi", _, _)
+            (_, "clone", "Clone", "clone")
             | ("ops", _, _, _)
-            | ("", "option", _, _)
+            | (_, "ffi", _, _)
+            | (_, "cmp", _, _)
+            | (_, "cast", _, _)
+            | (_, "convert", _, _)
+            | (_, "f128_t", _, _)
+            | (_, "option", _, _)
+            | (_, "vec", _, _)
+            | (_, _, "vec", _)
+            | (_, _, "AsmCastTrait", _)
             | ("ptr", _, _, "is_null" | "offset_from") => true,
-            ("", "slice", _, "as_ptr" | "as_mut_ptr") => {
+            (_, "slice", _, "as_ptr" | "as_mut_ptr") => {
                 let ptr = args[0].place().unwrap();
                 let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);
                 assert!(!ptr_deref);
@@ -450,13 +457,30 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 state.gm().x_eq_offset(&d, &ptr, idx);
                 false
             }
-            ("", "", "ptr", "write_volatile") => {
+            (_, _, "ptr", "write_volatile") => {
                 let ptr = args[0].place().unwrap();
                 let (l, l_deref) = AccPath::from_place(ptr, state);
                 assert!(!l_deref);
                 let suffixes = self.get_path_suffixes(&l, l_deref);
                 let r = self.transfer_op(&args[1], state);
                 state.gm().assign_with_suffixes(&l, true, &r, &suffixes);
+                true
+            }
+            (_, _, "ptr", "read_volatile") => {
+                let ptr = args[0].place().unwrap();
+                let (r, r_deref) = AccPath::from_place(ptr, state);
+                assert!(!r_deref);
+                let r = OpVal::Place(r, true);
+                let suffixes = self.get_path_suffixes(&d, d_deref);
+                state.gm().assign_with_suffixes(&d, d_deref, &r, &suffixes);
+                false
+            }
+            (_, "unix", _, "memcpy") => {
+                if let Some(arg) = args[0].place() {
+                    for (local, depth) in self.find_may_aliases(arg.local) {
+                        state.gm().invalidate_deref(local, depth, None);
+                    }
+                }
                 true
             }
             _ => todo!("{:?}", name),
@@ -684,6 +708,7 @@ macro_rules! create_cast_fn {
                     UintTy::U64 => (n as u64) as $typ as u128,
                     UintTy::U128 => n as $typ as u128,
                 },
+                TyKind::Bool => (n != 0) as $typ as u128,
                 _ => panic!(),
             }
         }
