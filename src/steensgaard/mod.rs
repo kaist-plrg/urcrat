@@ -403,8 +403,8 @@ struct Analyzer<'tcx, 'a> {
 }
 
 pub struct AnalysisResults {
-    pub vars: HashMap<VarId, VarId>,
-    pub var_tys: HashMap<VarId, VarType>,
+    vars: HashMap<VarId, VarId>,
+    var_tys: HashMap<VarId, VarType>,
     fns: HashMap<FnId, FnId>,
     fn_tys: HashMap<FnId, FnType>,
 }
@@ -452,28 +452,17 @@ impl AnalysisResults {
 
     pub fn get_alias_graph(&self) -> AliasGraph {
         let id_to_node = self.vars.clone();
-        let node_to_ids = graph::inverse(&to_graph(&id_to_node));
-        let points_to: HashMap<_, _> = self
+        let node_to_ids = inv(&id_to_node);
+        let (points_to, points_to_fn): (HashMap<_, _>, HashMap<_, _>) = self
             .var_tys
             .iter()
             .filter_map(|(k, v)| {
                 let VarType::Ref(ty) = v else { return None };
-                Some((*k, ty.var_ty))
+                Some(((*k, ty.var_ty), (*k, ty.fn_ty)))
             })
-            .collect();
-        let pointed_by = graph::inverse(&to_graph(&points_to));
-        let points_to_fn: HashMap<_, _> = self
-            .var_tys
-            .iter()
-            .filter_map(|(k, v)| {
-                let VarType::Ref(ty) = v else { return None };
-                Some((*k, ty.fn_ty))
-            })
-            .collect();
-        let mut pointed_by_fn: HashMap<_, HashSet<_>> = HashMap::new();
-        for (var_id, fn_id) in &points_to_fn {
-            pointed_by_fn.entry(*fn_id).or_default().insert(*var_id);
-        }
+            .unzip();
+        let pointed_by = inv(&points_to);
+        let pointed_by_fn = inv(&points_to_fn);
         AliasGraph {
             id_to_node,
             node_to_ids,
@@ -485,10 +474,16 @@ impl AnalysisResults {
     }
 }
 
-fn to_graph<T: Copy + Eq + std::hash::Hash>(map: &HashMap<T, T>) -> HashMap<T, HashSet<T>> {
-    map.iter()
-        .map(|(k, v)| (*k, HashSet::from_iter([*v])))
-        .collect()
+fn inv<T, S>(map: &HashMap<T, S>) -> HashMap<S, HashSet<T>>
+where
+    T: Eq + std::hash::Hash + Copy,
+    S: Eq + std::hash::Hash + Copy,
+{
+    let mut new_map: HashMap<_, HashSet<_>> = HashMap::new();
+    for (k, v) in map {
+        new_map.entry(*v).or_default().insert(*k);
+    }
+    new_map
 }
 
 #[derive(Debug)]
@@ -532,9 +527,11 @@ impl AliasGraph {
                     };
                     aliases.insert(alias);
                 }
-                for node in &self.pointed_by[&node] {
-                    if !done.contains(node) {
-                        new_remainings.insert((*node, depth + 1));
+                if let Some(nodes) = self.pointed_by.get(&node) {
+                    for node in nodes {
+                        if !done.contains(node) {
+                            new_remainings.insert((*node, depth + 1));
+                        }
                     }
                 }
             }

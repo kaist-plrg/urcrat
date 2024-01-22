@@ -817,3 +817,75 @@ fn test_deref_eq_invalidate() {
         },
     );
 }
+
+#[test]
+fn test_call_invalidate() {
+    // _2 = const 0_i32
+    // (*_1) = move _2
+    //
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = foo::f(_2) -> [return: bb1, unwind continue]
+    analyze_fn(
+        "
+        unsafe fn f(mut x: *mut libc::c_int) {
+            *x = 0 as libc::c_int;
+        }
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        f(y);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=3);
+            let i = get_ids(&g, 1..=3);
+            assert_eq!(n[&2].as_ptr(), &AbsLoc::new_root(i[&1]));
+            assert_eq!(n[&3].as_ptr(), &AbsLoc::new_root(i[&1]));
+
+            assert_eq!(g.get_local_as_int(1), None);
+        },
+    );
+}
+
+#[test]
+fn test_indirect_call_invalidate() {
+    // switchInt(move _1) -> [0: bb2, otherwise: bb1]
+    // _3 = foo::f as unsafe fn(*mut i32) (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<unsafe fn(*mut i32)>::Some(move _3)
+    // goto -> bb3
+    // _4 = foo::g as unsafe fn(*mut i32) (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<unsafe fn(*mut i32)>::Some(move _4)
+    // goto -> bb3
+    // _5 = const 0_i32
+    // _7 = &mut _5
+    // _6 = &raw mut (*_7)
+    // _10 = _2
+    // _9 = std::option::Option::<unsafe fn(*mut i32)>::unwrap(move _10)
+    // _8 = move _9(_6) -> [return: bb5, unwind continue]
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        unsafe fn f(mut x: *mut libc::c_int) {
+            *x = 0 as libc::c_int;
+        }
+        unsafe fn g(mut x: *mut libc::c_int) {}
+        let mut h: Option::<unsafe fn(*mut libc::c_int) -> ()> = if x != 0 {
+            Some(f as unsafe fn(*mut libc::c_int) -> ())
+        } else {
+            Some(g as unsafe fn(*mut libc::c_int) -> ())
+        };
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: *mut libc::c_int = &mut y;
+        h.unwrap()(z);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 5..=7);
+            let i = get_ids(&g, 5..=7);
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&5]));
+            assert_eq!(n[&7].as_ptr(), &AbsLoc::new_root(i[&5]));
+
+            assert_eq!(g.get_local_as_int(5), None);
+        },
+    );
+}

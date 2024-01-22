@@ -9,6 +9,7 @@ use rustc_middle::{
     },
     ty::{adjustment::PointerCoercion, IntTy, Ty, TyKind, UintTy},
 };
+use rustc_span::def_id::LocalDefId;
 
 use super::*;
 use crate::*;
@@ -319,15 +320,99 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     .collect(),
             },
             TerminatorKind::Call {
-                func: _func,
-                args: _args,
-                destination: _destination,
-                target: Some(_),
+                func,
+                args,
+                destination,
+                target: Some(target),
                 ..
             } => {
-                todo!()
+                assert!(destination.projection.is_empty());
+                let mut state = state.clone();
+                state.gm().invalidate_symbolic(destination.local);
+                let location = Location {
+                    block: *target,
+                    statement_index: 0,
+                };
+                match func {
+                    Operand::Copy(func) | Operand::Move(func) => {
+                        assert!(func.projection.is_empty());
+                        let callees = self.resolve_indirect_calls(func.local);
+                        self.transfer_intra_call(&callees, &mut state);
+                    }
+                    Operand::Constant(box constant) => {
+                        let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                        assert!(matches!(value, ConstValue::ZeroSized));
+                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let name = self.def_id_to_string(*def_id);
+                        let mut segs: Vec<_> = name.split("::").collect();
+                        let seg0 = segs.pop().unwrap_or_default();
+                        let seg1 = segs.pop().unwrap_or_default();
+                        let seg2 = segs.pop().unwrap_or_default();
+                        let seg3 = segs.pop().unwrap_or_default();
+                        let sig = self.tcx.fn_sig(def_id).skip_binder();
+                        let inputs = sig.inputs().skip_binder();
+                        if let Some(local_def_id) = def_id.as_local() {
+                            if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
+                                let span = self.tcx.span_of_impl(impl_def_id).unwrap();
+                                let code =
+                                    self.tcx.sess.source_map().span_to_snippet(span).unwrap();
+                                assert_eq!(code, "BitfieldStruct");
+                            } else if seg1.contains("{extern#") {
+                                self.transfer_c_call(seg0, inputs, args, &mut state);
+                            } else {
+                                self.transfer_intra_call(
+                                    &HashSet::from_iter([local_def_id]),
+                                    &mut state,
+                                );
+                            }
+                        } else {
+                            self.transfer_rust_call(
+                                (seg3, seg2, seg1, seg0),
+                                inputs,
+                                args,
+                                &mut state,
+                            );
+                        }
+                    }
+                }
+                vec![(location, state)]
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn transfer_intra_call(&self, callees: &HashSet<LocalDefId>, state: &mut AbsMem) {
+        let graph = state.gm();
+        for callee in callees {
+            for (local, depth) in self.locals_invalidated_by_call(*callee) {
+                graph.invalidate_deref(local, depth, None);
+            }
+        }
+    }
+
+    fn transfer_c_call(
+        &self,
+        _name: &str,
+        _inputs: &[Ty<'_>],
+        _args: &[Operand<'_>],
+        _state: &mut AbsMem,
+    ) {
+        todo!()
+    }
+
+    fn transfer_rust_call(
+        &self,
+        name: (&str, &str, &str, &str),
+        inputs: &[Ty<'_>],
+        _args: &[Operand<'_>],
+        _state: &mut AbsMem,
+    ) {
+        if inputs.iter().all(|t| t.is_primitive()) {
+            return;
+        }
+        match name {
+            ("", "option", _, "unwrap") => {}
+            _ => todo!("{:?}", name),
         }
     }
 }

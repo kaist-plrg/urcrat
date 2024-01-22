@@ -588,7 +588,7 @@ impl Graph {
         self.nodes[loc.root].obj.project_mut(&loc.projection)
     }
 
-    pub fn invalidate_deref(&mut self, local: Local, mut depth: u32, opt_id: Option<usize>) {
+    pub fn invalidate_deref(&mut self, local: Local, mut depth: usize, opt_id: Option<usize>) {
         let id = *some_or!(self.locals.get(&local), return);
         let mut locs = vec![AbsLoc::new(id, vec![])];
         while !locs.is_empty() {

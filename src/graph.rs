@@ -4,15 +4,22 @@ use etrace::some_or;
 use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
 use rustc_index::Idx;
 
-pub fn transitive_closure<T: Idx + Ord>(
-    graph: &BTreeMap<T, BTreeSet<T>>,
-) -> BTreeMap<T, BTreeSet<T>> {
-    let len = graph.len();
+pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
+    graph: &HashMap<T, HashSet<T>>,
+) -> HashMap<T, HashSet<T>> {
+    let id_to_v: Vec<_> = graph.keys().cloned().collect();
+    let v_to_id: HashMap<_, _> = id_to_v
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(k, v)| (v, k))
+        .collect();
+    let len = id_to_v.len();
 
     let mut reachability = vec![vec![false; len]; len];
     for (v, succs) in graph.iter() {
         for succ in succs {
-            reachability[v.index()][succ.index()] = true;
+            reachability[v_to_id[v]][v_to_id[succ]] = true;
         }
     }
 
@@ -25,20 +32,20 @@ pub fn transitive_closure<T: Idx + Ord>(
         }
     }
 
-    let mut new_graph = BTreeMap::new();
+    let mut new_graph = HashMap::new();
     for (i, reachability) in reachability.iter().enumerate() {
         let neighbors = reachability
             .iter()
             .enumerate()
             .filter_map(|(to, is_reachable)| {
                 if *is_reachable {
-                    Some(T::new(to))
+                    Some(id_to_v[to].clone())
                 } else {
                     None
                 }
             })
             .collect();
-        new_graph.insert(T::new(i), neighbors);
+        new_graph.insert(id_to_v[i].clone(), neighbors);
     }
     new_graph
 }
@@ -104,9 +111,12 @@ pub fn inverse<T: Clone + Eq + std::hash::Hash>(
     map: &HashMap<T, HashSet<T>>,
 ) -> HashMap<T, HashSet<T>> {
     let mut inv: HashMap<_, HashSet<_>> = HashMap::new();
+    for node in map.keys() {
+        inv.insert(node.clone(), HashSet::new());
+    }
     for (node, succs) in map {
         for succ in succs {
-            inv.entry(succ.clone()).or_default().insert(node.clone());
+            inv.get_mut(succ).unwrap().insert(node.clone());
         }
     }
     inv
