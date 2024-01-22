@@ -68,7 +68,8 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 CastKind::PointerCoercion(coercion) => match coercion {
                     PointerCoercion::ReifyFnPointer
                     | PointerCoercion::UnsafeFnPointer
-                    | PointerCoercion::ClosureFnPointer(_) => {
+                    | PointerCoercion::ClosureFnPointer(_)
+                    | PointerCoercion::ArrayToPointer => {
                         state
                             .gm()
                             .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
@@ -77,7 +78,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let r = self.transfer_op(r, state);
                         state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                     }
-                    PointerCoercion::ArrayToPointer => todo!(),
                 },
                 _ => {
                     state
@@ -188,10 +188,8 @@ impl<'tcx> Analyzer<'tcx, '_> {
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
                 assert!(empty_suffix());
-                assert!(r.projection.is_empty());
                 let (path, is_deref) = AccPath::from_place(*r, state);
-                assert!(!is_deref);
-                let v = OpVal::Place(path, false);
+                let v = OpVal::Place(path, is_deref);
                 state.gm().assign(&l, l_deref, &v);
             }
         }
@@ -431,24 +429,33 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (d, d_deref) = AccPath::from_place(*dst, state);
         assert!(!d_deref);
         match name {
-            ("", "option", _, "unwrap") | ("ptr", _, _, "is_null") => true,
+            ("", "option", _, _) | ("ptr", _, _, "is_null" | "offset_from") => true,
             ("", "slice", _, "as_ptr" | "as_mut_ptr") => {
-                let (Operand::Copy(a) | Operand::Move(a)) = args[0] else { panic!() };
-                let (mut a, a_deref) = AccPath::from_place(a, state);
-                assert!(!a_deref);
-                a.projection.push(AccElem::Int(0));
-                state.gm().x_eq_ref_y(&d, &a, true);
+                let ptr = args[0].place().unwrap();
+                let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);
+                assert!(!ptr_deref);
+                ptr.projection.push(AccElem::Int(0));
+                state.gm().x_eq_ref_y(&d, &ptr, true);
                 false
             }
             ("ptr", _, _, "offset") => {
-                let (Operand::Copy(ptr) | Operand::Move(ptr)) = args[0] else { panic!() };
+                let ptr = args[0].place().unwrap();
                 let (ptr, ptr_deref) = AccPath::from_place(ptr, state);
                 assert!(!ptr_deref);
                 let idx = self.transfer_op(&args[1], state);
                 state.gm().x_eq_offset(&d, &ptr, idx);
                 false
             }
-            _ => todo!("{:?} {:?}", self.local_def_id, name),
+            ("", "", "ptr", "write_volatile") => {
+                let ptr = args[0].place().unwrap();
+                let (l, l_deref) = AccPath::from_place(ptr, state);
+                assert!(!l_deref);
+                let suffixes = self.get_path_suffixes(&l, l_deref);
+                let r = self.transfer_op(&args[1], state);
+                state.gm().assign_with_suffixes(&l, true, &r, &suffixes);
+                true
+            }
+            _ => todo!("{:?}", name),
         }
     }
 }

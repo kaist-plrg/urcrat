@@ -68,17 +68,17 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let def_id = local_def_id.to_def_id();
         let body = tcx.optimized_mir(def_id);
 
-        for bbd in body.basic_blocks.iter() {
-            for stmt in &bbd.statements {
-                println!("{:?}", stmt);
-            }
-            if !matches!(
-                bbd.terminator().kind,
-                TerminatorKind::Return | TerminatorKind::Assert { .. }
-            ) {
-                println!("{:?}", bbd.terminator().kind);
-            }
-        }
+        // for bbd in body.basic_blocks.iter() {
+        //     for stmt in &bbd.statements {
+        //         println!("{:?}", stmt);
+        //     }
+        //     if !matches!(
+        //         bbd.terminator().kind,
+        //         TerminatorKind::Return | TerminatorKind::Assert { .. }
+        //     ) {
+        //         println!("{:?}", bbd.terminator().kind);
+        //     }
+        // }
 
         let pre_rpo_map = get_rpo_map(body);
         let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
@@ -132,7 +132,7 @@ pub struct Analyzer<'tcx, 'a> {
     dead_locals: Vec<BitSet<Local>>,
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
-    pub local_def_id: LocalDefId,
+    local_def_id: LocalDefId,
     indirect_assigns: &'a HashMap<LocalDefId, HashSet<Local>>,
     reachability: &'a HashMap<LocalDefId, HashSet<LocalDefId>>,
     alias_graph: &'a steensgaard::AliasGraph,
