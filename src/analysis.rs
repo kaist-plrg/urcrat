@@ -53,7 +53,11 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 let (path, is_deref) = access.get_path(state);
                 let g = state.g();
                 let obj = g.get_obj(&path, is_deref);
-                println!("{:?}", access.ctx);
+                println!(
+                    "{:?} {:?}",
+                    body.source_info(access.location).span,
+                    access.ctx
+                );
                 if let Some(obj) = obj {
                     let Obj::Compound(fields) = obj else { unreachable!() };
                     for (i, obj) in fields {

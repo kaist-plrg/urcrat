@@ -253,6 +253,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
     pub fn transfer_term(
         &self,
         term: &Terminator<'tcx>,
+        dv: Option<&DiscrVal>,
         state: &AbsMem,
     ) -> Vec<(Location, AbsMem)> {
         match &term.kind {
@@ -275,25 +276,53 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             | TerminatorKind::Call { target: None, .. } => vec![],
             TerminatorKind::SwitchInt { discr, targets } => match self.transfer_op(discr, state) {
-                OpVal::Place(discr, is_deref) => targets
-                    .iter()
-                    .map(|(v, target)| {
-                        let location = Location {
-                            block: target,
+                OpVal::Place(discr, is_deref) => match dv {
+                    Some(dv) => {
+                        assert_eq!(targets.all_targets().len(), 2);
+                        let tb = targets.target_for_value(1);
+                        let fb = targets.target_for_value(0);
+                        assert_ne!(tb, fb);
+                        let tl = Location {
+                            block: tb,
                             statement_index: 0,
                         };
-                        let mut state = state.clone();
-                        state.gm().filter_x_int(&discr, is_deref, v);
-                        (location, state)
-                    })
-                    .chain(std::iter::once((
-                        Location {
-                            block: targets.otherwise(),
+                        let fl = Location {
+                            block: fb,
                             statement_index: 0,
-                        },
-                        state.clone(),
-                    )))
-                    .collect(),
+                        };
+                        let g = state.g();
+                        let v_local = g
+                            .get_local_as_int(dv.lhs.index())
+                            .map(|n| (n, dv.rhs))
+                            .or_else(|| g.get_local_as_int(dv.rhs.index()).map(|n| (n, dv.lhs)));
+                        let mut ts = state.clone();
+                        let mut fs = state.clone();
+                        if let Some((v, local)) = v_local {
+                            let g = if dv.equal { ts.gm() } else { fs.gm() };
+                            g.filter_x_int(&AccPath::new(local, vec![]), false, v);
+                        }
+                        vec![(tl, ts), (fl, fs)]
+                    }
+                    None => targets
+                        .iter()
+                        .map(|(v, target)| {
+                            let location = Location {
+                                block: target,
+                                statement_index: 0,
+                            };
+                            let mut state = state.clone();
+                            state.gm().filter_x_int(&discr, is_deref, v);
+                            (location, state)
+                        })
+                        .chain(std::iter::once((
+                            Location {
+                                block: targets.otherwise(),
+                                statement_index: 0,
+                            },
+                            state.clone(),
+                        )))
+                        .collect(),
+                },
                 OpVal::Int(i) => {
                     let target_opt = targets.iter().find(|(v, _)| i == *v);
                     let target = if let Some((_, target)) = target_opt {

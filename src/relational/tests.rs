@@ -696,6 +696,54 @@ fn test_filter() {
 }
 
 #[test]
+fn test_filter_if_eq() {
+    // _2 = const 0_i32
+    // _4 = const 0_i32
+    // _3 = Eq(_1, move _4)
+    // switchInt(move _3) -> [0: bb2, otherwise: bb1]
+    // _2 = _1
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        if x == 0 as libc::c_int {
+            y = x;
+        }
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_filter_if_ne() {
+    // _2 = const 1_i32
+    // _4 = const 0_i32
+    // _3 = Ne(_1, move _4)
+    // switchInt(move _3) -> [0: bb2, otherwise: bb1]
+    // _5 = const 0_i32
+    // _2 = move _5
+    // _2 = _1
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 1 as libc::c_int;
+        if x != 0 as libc::c_int {
+            y = 0 as libc::c_int;
+        } else {
+            y = x;
+        };
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
 fn test_join_same() {
     // _2 = const 0_i32
     // _3 = _2

@@ -9,8 +9,8 @@ use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     mir::{
-        interpret::ConstValue, visit::Visitor, BasicBlock, Body, ConstantKind, Local, Location,
-        Operand, Place, Rvalue, Terminator, TerminatorKind,
+        interpret::ConstValue, visit::Visitor, BasicBlock, BinOp, Body, ConstantKind, Local,
+        Location, Operand, Place, Rvalue, StatementKind, Terminator, TerminatorKind,
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -102,6 +102,7 @@ pub fn analyze_fn(
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let rpo_map = compute_rpo_map(body, &loop_blocks);
     let dead_locals = get_dead_locals(body, tcx);
+    let discriminant_values = find_discriminant_values(body);
     let local_tys = body
         .local_decls
         .iter()
@@ -126,6 +127,7 @@ pub fn analyze_fn(
         local_tys,
         local_ptr_tys,
         local_def_id,
+        discriminant_values,
         prog_info,
     };
     analyzer.analyze()
@@ -145,6 +147,7 @@ pub struct Analyzer<'tcx, 'a> {
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
     local_def_id: LocalDefId,
+    discriminant_values: HashMap<BasicBlock, DiscrVal>,
     prog_info: &'a ProgInfo,
 }
 
@@ -166,7 +169,8 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 self.transfer_stmt(stmt, &mut next_state);
                 vec![(location.successor_within_block(), next_state)]
             } else {
-                self.transfer_term(bbd.terminator(), &next_state)
+                let v = self.discriminant_values.get(&location.block);
+                self.transfer_term(bbd.terminator(), v, &next_state)
             };
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
@@ -464,6 +468,42 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
             let mut dead_locals = BitSet::new_filled(body.local_decls.len());
             dead_locals.subtract(&borrowed_or_live_locals);
             dead_locals
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DiscrVal {
+    pub equal: bool,
+    pub lhs: Local,
+    pub rhs: Local,
+}
+
+fn find_discriminant_values(body: &Body<'_>) -> HashMap<BasicBlock, DiscrVal> {
+    body.basic_blocks
+        .iter_enumerated()
+        .filter_map(|(bb, bbd)| {
+            let TerminatorKind::SwitchInt { discr, .. } = &bbd.terminator().kind else {
+                return None;
+            };
+            let place = discr.place()?;
+            let local = place.as_local()?;
+            let v = bbd.statements.iter().rev().find_map(|stmt| {
+                let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else { return None };
+                if lhs.as_local()? != local {
+                    return None;
+                }
+                let Rvalue::BinaryOp(op, box (lhs, rhs)) = rhs else { return None };
+                let equal = match op {
+                    BinOp::Eq => true,
+                    BinOp::Ne => false,
+                    _ => return None,
+                };
+                let lhs = lhs.place()?.as_local()?;
+                let rhs = rhs.place()?.as_local()?;
+                Some(DiscrVal { equal, lhs, rhs })
+            })?;
+            Some((bb, v))
         })
         .collect()
 }
