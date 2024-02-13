@@ -525,15 +525,22 @@ impl AccPath {
         Self { local, projection }
     }
 
+    #[inline]
     fn from_place(place: Place<'_>, state: &AbsMem) -> (Self, bool) {
-        let root = place.local;
-        let projections = place
-            .projection
+        Self::from_local_projection(place.local, place.projection, state)
+    }
+
+    pub fn from_local_projection(
+        local: Local,
+        proj: &[PlaceElem<'_>],
+        state: &AbsMem,
+    ) -> (Self, bool) {
+        let projections = proj
             .iter()
-            .filter_map(|e| AccElem::from_elem(e, state))
+            .filter_map(|e| AccElem::from_elem(*e, state))
             .collect();
-        let is_deref = place.is_indirect_first_projection();
-        (AccPath::new(root, projections), is_deref)
+        let is_deref = proj.get(0).map_or(false, |e| matches!(e, PlaceElem::Deref));
+        (AccPath::new(local, projections), is_deref)
     }
 
     #[inline]

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use etrace::some_or;
 use rustc_middle::mir::Local;
@@ -294,11 +294,22 @@ impl Node {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
-    pub locals: HashMap<Local, NodeId>,
-    pub ints: HashMap<u128, NodeId>,
+    locals: HashMap<Local, NodeId>,
+    ints: HashMap<u128, NodeId>,
+}
+
+impl std::fmt::Debug for Graph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nodes: BTreeMap<_, _> = self.nodes.iter().enumerate().map(|(i, n)| (i, n)).collect();
+        let locals: BTreeMap<_, _> = self.locals.iter().map(|(l, n)| (*l, *n)).collect();
+        f.debug_struct("Graph")
+            .field("nodes", &nodes)
+            .field("locals", &locals)
+            .finish()
+    }
 }
 
 impl Graph {
@@ -420,6 +431,20 @@ impl Graph {
             let l = l.extended(suffix);
             let r = r.extended(suffix);
             self.assign(&l, l_deref, &r);
+        }
+    }
+
+    pub fn get_obj(&self, x: &AccPath, deref: bool) -> Option<&Obj> {
+        if deref {
+            let id = self.locals.get(&x.local)?;
+            let mut loc = self.get_pointed_loc(*id, &[])?;
+            loc.projection.extend(x.projection.to_owned());
+            let node = &self.nodes[loc.root];
+            node.obj.project(&loc.projection)
+        } else {
+            let id = self.locals.get(&x.local)?;
+            let node = &self.nodes[*id];
+            node.obj.project(&x.projection)
         }
     }
 
@@ -659,16 +684,15 @@ impl Graph {
                     *obj = Obj::default();
                 }
                 return;
-            } else {
-                locs = locs
-                    .into_iter()
-                    .flat_map(|loc| {
-                        let obj = some_or!(self.obj_at_location(&loc), return vec![]);
-                        obj.pointing_locations()
-                    })
-                    .collect();
-                depth -= 1;
             }
+            locs = locs
+                .into_iter()
+                .flat_map(|loc| {
+                    let obj = some_or!(self.obj_at_location(&loc), return vec![]);
+                    obj.pointing_locations()
+                })
+                .collect();
+            depth -= 1;
         }
     }
 

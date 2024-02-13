@@ -4,7 +4,7 @@ use rustc_middle::{
     mir::{Location, TerminatorKind},
     ty::TyCtxt,
 };
-use rustc_span::def_id::DefId;
+use rustc_span::def_id::LocalDefId;
 
 use super::*;
 use crate::*;
@@ -15,7 +15,7 @@ fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     compile_util::run_compiler(config, f).unwrap();
 }
 
-fn find_fn(name: &str, tcx: TyCtxt<'_>) -> DefId {
+fn find_fn(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
     let hir = tcx.hir();
     hir.items()
         .find_map(|item_id| {
@@ -23,12 +23,12 @@ fn find_fn(name: &str, tcx: TyCtxt<'_>) -> DefId {
             if item.ident.name.as_str() != name {
                 return None;
             }
-            Some(item_id.owner_id.to_def_id())
+            Some(item_id.owner_id.def_id)
         })
         .unwrap()
 }
 
-fn find_return(def_id: DefId, tcx: TyCtxt<'_>) -> Location {
+fn find_return(def_id: LocalDefId, tcx: TyCtxt<'_>) -> Location {
     let body = tcx.optimized_mir(def_id);
     let (bb, bbd) = body
         .basic_blocks

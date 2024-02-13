@@ -35,94 +35,105 @@ fn analyze_input(input: Input) -> AnalysisResults {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
-    let hir = tcx.hir();
-    let may_aliases = steensgaard::analyze(tcx);
-    let alias_graph = may_aliases.get_alias_graph();
-
-    let func_ids: Vec<_> = hir
-        .items()
-        .filter_map(|item_id| {
-            let item = hir.item(item_id);
-            if item.ident.name.as_str() == "main" || !matches!(item.kind, ItemKind::Fn(_, _, _)) {
-                return None;
-            }
-            Some(item_id.owner_id.def_id)
-        })
+    let prog_info = relational::ProgInfo::new(tcx);
+    let functions = prog_info
+        .reachability
+        .keys()
+        .map(|def_id| (*def_id, analyze_fn(tcx, &prog_info, *def_id)))
         .collect();
+    AnalysisResults { functions }
+}
 
-    let (indirect_assigns, call_graph): (HashMap<_, _>, HashMap<_, _>) = func_ids
-        .iter()
-        .map(|def_id| {
-            let body = tcx.optimized_mir(def_id.to_def_id());
-            let (indirect_assigns, callees) = visit_body(*def_id, body, &alias_graph, tcx);
-            ((*def_id, indirect_assigns), (*def_id, callees))
-        })
-        .unzip();
-    let mut reachability = graph::transitive_closure(&call_graph);
-    for (caller, callees) in &mut reachability {
-        callees.insert(*caller);
-    }
+#[derive(Debug)]
+pub struct ProgInfo {
+    indirect_assigns: HashMap<LocalDefId, HashSet<Local>>,
+    reachability: HashMap<LocalDefId, HashSet<LocalDefId>>,
+    alias_graph: steensgaard::AliasGraph,
+}
 
-    let mut functions = HashMap::new();
-    for local_def_id in func_ids.iter().copied() {
-        let def_id = local_def_id.to_def_id();
-        let body = tcx.optimized_mir(def_id);
+impl ProgInfo {
+    pub fn new(tcx: TyCtxt<'_>) -> Self {
+        let hir = tcx.hir();
 
-        println!("{:?}", def_id);
-        // for bbd in body.basic_blocks.iter() {
-        //     for stmt in &bbd.statements {
-        //         println!("{:?}", stmt);
-        //     }
-        //     if !matches!(
-        //         bbd.terminator().kind,
-        //         TerminatorKind::Return | TerminatorKind::Assert { .. }
-        //     ) {
-        //         println!("{:?}", bbd.terminator().kind);
-        //     }
-        // }
+        let may_aliases = steensgaard::analyze(tcx);
+        let alias_graph = may_aliases.get_alias_graph();
 
-        let pre_rpo_map = get_rpo_map(body);
-        let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
-        let rpo_map = compute_rpo_map(body, &loop_blocks);
-        let dead_locals = get_dead_locals(body, tcx);
-        let local_tys = body
-            .local_decls
-            .iter()
-            .map(|decl| TyStructure::from_ty(decl.ty, def_id, tcx))
-            .collect();
-        let local_ptr_tys = body
-            .local_decls
-            .iter_enumerated()
-            .filter_map(|(local, decl)| {
-                let (TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _)) =
-                    decl.ty.kind()
-                else {
+        let func_ids: Vec<_> = hir
+            .items()
+            .filter_map(|item_id| {
+                let item = hir.item(item_id);
+                if item.ident.name.as_str() == "main" || !matches!(item.kind, ItemKind::Fn(_, _, _))
+                {
                     return None;
-                };
-                Some((local, TyStructure::from_ty(*ty, def_id, tcx)))
+                }
+                Some(item_id.owner_id.def_id)
             })
             .collect();
-        let analyzer = Analyzer {
-            tcx,
-            body,
-            rpo_map,
-            dead_locals,
-            local_tys,
-            local_ptr_tys,
-            local_def_id,
-            indirect_assigns: &indirect_assigns,
-            reachability: &reachability,
-            alias_graph: &alias_graph,
-        };
-        functions.insert(def_id, analyzer.analyze());
-    }
 
-    AnalysisResults { functions }
+        let (indirect_assigns, call_graph): (HashMap<_, _>, HashMap<_, _>) = func_ids
+            .iter()
+            .map(|def_id| {
+                let body = tcx.optimized_mir(def_id.to_def_id());
+                let (indirect_assigns, callees) = visit_body(*def_id, body, &alias_graph, tcx);
+                ((*def_id, indirect_assigns), (*def_id, callees))
+            })
+            .unzip();
+        let mut reachability = graph::transitive_closure(&call_graph);
+        for (caller, callees) in &mut reachability {
+            callees.insert(*caller);
+        }
+
+        Self {
+            indirect_assigns,
+            reachability,
+            alias_graph,
+        }
+    }
+}
+
+pub fn analyze_fn(
+    tcx: TyCtxt<'_>,
+    prog_info: &ProgInfo,
+    local_def_id: LocalDefId,
+) -> HashMap<Location, AbsMem> {
+    let def_id = local_def_id.to_def_id();
+    let body = tcx.optimized_mir(def_id);
+    let pre_rpo_map = get_rpo_map(body);
+    let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
+    let rpo_map = compute_rpo_map(body, &loop_blocks);
+    let dead_locals = get_dead_locals(body, tcx);
+    let local_tys = body
+        .local_decls
+        .iter()
+        .map(|decl| TyStructure::from_ty(decl.ty, def_id, tcx))
+        .collect();
+    let local_ptr_tys = body
+        .local_decls
+        .iter_enumerated()
+        .filter_map(|(local, decl)| {
+            let (TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _)) = decl.ty.kind()
+            else {
+                return None;
+            };
+            Some((local, TyStructure::from_ty(*ty, def_id, tcx)))
+        })
+        .collect();
+    let analyzer = Analyzer {
+        tcx,
+        body,
+        rpo_map,
+        dead_locals,
+        local_tys,
+        local_ptr_tys,
+        local_def_id,
+        prog_info,
+    };
+    analyzer.analyze()
 }
 
 #[derive(Debug, Clone)]
 pub struct AnalysisResults {
-    pub functions: HashMap<DefId, HashMap<Location, AbsMem>>,
+    pub functions: HashMap<LocalDefId, HashMap<Location, AbsMem>>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -134,9 +145,7 @@ pub struct Analyzer<'tcx, 'a> {
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
     local_def_id: LocalDefId,
-    indirect_assigns: &'a HashMap<LocalDefId, HashSet<Local>>,
-    reachability: &'a HashMap<LocalDefId, HashSet<LocalDefId>>,
-    alias_graph: &'a steensgaard::AliasGraph,
+    prog_info: &'a ProgInfo,
 }
 
 impl<'tcx> Analyzer<'tcx, '_> {
@@ -194,32 +203,37 @@ impl<'tcx> Analyzer<'tcx, '_> {
     }
 
     pub fn resolve_indirect_calls(&self, local: Local) -> HashSet<LocalDefId> {
-        self.alias_graph
+        self.prog_info
+            .alias_graph
             .find_fn_may_aliases(self.local_def_id, local, self.tcx)
     }
 
     pub fn locals_invalidated_by_call(&self, callee: LocalDefId) -> HashSet<(Local, usize)> {
-        self.reachability[&callee]
+        self.prog_info.reachability[&callee]
             .iter()
             .flat_map(|func| {
-                self.indirect_assigns[func].iter().flat_map(|local| {
-                    self.alias_graph
-                        .find_may_aliases(*func, *local)
-                        .into_iter()
-                        .filter_map(|alias| {
-                            if alias.function == self.local_def_id {
-                                Some((alias.local, alias.depth))
-                            } else {
-                                None
-                            }
-                        })
-                })
+                self.prog_info.indirect_assigns[func]
+                    .iter()
+                    .flat_map(|local| {
+                        self.prog_info
+                            .alias_graph
+                            .find_may_aliases(*func, *local)
+                            .into_iter()
+                            .filter_map(|alias| {
+                                if alias.function == self.local_def_id {
+                                    Some((alias.local, alias.depth))
+                                } else {
+                                    None
+                                }
+                            })
+                    })
             })
             .collect()
     }
 
     pub fn find_may_aliases(&self, local: Local) -> HashSet<(Local, usize)> {
-        self.alias_graph
+        self.prog_info
+            .alias_graph
             .find_may_aliases(self.local_def_id, local)
             .into_iter()
             .filter_map(|alias| {

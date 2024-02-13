@@ -23,5 +23,6 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    relational::analyze_path(&file);
+    // relational::analyze_path(&file);
+    analysis::analyze_path(&file);
 }

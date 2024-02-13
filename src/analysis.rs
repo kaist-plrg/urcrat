@@ -1,178 +1,161 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{collections::HashSet, path::Path};
 
 use etrace::some_or;
-use rustc_hir::{
-    def::Res, intravisit, intravisit::Visitor, Expr, ExprKind, ItemKind, Node, QPath, Ty, TyKind,
-};
+use relational::{AbsMem, AccPath, Obj};
+use rustc_abi::FieldIdx;
+use rustc_hir::ItemKind;
+use rustc_index::IndexVec;
 use rustc_middle::{
-    hir::nested_filter,
-    ty::{TyCtxt, TypeckResults},
+    mir::{
+        visit::{PlaceContext, Visitor},
+        Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
+    },
+    ty::{TyCtxt, TyKind},
 };
-use rustc_span::def_id::DefId;
+use rustc_session::config::Input;
+use rustc_span::def_id::LocalDefId;
 
-use crate::{compile_util, graph};
+use crate::{compile_util, relational, ty_finder};
 
-pub fn analyze(path: &Path) {
-    let input = compile_util::path_to_input(path);
+pub fn analyze_path(path: &Path) {
+    analyze_input(compile_util::path_to_input(path))
+}
+
+pub fn analyze_str(code: &str) {
+    analyze_input(compile_util::str_to_input(code))
+}
+
+fn analyze_input(input: Input) {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |tcx| {
-        let mut visitor = TyVisitor::new(tcx);
-        tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-        let foreign_tys: HashSet<_> = visitor
-            .foreign_types
-            .into_iter()
-            .flat_map(|id| graph::reachable_vertices(&visitor.type_graph, id, visitor.tys.len()))
-            .map(|id| visitor.tys[id])
-            .collect();
-
-        for item_id in tcx.hir().items() {
-            let item = tcx.hir().item(item_id);
-            if !matches!(
-                item.kind,
-                ItemKind::Static(_, _, _) | ItemKind::Const(_, _, _) | ItemKind::Fn(_, _, _)
-            ) {
-                continue;
-            }
-            let typeck = tcx.typeck(item.owner_id);
-            let mut visitor = UnionVisitor::new(tcx, typeck, &foreign_tys);
-            visitor.visit_item(item);
-            if !visitor.map.is_empty() {
-                let def_path = tcx.def_path_str(item.owner_id.to_def_id());
-                println!("{:?} {:?}", def_path, visitor.map);
-            }
-        }
-    })
-    .unwrap();
+    compile_util::run_compiler(config, analyze).unwrap()
 }
 
-struct TyVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    tys: Vec<DefId>,
-    ty_ids: HashMap<DefId, usize>,
-    foreign_types: HashSet<usize>,
-    type_graph: HashMap<usize, HashSet<usize>>,
-}
+pub fn analyze(tcx: TyCtxt<'_>) {
+    let visitor = ty_finder::TyVisitor::new(tcx);
+    let foreign_tys = visitor.find_foreign_tys(tcx);
+    let prog_info = relational::ProgInfo::new(tcx);
 
-impl<'tcx> TyVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            tcx,
-            tys: Vec::new(),
-            ty_ids: HashMap::new(),
-            foreign_types: HashSet::new(),
-            type_graph: HashMap::new(),
+    for item_id in tcx.hir().items() {
+        let item = tcx.hir().item(item_id);
+        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+            continue;
         }
-    }
-
-    fn ty_to_id(&mut self, ty: DefId) -> usize {
-        self.ty_ids.get(&ty).copied().unwrap_or_else(|| {
-            let id = self.tys.len();
-            self.tys.push(ty);
-            self.ty_ids.insert(ty, id);
-            id
-        })
-    }
-
-    fn handle_ty(&mut self, ty: &'tcx Ty<'tcx>) {
-        let TyKind::Path(QPath::Resolved(_, path)) = ty.kind else { return };
-        let Res::Def(_, def_id) = path.res else { return };
-        if !def_id.is_local() {
-            return;
-        }
-        let id = self.ty_to_id(def_id);
-
-        let hir = self.tcx.hir();
-        let mut hir_id = ty.hir_id;
-        while let Some(parent_id) = hir.opt_parent_id(hir_id) {
-            let node = hir.get(parent_id);
-            match node {
-                Node::ForeignItem(_) => {
-                    self.foreign_types.insert(id);
-                    break;
-                }
-                Node::Item(item) => {
-                    if matches!(
-                        item.kind,
-                        ItemKind::Struct(_, _) | ItemKind::Union(_, _) | ItemKind::TyAlias(_, _)
-                    ) {
-                        let item_def_id = item.owner_id.to_def_id();
-                        let item_id = self.ty_to_id(item_def_id);
-                        self.type_graph.entry(item_id).or_default().insert(id);
+        let local_def_id = item_id.owner_id.def_id;
+        let def_id = local_def_id.to_def_id();
+        let body = tcx.optimized_mir(def_id);
+        let mut visitor = PlaceVisitor::new(tcx, &body.local_decls, &foreign_tys);
+        visitor.visit_body(body);
+        if !visitor.accesses.is_empty() {
+            println!("{:?}", local_def_id);
+            let states = relational::analyze_fn(tcx, &prog_info, local_def_id);
+            for access in &visitor.accesses {
+                let state = &states[&access.location];
+                let (path, is_deref) = access.get_path(state);
+                let g = state.g();
+                let obj = g.get_obj(&path, is_deref);
+                println!("{:?}", access.ctx);
+                if let Some(obj) = obj {
+                    let Obj::Compound(fields) = obj else { unreachable!() };
+                    for (i, obj) in fields {
+                        if let Obj::Ptr(loc) = obj {
+                            if loc.projection().is_empty() {
+                                let node = &g.nodes[loc.root()];
+                                if let Some(v) = node.at_addr {
+                                    println!("{}: {}", i, v);
+                                } else {
+                                    println!("{}: loc<{:?}>", i, obj);
+                                }
+                            } else {
+                                println!("{}: loc<{:?}>", i, obj);
+                            }
+                        } else {
+                            println!("{}: {:?}", i, obj);
+                        }
                     }
-                    break;
+                } else {
+                    println!("None");
                 }
-                _ => hir_id = parent_id,
             }
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for TyVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
-
-    fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
-        self.handle_ty(ty);
-        intravisit::walk_ty(self, ty);
-    }
-}
-
-struct UnionVisitor<'tcx, 'a> {
+struct PlaceVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
-    typeck: &'a TypeckResults<'tcx>,
-    foreign_tys: &'a HashSet<DefId>,
-    map: HashMap<String, HashSet<String>>,
+    local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
+    foreign_tys: &'a HashSet<LocalDefId>,
+    accesses: Vec<FieldAccess<'tcx>>,
 }
 
-impl<'tcx, 'a> UnionVisitor<'tcx, 'a> {
+impl<'tcx, 'a> PlaceVisitor<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
-        typeck: &'a TypeckResults<'tcx>,
-        foreign_tys: &'a HashSet<DefId>,
+        local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
+        foreign_tys: &'a HashSet<LocalDefId>,
     ) -> Self {
         Self {
             tcx,
-            typeck,
+            local_decls,
             foreign_tys,
-            map: HashMap::new(),
+            accesses: vec![],
         }
-    }
-
-    fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        let ExprKind::Field(expr, ident) = expr.kind else { return };
-        let ty = self.typeck.expr_ty(expr);
-        let adt_def = some_or!(ty.ty_adt_def(), return);
-        if !adt_def.is_union() {
-            return;
-        }
-        let def_id = adt_def.did();
-        if !def_id.is_local() {
-            return;
-        }
-        if self.foreign_tys.contains(&def_id) {
-            return;
-        }
-        let ty = format!("{:?}", ty);
-        let field = ident.name.to_string();
-        self.map.entry(ty).or_default().insert(field);
     }
 }
 
-impl<'tcx> Visitor<'tcx> for UnionVisitor<'tcx, '_> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+impl<'tcx> Visitor<'tcx> for PlaceVisitor<'tcx, '_> {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        if place.projection.len() > 0 {
+            for i in 0..(place.projection.len() - 1) {
+                let ty = Place::ty_from(
+                    place.local,
+                    &place.projection[..=i],
+                    self.local_decls,
+                    self.tcx,
+                )
+                .ty;
+                let TyKind::Adt(adt_def, _) = ty.kind() else { continue };
+                if !adt_def.is_union() {
+                    continue;
+                }
+                let def_id = some_or!(adt_def.did().as_local(), continue);
+                if self.foreign_tys.contains(&def_id) {
+                    continue;
+                }
+                let ProjectionElem::Field(f, _) = place.projection[i + 1] else { unreachable!() };
+                let access = FieldAccess {
+                    ty: def_id,
+                    local: place.local,
+                    projection: &place.projection[..=i],
+                    field: f,
+                    ctx: context,
+                    location,
+                };
+                self.accesses.push(access);
+            }
+        }
+        self.super_place(place, context, location);
     }
+}
 
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        self.handle_expr(expr);
-        intravisit::walk_expr(self, expr);
+#[derive(Debug, Clone, Copy)]
+struct FieldAccess<'tcx> {
+    #[allow(unused)]
+    ty: LocalDefId,
+    local: Local,
+    projection: &'tcx [PlaceElem<'tcx>],
+    #[allow(unused)]
+    field: FieldIdx,
+    ctx: PlaceContext,
+    location: Location,
+}
+
+impl FieldAccess<'_> {
+    fn get_path(&self, state: &AbsMem) -> (AccPath, bool) {
+        assert!(!self.projection.is_empty());
+        AccPath::from_local_projection(
+            self.local,
+            &self.projection[..self.projection.len() - 1],
+            state,
+        )
     }
 }
