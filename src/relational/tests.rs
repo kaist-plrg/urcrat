@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rustc_middle::{
     mir::{Location, TerminatorKind},
@@ -562,10 +562,8 @@ fn test_eq_array_symbolic() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=6);
             assert_eq!(n[&1].as_ptr(), n[&4].as_ptr());
-            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&2].symbolic_obj(&[1, 4]).as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&3].as_ptr(), n[&5].as_ptr());
-
-            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([1, 4]));
 
             assert_eq!(g.get_local_as_int(3), Some(1));
             assert_eq!(g.get_local_as_int(6), None);
@@ -619,10 +617,8 @@ fn test_eq_array_symbolic_invalidated() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=8);
             assert_eq!(n[&1].as_ptr(), n[&8].as_ptr());
-            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&2].symbolic_obj(&[4, 5]).as_ptr(), n[&3].as_ptr());
             assert_eq!(n[&4].as_ptr(), n[&5].as_ptr());
-
-            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([4, 5]));
 
             assert_eq!(g.get_local_as_int(1), Some(2));
             assert_eq!(g.get_local_as_int(3), Some(1));
@@ -1046,8 +1042,7 @@ fn test_offset_array_symbolic() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 2..=6);
-            assert_eq!(n[&2].symbolic_obj().as_ptr(), n[&6].as_ptr());
-            assert_eq!(n[&2].symbolic_index(), HashSet::from_iter([1, 9]));
+            assert_eq!(n[&2].symbolic_obj(&[1, 9]).as_ptr(), n[&6].as_ptr());
 
             assert_eq!(g.get_local_as_int(6), Some(1));
         },
@@ -1191,6 +1186,41 @@ fn test_offset_switch() {
         ",
         |g, _, _| {
             assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_offset_twice_2() {
+    // _3 = const 0_usize as *mut s (PointerFromExposedAddress)
+    // _6 = _1 as isize (IntToInt)
+    // _5 = std::ptr::mut_ptr::<impl *mut s>::offset(_3, move _6)
+    // _4 = ((*_5).0: i32)
+    // _9 = _2 as isize (IntToInt)
+    // _8 = std::ptr::mut_ptr::<impl *mut s>::offset(_3, move _9)
+    // _7 = ((*_8).0: i32)
+    // _12 = _1 as isize (IntToInt)
+    // _11 = std::ptr::mut_ptr::<impl *mut s>::offset(_3, move _12)
+    // _10 = ((*_11).0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        ",
+        "mut x: libc::c_int, mut y: libc::c_int",
+        "
+        let mut s: *mut s = 0 as *mut s;
+        let mut a: libc::c_int = (*s.offset(x as isize)).x;
+        let mut b: libc::c_int = (*s.offset(y as isize)).x;
+        let mut c: libc::c_int = (*s.offset(x as isize)).x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 4..=10);
+            assert_eq!(n[&4].obj.as_ptr().root(), n[&10].obj.as_ptr().root(),);
+            assert_ne!(n[&4].obj.as_ptr().root(), n[&7].obj.as_ptr().root(),);
         },
     );
 }

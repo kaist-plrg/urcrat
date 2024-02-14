@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use etrace::some_or;
 use rustc_middle::mir::Local;
@@ -104,7 +104,7 @@ impl AbsLoc {
 pub enum Obj {
     Ptr(AbsLoc),
     Compound(HashMap<usize, Obj>),
-    Index(HashSet<Local>, Box<Obj>),
+    Index(HashMap<BTreeSet<Local>, Obj>),
 }
 
 impl std::fmt::Debug for Obj {
@@ -123,7 +123,18 @@ impl std::fmt::Debug for Obj {
                 }
                 write!(f, "]")
             }
-            Self::Index(ls, obj) => write!(f, "[{:?}: {:?}]", ls, obj),
+            Self::Index(fs) => {
+                write!(f, "[")?;
+                let mut v = fs.keys().cloned().collect::<Vec<_>>();
+                v.sort();
+                for (i, k) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {:?}", k, fs[k])?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -144,11 +155,14 @@ impl Obj {
                     fields.get(n)?
                 }
                 AccElem::Symbolic(local1) => {
-                    let Obj::Index(local2, box obj) = self else { return None };
-                    if local1.is_disjoint(local2) {
-                        return None;
-                    };
-                    obj
+                    let Obj::Index(fields) = self else { return None };
+                    fields.iter().find_map(|(local2, obj)| {
+                        if local1.is_disjoint(local2) {
+                            None
+                        } else {
+                            Some(obj)
+                        }
+                    })?
                 }
             };
             inner.project(&proj[1..])
@@ -168,15 +182,24 @@ impl Obj {
                     fields.entry(*n).or_insert(Obj::default())
                 }
                 AccElem::Symbolic(local1) => {
-                    if !matches!(self, Obj::Index(_, _)) {
-                        *self = Obj::Index(local1.clone(), Box::default());
+                    if !matches!(self, Obj::Index(_)) {
+                        *self =
+                            Obj::Index([(local1.clone(), Obj::default())].into_iter().collect());
                     }
-                    let Obj::Index(local2, box obj) = self else { unreachable!() };
-                    if local1.is_disjoint(local2) {
-                        *local2 = local1.clone();
-                        *obj = Obj::default();
+                    let Obj::Index(fields) = self else { unreachable!() };
+                    match fields.keys().find(|local2| !local1.is_disjoint(local2)) {
+                        Some(local2) => {
+                            let mut local2 = local2.clone();
+                            let obj = fields.remove(&local2).unwrap();
+                            local2.extend(local1);
+                            fields.insert(local2.clone(), obj);
+                            fields.get_mut(&local2).unwrap()
+                        }
+                        None => {
+                            fields.insert(local1.clone(), Obj::default());
+                            fields.get_mut(local1).unwrap()
+                        }
                     }
-                    obj
                 }
             };
             inner.project_mut(&proj[1..])
@@ -198,7 +221,11 @@ impl Obj {
                     obj.substitute(old_id, new_id);
                 }
             }
-            Obj::Index(_, box obj) => obj.substitute(old_id, new_id),
+            Obj::Index(fs) => {
+                for obj in fs.values_mut() {
+                    obj.substitute(old_id, new_id);
+                }
+            }
         }
     }
 
@@ -214,7 +241,11 @@ impl Obj {
                     obj.extend_loc(loc);
                 }
             }
-            Obj::Index(_, box obj) => obj.extend_loc(loc),
+            Obj::Index(fs) => {
+                for obj in fs.values_mut() {
+                    obj.extend_loc(loc);
+                }
+            }
         }
     }
 
@@ -226,12 +257,18 @@ impl Obj {
                     obj.invalidate_symbolic(local);
                 }
             }
-            Self::Index(ls, box obj) => {
-                if ls.remove(&local) && ls.is_empty() {
-                    *self = Obj::default();
-                    return;
+            Self::Index(fs) => {
+                while let Some(ls) = fs.keys().find(|ls| ls.contains(&local)) {
+                    let mut ls = ls.clone();
+                    let obj = fs.remove(&ls).unwrap();
+                    ls.remove(&local);
+                    if !ls.is_empty() {
+                        fs.insert(ls, obj);
+                    }
                 }
-                obj.invalidate_symbolic(local);
+                for obj in fs.values_mut() {
+                    obj.invalidate_symbolic(local);
+                }
             }
         }
     }
@@ -243,7 +280,10 @@ impl Obj {
                 .values()
                 .flat_map(|obj| obj.pointing_locations())
                 .collect(),
-            Self::Index(_, box obj) => obj.pointing_locations(),
+            Self::Index(fs) => fs
+                .values()
+                .flat_map(|obj| obj.pointing_locations())
+                .collect(),
         }
     }
 
@@ -257,14 +297,10 @@ impl Obj {
         fs.get(&i).unwrap()
     }
 
-    pub fn symbolic_index(&self) -> HashSet<usize> {
-        let Obj::Index(ls, _) = self else { panic!() };
-        ls.iter().map(|l| l.index()).collect()
-    }
-
-    pub fn symbolic_obj(&self) -> &Obj {
-        let Obj::Index(_, box obj) = self else { panic!() };
-        obj
+    pub fn symbolic_obj(&self, index: &[usize]) -> &Obj {
+        let Obj::Index(fs) = self else { panic!() };
+        let index = index.iter().copied().map(Local::from_usize).collect();
+        fs.get(&index).unwrap()
     }
 }
 
@@ -301,12 +337,8 @@ impl Node {
         self.obj.field(i)
     }
 
-    pub fn symbolic_index(&self) -> HashSet<usize> {
-        self.obj.symbolic_index()
-    }
-
-    pub fn symbolic_obj(&self) -> &Obj {
-        self.obj.symbolic_obj()
+    pub fn symbolic_obj(&self, index: &[usize]) -> &Obj {
+        self.obj.symbolic_obj(index)
     }
 }
 
@@ -596,8 +628,8 @@ impl Graph {
         }
     }
 
-    pub fn find_aliases(&self, local: Local) -> HashSet<Local> {
-        let mut aliases = HashSet::new();
+    pub fn find_aliases(&self, local: Local) -> BTreeSet<Local> {
+        let mut aliases = BTreeSet::new();
         aliases.insert(local);
         let loc1 = some_or!(self.loc_pointed_by_local(local), return aliases);
         for l in self.locals.keys() {
@@ -760,13 +792,19 @@ fn join_objs(
                 fs.insert(*f, nobj);
             }
         }
-        (Obj::Index(l1, box obj1), Obj::Index(l2, box obj2)) => {
-            let l: HashSet<_> = l1.intersection(l2).copied().collect();
-            if !l.is_empty() {
-                let mut nobj = Obj::default();
-                join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
-                *obj = Obj::Index(l, Box::new(nobj));
+        (Obj::Index(fs1), Obj::Index(fs2)) => {
+            let mut fs = HashMap::new();
+            for (l1, obj1) in fs1 {
+                for (l2, obj2) in fs2 {
+                    let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
+                    if !l.is_empty() {
+                        let mut nobj = Obj::default();
+                        join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
+                        fs.insert(l, nobj);
+                    }
+                }
             }
+            *obj = Obj::Index(fs);
         }
         _ => {}
     }
@@ -783,7 +821,7 @@ fn cmp_projection(proj1: &[AccElem], proj2: &[AccElem]) -> Option<Vec<AccElem>> 
                 proj.push(AccElem::Int(*i1));
             }
             (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
-                let l: HashSet<_> = l1.intersection(l2).copied().collect();
+                let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
                 if l.is_empty() {
                     return None;
                 }
@@ -814,9 +852,13 @@ fn ord_objs(
             let obj1 = some_or!(fs1.get(f), return false);
             ord_objs(obj1, obj2, id_set, remaining)
         }),
-        (Obj::Index(l1, box obj1), Obj::Index(l2, box obj2)) => {
-            l2.is_subset(l1) && ord_objs(obj1, obj2, id_set, remaining)
-        }
+        (Obj::Index(fs1), Obj::Index(fs2)) => fs2.iter().all(|(l2, obj2)| {
+            let obj1 = fs1
+                .iter()
+                .find_map(|(l1, obj1)| if l2.is_subset(l1) { Some(obj1) } else { None });
+            let obj1 = some_or!(obj1, return false);
+            ord_objs(obj1, obj2, id_set, remaining)
+        }),
         _ => false,
     }
 }

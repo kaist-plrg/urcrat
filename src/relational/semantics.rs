@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use rustc_abi::FieldIdx;
 use rustc_middle::{
@@ -588,7 +588,7 @@ impl AccPath {
 #[derive(Clone, PartialEq, Eq)]
 pub enum AccElem {
     Int(usize),
-    Symbolic(HashSet<Local>),
+    Symbolic(BTreeSet<Local>),
 }
 
 impl std::fmt::Debug for AccElem {
