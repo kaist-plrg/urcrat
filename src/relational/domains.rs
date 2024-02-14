@@ -171,7 +171,7 @@ impl Obj {
         }
     }
 
-    fn project_mut<'a>(&'a mut self, proj: &[AccElem]) -> &'a mut Obj {
+    fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
         if let Some(elem) = proj.get(0) {
             let inner = match elem {
                 AccElem::Int(n) => {
@@ -192,17 +192,23 @@ impl Obj {
                             let mut local2 = local2.clone();
                             let obj = fields.remove(&local2).unwrap();
                             local2.extend(local1);
+                            if write {
+                                fields.clear();
+                            }
                             fields.insert(local2.clone(), obj);
                             fields.get_mut(&local2).unwrap()
                         }
                         None => {
+                            if write {
+                                fields.clear();
+                            }
                             fields.insert(local1.clone(), Obj::default());
                             fields.get_mut(local1).unwrap()
                         }
                     }
                 }
             };
-            inner.project_mut(&proj[1..])
+            inner.project_mut(&proj[1..], write)
         } else {
             self
         }
@@ -297,10 +303,10 @@ impl Obj {
         fs.get(&i).unwrap()
     }
 
-    pub fn symbolic_obj(&self, index: &[usize]) -> &Obj {
+    pub fn symbolic_obj(&self, index: &[usize]) -> Option<&Obj> {
         let Obj::Index(fs) = self else { panic!() };
         let index = index.iter().copied().map(Local::from_usize).collect();
-        fs.get(&index).unwrap()
+        fs.get(&index)
     }
 }
 
@@ -337,7 +343,7 @@ impl Node {
         self.obj.field(i)
     }
 
-    pub fn symbolic_obj(&self, index: &[usize]) -> &Obj {
+    pub fn symbolic(&self, index: &[usize]) -> Option<&Obj> {
         self.obj.symbolic_obj(index)
     }
 }
@@ -499,24 +505,24 @@ impl Graph {
     fn lvalue(&mut self, x: &AccPath, deref: bool) -> &mut Obj {
         if deref {
             let (id, _) = self.get_local_node_mut(x.local);
-            let mut loc = self.get_pointed_loc_mut(id, &[]);
+            let mut loc = self.get_pointed_loc_mut(id, &[], true);
             loc.projection.extend(x.projection.to_owned());
             let node = &mut self.nodes[loc.root];
-            node.obj.project_mut(&loc.projection)
+            node.obj.project_mut(&loc.projection, true)
         } else {
             let (_, node) = self.get_local_node_mut(x.local);
-            node.obj.project_mut(&x.projection)
+            node.obj.project_mut(&x.projection, true)
         }
     }
 
     fn rvalue(&mut self, x: &AccPath, deref: bool) -> AbsLoc {
         let (id, _) = self.get_local_node_mut(x.local);
         if deref {
-            let mut loc = self.get_pointed_loc_mut(id, &[]);
+            let mut loc = self.get_pointed_loc_mut(id, &[], false);
             loc.projection.extend(x.projection.to_owned());
-            self.get_pointed_loc_mut(loc.root, &loc.projection)
+            self.get_pointed_loc_mut(loc.root, &loc.projection, false)
         } else {
-            self.get_pointed_loc_mut(id, &x.projection)
+            self.get_pointed_loc_mut(id, &x.projection, false)
         }
     }
 
@@ -540,7 +546,7 @@ impl Graph {
     pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath, y_deref: bool) {
         let (id, _) = self.get_local_node_mut(y.local);
         let loc = if y_deref {
-            let mut loc = self.get_pointed_loc_mut(id, &[]);
+            let mut loc = self.get_pointed_loc_mut(id, &[], false);
             loc.projection.extend(y.projection.to_owned());
             loc
         } else {
@@ -553,13 +559,13 @@ impl Graph {
 
     pub fn x_eq_offset(&mut self, x: &AccPath, y: &AccPath, idx: OpVal) {
         let (id, _) = self.get_local_node_mut(y.local);
-        let loc = self.get_pointed_loc_mut(id, &[]);
+        let loc = self.get_pointed_loc_mut(id, &[], false);
         let mut loc = if loc.projection.is_empty() {
             let Obj::Ptr(loc) = &self.nodes[id].obj else { panic!() };
             let mut loc = loc.clone();
             self.extend_loc(&loc);
             loc.projection.push(AccElem::Int(0));
-            self.obj_at_location_mut(&loc);
+            self.obj_at_location_mut(&loc, false);
             loc
         } else {
             loc
@@ -592,7 +598,7 @@ impl Graph {
 
     pub fn x_eq_offset_int(&mut self, x: &AccPath, y: &AccPath, idx: u128) {
         let (id, _) = self.get_local_node_mut(y.local);
-        let mut loc = self.get_pointed_loc_mut(id, &[]);
+        let mut loc = self.get_pointed_loc_mut(id, &[], false);
         let obj = self.lvalue(x, false);
         let elem = loc.projection.last_mut().unwrap();
         if let AccElem::Int(n) = elem {
@@ -689,8 +695,8 @@ impl Graph {
         Some(loc.clone())
     }
 
-    fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem]) -> AbsLoc {
-        self.set_obj_ptr(|this| this.nodes[node_id].obj.project_mut(proj))
+    fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem], write: bool) -> AbsLoc {
+        self.set_obj_ptr(|this| this.nodes[node_id].obj.project_mut(proj, write))
     }
 
     #[inline]
@@ -720,8 +726,8 @@ impl Graph {
         self.nodes[loc.root].obj.project(&loc.projection)
     }
 
-    fn obj_at_location_mut(&mut self, loc: &AbsLoc) -> &mut Obj {
-        self.nodes[loc.root].obj.project_mut(&loc.projection)
+    fn obj_at_location_mut(&mut self, loc: &AbsLoc, write: bool) -> &mut Obj {
+        self.nodes[loc.root].obj.project_mut(&loc.projection, write)
     }
 
     pub fn invalidate_deref(&mut self, local: Local, mut depth: usize, opt_id: Option<usize>) {
@@ -735,7 +741,7 @@ impl Graph {
                             continue;
                         }
                     }
-                    let obj = self.obj_at_location_mut(&l);
+                    let obj = self.obj_at_location_mut(&l, false);
                     *obj = Obj::default();
                 }
                 return;

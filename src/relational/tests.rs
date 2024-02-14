@@ -562,7 +562,7 @@ fn test_eq_array_symbolic() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=6);
             assert_eq!(n[&1].as_ptr(), n[&4].as_ptr());
-            assert_eq!(n[&2].symbolic_obj(&[1, 4]).as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&2].symbolic(&[1, 4]).unwrap().as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&3].as_ptr(), n[&5].as_ptr());
 
             assert_eq!(g.get_local_as_int(3), Some(1));
@@ -617,7 +617,7 @@ fn test_eq_array_symbolic_invalidated() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=8);
             assert_eq!(n[&1].as_ptr(), n[&8].as_ptr());
-            assert_eq!(n[&2].symbolic_obj(&[4, 5]).as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&2].symbolic(&[4, 5]).unwrap().as_ptr(), n[&3].as_ptr());
             assert_eq!(n[&4].as_ptr(), n[&5].as_ptr());
 
             assert_eq!(g.get_local_as_int(1), Some(2));
@@ -1042,7 +1042,7 @@ fn test_offset_array_symbolic() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 2..=6);
-            assert_eq!(n[&2].symbolic_obj(&[1, 9]).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&2].symbolic(&[1, 9]).unwrap().as_ptr(), n[&6].as_ptr());
 
             assert_eq!(g.get_local_as_int(6), Some(1));
         },
@@ -1221,6 +1221,35 @@ fn test_offset_twice_2() {
             let n = get_nodes(&g, 4..=10);
             assert_eq!(n[&4].obj.as_ptr().root(), n[&10].obj.as_ptr().root(),);
             assert_ne!(n[&4].obj.as_ptr().root(), n[&7].obj.as_ptr().root(),);
+        },
+    );
+}
+
+#[test]
+fn test_write_twice() {
+    // _3 = [const 0_i32; 2]
+    // _4 = const 0_i32
+    // _5 = _1 as usize (IntToInt)
+    // _6 = const 2_usize
+    // _7 = Lt(_5, _6)
+    // _3[_5] = move _4
+    // _8 = const 1_i32
+    // _9 = _2 as usize (IntToInt)
+    // _10 = const 2_usize
+    // _11 = Lt(_9, _10)
+    // _3[_9] = move _8
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int, mut y: libc::c_int",
+        "
+        let mut z: [libc::c_int; 2] = [0; 2];
+        z[x as usize] = 0 as libc::c_int;
+        z[y as usize] = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 3..=8);
+            assert_eq!(n[&3].symbolic(&[2, 9]).unwrap().as_ptr(), n[&8].as_ptr());
+            assert_eq!(n[&3].symbolic(&[1, 5]), None);
         },
     );
 }
