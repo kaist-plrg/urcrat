@@ -701,19 +701,19 @@ impl Graph {
 
     #[inline]
     fn set_obj_ptr<F: Fn(&mut Self) -> &mut Obj>(&mut self, f: F) -> AbsLoc {
-        let next_id = self.nodes.len();
         let obj = f(self);
-        let loc = if let Obj::Ptr(loc) = obj {
+        if let Obj::Ptr(loc) = obj {
             loc.clone()
         } else {
+            let obj: *mut Obj = obj;
+            let next_id = self.nodes.len();
             let loc = AbsLoc::new(next_id, vec![]);
-            *obj = Obj::Ptr(loc.clone());
-            loc
-        };
-        if loc.root == next_id {
+            unsafe {
+                *obj = Obj::Ptr(loc.clone());
+            }
             self.nodes.push(Node::new());
+            loc
         }
-        loc
     }
 
     pub fn deref_local_id(&self, local: Local) -> Option<usize> {

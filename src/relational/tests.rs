@@ -995,6 +995,56 @@ fn test_as_mut_ptr() {
 }
 
 #[test]
+fn test_write_volatile() {
+    // _1 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _5 = const 1_i32
+    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        ::std::ptr::write_volatile(&mut x as *mut libc::c_int, 1 as libc::c_int);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=5);
+            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
+            assert_eq!(g.get_local_as_int(1), Some(1));
+        },
+    );
+}
+
+#[test]
+fn test_read_volatile() {
+    // _1 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _8 = &_1
+    // _7 = &raw const (*_8)
+    // _6 = std::ptr::read_volatile::<i32>(move _7)
+    // _9 = const 1_i32
+    // _5 = Add(move _6, move _9)
+    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        ::std::ptr::write_volatile(
+            &mut x as *mut libc::c_int,
+            ::std::ptr::read_volatile::<libc::c_int>(&x as *const libc::c_int)
+                + 1 as libc::c_int,
+        );
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=9);
+            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
+            assert_eq!(n[&1].obj.as_ptr(), n[&9].obj.as_ptr());
+            assert_eq!(g.get_local_as_int(1), Some(1));
+            assert_eq!(g.get_local_as_int(6), Some(0));
+        },
+    );
+}
+
+#[test]
 fn test_offset_array() {
     // _1 = [const 0_i32; 2]
     // _4 = &mut _1
@@ -1255,51 +1305,36 @@ fn test_write_twice() {
 }
 
 #[test]
-fn test_write_volatile() {
-    // _1 = const 0_i32
-    // _4 = &mut _1
-    // _3 = &raw mut (*_4)
-    // _5 = const 1_i32
-    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
-    analyze_fn(
+fn test_for_switch() {
+    // _2 = const 0_usize as *mut s (PointerFromExposedAddress)
+    // _3 = const 0_i32
+    // goto -> bb1
+    // switchInt(_1) -> [0: bb4, otherwise: bb2]
+    // switchInt(((*_2).0: i32)) -> [0: bb3, otherwise: bb1]
+    // _4 = ((*_2).0: i32)
+    // _3 = move _4
+    // goto -> bb1
+    analyze_fn_with(
         "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        ",
+        "b: bool",
+        "
+        let mut s: *mut s = 0 as *mut s;
         let mut x: libc::c_int = 0 as libc::c_int;
-        ::std::ptr::write_volatile(&mut x as *mut libc::c_int, 1 as libc::c_int);
+        while b {
+            match (*s).x {
+                0 => { x = (*s).x; }
+                _ => {}
+            }
+        }
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=5);
-            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
-            assert_eq!(g.get_local_as_int(1), Some(1));
-        },
-    );
-}
-
-#[test]
-fn test_read_volatile() {
-    // _1 = const 0_i32
-    // _4 = &mut _1
-    // _3 = &raw mut (*_4)
-    // _8 = &_1
-    // _7 = &raw const (*_8)
-    // _6 = std::ptr::read_volatile::<i32>(move _7)
-    // _9 = const 1_i32
-    // _5 = Add(move _6, move _9)
-    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
-    analyze_fn(
-        "
-        let mut x: libc::c_int = 0 as libc::c_int;
-        ::std::ptr::write_volatile(
-            &mut x as *mut libc::c_int,
-            ::std::ptr::read_volatile::<libc::c_int>(&x as *const libc::c_int)
-                + 1 as libc::c_int,
-        );
-        ",
-        |g, _, _| {
-            let n = get_nodes(&g, 1..=9);
-            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
-            assert_eq!(n[&1].obj.as_ptr(), n[&9].obj.as_ptr());
-            assert_eq!(g.get_local_as_int(1), Some(1));
-            assert_eq!(g.get_local_as_int(6), Some(0));
+            assert_eq!(g.get_local_as_int(3), Some(0));
         },
     );
 }
