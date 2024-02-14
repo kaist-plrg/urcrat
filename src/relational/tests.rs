@@ -1080,6 +1080,122 @@ fn test_offset() {
 }
 
 #[test]
+fn test_offset_twice() {
+    // _2 = const 0_usize as *mut s (PointerFromExposedAddress)
+    // _5 = _1 as isize (IntToInt)
+    // _4 = std::ptr::mut_ptr::<impl *mut s>::offset(_2, move _5)
+    // _3 = ((*_4).0: i32)
+    // _8 = _1 as isize (IntToInt)
+    // _7 = std::ptr::mut_ptr::<impl *mut s>::offset(_2, move _8)
+    // _6 = ((*_7).0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        ",
+        "mut x: libc::c_int",
+        "
+        let mut s: *mut s = 0 as *mut s;
+        let mut y: libc::c_int = (*s.offset(x as isize)).x;
+        let mut z: libc::c_int = (*s.offset(x as isize)).x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 3..=6);
+            assert_eq!(n[&3].obj.as_ptr().root(), n[&6].obj.as_ptr().root());
+        },
+    );
+}
+
+#[test]
+fn test_offset_twice_struct() {
+    // _3 = const 0_usize as *mut s (PointerFromExposedAddress)
+    // _2 = t { s: move _3 }
+    // _6 = (_2.0: *mut s)
+    // _8 = ((*_1).0: i32)
+    // _7 = move _8 as isize (IntToInt)
+    // _5 = std::ptr::mut_ptr::<impl *mut s>::offset(move _6, move _7)
+    // _4 = ((*_5).0: i32)
+    // _11 = (_2.0: *mut s)
+    // _13 = ((*_1).0: i32)
+    // _12 = move _13 as isize (IntToInt)
+    // _10 = std::ptr::mut_ptr::<impl *mut s>::offset(move _11, move _12)
+    // _9 = ((*_10).0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub s: *mut s,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct r {
+            pub x: libc::c_int,
+        }
+        ",
+        "mut r: *mut r",
+        "
+        let mut t: t = t { s: 0 as *mut s };
+        let mut x: libc::c_int = (*(t.s).offset((*r).x as isize)).x;
+        let mut y: libc::c_int = (*(t.s).offset((*r).x as isize)).x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 4..=9);
+            assert_eq!(n[&4].obj.as_ptr().root(), n[&9].obj.as_ptr().root());
+        },
+    );
+}
+
+#[test]
+fn test_offset_switch() {
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub s: *mut s,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct r {
+            pub x: libc::c_int,
+        }
+        ",
+        "mut r: *mut r",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut t: t = t { s: 0 as *mut s };
+        let mut x: libc::c_int = (*(t.s).offset((*r).x as isize)).x;
+        match x {
+            0 => {
+                y = (*(t.s).offset((*r).x as isize)).x;
+            }
+            1 => {
+                y = (*(t.s).offset((*r).x as isize)).x - 1 as libc::c_int;
+            }
+            _ => {}
+        };
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
 fn test_write_volatile() {
     // _1 = const 0_i32
     // _4 = &mut _1

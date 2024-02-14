@@ -145,7 +145,7 @@ impl Obj {
                 }
                 AccElem::Symbolic(local1) => {
                     let Obj::Index(local2, box obj) = self else { return None };
-                    if local1 != local2 {
+                    if local1.is_disjoint(local2) {
                         return None;
                     };
                     obj
@@ -172,7 +172,7 @@ impl Obj {
                         *self = Obj::Index(local1.clone(), Box::default());
                     }
                     let Obj::Index(local2, box obj) = self else { unreachable!() };
-                    if local1 != local2 {
+                    if local1.is_disjoint(local2) {
                         *local2 = local1.clone();
                         *obj = Obj::default();
                     }
@@ -199,6 +199,22 @@ impl Obj {
                 }
             }
             Obj::Index(_, box obj) => obj.substitute(old_id, new_id),
+        }
+    }
+
+    fn extend_loc(&mut self, loc: &AbsLoc) {
+        match self {
+            Obj::Ptr(curr_loc) => {
+                if curr_loc == loc {
+                    curr_loc.projection.push(AccElem::Int(0));
+                }
+            }
+            Obj::Compound(fs) => {
+                for obj in fs.values_mut() {
+                    obj.extend_loc(loc);
+                }
+            }
+            Obj::Index(_, box obj) => obj.extend_loc(loc),
         }
     }
 
@@ -507,9 +523,10 @@ impl Graph {
         let (id, _) = self.get_local_node_mut(y.local);
         let loc = self.get_pointed_loc_mut(id, &[]);
         let mut loc = if loc.projection.is_empty() {
-            let Obj::Ptr(loc) = &mut self.nodes[id].obj else { panic!() };
+            let Obj::Ptr(loc) = &self.nodes[id].obj else { panic!() };
+            let mut loc = loc.clone();
+            self.extend_loc(&loc);
             loc.projection.push(AccElem::Int(0));
-            let loc = loc.clone();
             self.obj_at_location_mut(&loc);
             loc
         } else {
@@ -570,6 +587,12 @@ impl Graph {
     fn substitute(&mut self, old_id: NodeId, new_id: NodeId) {
         for node in &mut self.nodes {
             node.obj.substitute(old_id, new_id);
+        }
+    }
+
+    fn extend_loc(&mut self, loc: &AbsLoc) {
+        for node in &mut self.nodes {
+            node.obj.extend_loc(loc);
         }
     }
 
