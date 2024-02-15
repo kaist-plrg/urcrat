@@ -157,8 +157,8 @@ fn test_deref_eq() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=2);
-            let n11 = &g.nodes[n[&1].as_ptr().root()];
-            assert_eq!(n11.as_ptr(), n[&2].as_ptr());
+            let dn1 = g.obj_at_location(n[&1].as_ptr()).unwrap();
+            assert_eq!(dn1.as_ptr(), n[&2].as_ptr());
 
             assert_eq!(g.get_local_as_int(2), Some(0));
         },
@@ -589,8 +589,8 @@ fn test_eq_array_symbolic_struct() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=2);
-            let n11 = &g.nodes[n[&1].as_ptr().root()];
-            assert_eq!(n11.field(0).as_ptr(), n[&2].as_ptr());
+            let dn1 = g.obj_at_location(n[&1].as_ptr()).unwrap();
+            assert_eq!(dn1.field(0).as_ptr(), n[&2].as_ptr());
         },
     );
 }
@@ -825,6 +825,7 @@ fn test_join_loop() {
         }
         ",
         |g, _, _| {
+            println!("{:?}", g);
             let n = get_nodes(&g, 1..=2);
             assert_eq!(n[&1].as_ptr(), n[&2].as_ptr());
             assert_eq!(g.get_local_as_int(1), None);
@@ -1008,7 +1009,7 @@ fn test_write_volatile() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=5);
-            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
+            assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
             assert_eq!(g.get_local_as_int(1), Some(1));
         },
     );
@@ -1036,8 +1037,8 @@ fn test_read_volatile() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=9);
-            assert_eq!(n[&1].obj.as_ptr(), n[&5].obj.as_ptr());
-            assert_eq!(n[&1].obj.as_ptr(), n[&9].obj.as_ptr());
+            assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&1].as_ptr(), n[&9].as_ptr());
             assert_eq!(g.get_local_as_int(1), Some(1));
             assert_eq!(g.get_local_as_int(6), Some(0));
         },
@@ -1114,9 +1115,9 @@ fn test_offset() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=3);
-            assert_eq!(n[&1].obj.as_ptr().root(), n[&3].obj.as_ptr().root());
-            assert_eq!(n[&1].obj.as_ptr().projection()[0], AccElem::Int(0));
-            assert_eq!(n[&3].obj.as_ptr().projection()[0], AccElem::Int(1));
+            assert_eq!(n[&1].as_ptr().root(), n[&3].as_ptr().root());
+            assert_eq!(n[&1].as_ptr().projection()[0], AccElem::Int(0));
+            assert_eq!(n[&3].as_ptr().projection()[0], AccElem::Int(1));
 
             let n11 = &g.nodes[n[&3].as_ptr().root()].field(1);
             assert_eq!(n11.as_ptr(), n[&2].as_ptr());
@@ -1149,7 +1150,7 @@ fn test_offset_twice() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 3..=6);
-            assert_eq!(n[&3].obj.as_ptr().root(), n[&6].obj.as_ptr().root());
+            assert_eq!(n[&3].as_ptr().root(), n[&6].as_ptr().root());
         },
     );
 }
@@ -1194,7 +1195,7 @@ fn test_offset_twice_struct() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 4..=9);
-            assert_eq!(n[&4].obj.as_ptr().root(), n[&9].obj.as_ptr().root());
+            assert_eq!(n[&4].as_ptr().root(), n[&9].as_ptr().root());
         },
     );
 }
@@ -1269,8 +1270,8 @@ fn test_offset_twice_2() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 4..=10);
-            assert_eq!(n[&4].obj.as_ptr().root(), n[&10].obj.as_ptr().root(),);
-            assert_ne!(n[&4].obj.as_ptr().root(), n[&7].obj.as_ptr().root(),);
+            assert_eq!(n[&4].as_ptr().root(), n[&10].as_ptr().root(),);
+            assert_ne!(n[&4].as_ptr().root(), n[&7].as_ptr().root(),);
         },
     );
 }
@@ -1328,13 +1329,60 @@ fn test_for_switch() {
         let mut x: libc::c_int = 0 as libc::c_int;
         while b {
             match (*s).x {
-                0 => { x = (*s).x; }
+                0 => x = (*s).x,
                 _ => {}
             }
         }
         ",
         |g, _, _| {
             assert_eq!(g.get_local_as_int(3), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_for_switch_offset() {
+    // _1 = const 0_i32
+    // _2 = const 0_usize as *mut s (PointerFromExposedAddress)
+    // _3 = _2
+    // goto -> bb1
+    // _5 = _3
+    // _8 = const 10_i32
+    // _7 = move _8 as isize (IntToInt)
+    // _6 = std::ptr::mut_ptr::<impl *mut s>::offset(_2, move _7)
+    // _4 = Lt(move _5, move _6)
+    // switchInt(move _4) -> [0: bb7, otherwise: bb3]
+    // switchInt(((*_3).0: i32)) -> [0: bb4, otherwise: bb5]
+    // _9 = ((*_3).0: i32)
+    // _1 = move _9
+    // goto -> bb5
+    // _11 = _3
+    // _10 = std::ptr::mut_ptr::<impl *mut s>::offset(move _11, const 1_isize)
+    // _3 = move _10
+    // goto -> bb1
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut s: *mut s = 0 as *mut s;
+        let mut t: *mut s = s;
+        while t < s.offset(10 as libc::c_int as isize) {
+            match (*t).x {
+                0 => y = (*t).x,
+                _ => {}
+            }
+            t = t.offset(1);
+        }
+        ",
+        |g, _, _| {
+            // assert_eq!(g.get_local_as_int(1), Some(0));
         },
     );
 }

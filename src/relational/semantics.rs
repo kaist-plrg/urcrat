@@ -199,12 +199,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
                 let (path, is_deref) = AccPath::from_place(*place, state);
-                let int_opt = if is_deref {
-                    state.g().get_deref_x_as_int(&path)
-                } else {
-                    state.g().get_x_as_int(&path)
-                };
-                if let Some(i) = int_opt {
+                if let Some(i) = state.g().get_x_as_int(&path, is_deref) {
                     OpVal::Int(i)
                 } else {
                     OpVal::Place(path, is_deref)
@@ -311,7 +306,9 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 statement_index: 0,
                             };
                             let mut state = state.clone();
+                            // println!("BEFORE FILTER {:?} {:?}", location, state);
                             state.gm().filter_x_int(&discr, is_deref, v);
+                            // println!(" AFTER FILTER {:?} {:?}", location, state);
                             (location, state)
                         })
                         .chain(std::iter::once((
@@ -585,7 +582,7 @@ impl AccPath {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum AccElem {
     Int(usize),
     Symbolic(BTreeSet<Local>),
@@ -607,7 +604,7 @@ impl AccElem {
             ProjectionElem::Field(i, _) => Some(AccElem::Int(i.index())),
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
-                if let Some(i) = state.g().get_x_as_int(&path) {
+                if let Some(i) = state.g().get_x_as_int(&path, false) {
                     Some(AccElem::Int(i as usize))
                 } else {
                     Some(AccElem::Symbolic(state.g().find_aliases(local)))

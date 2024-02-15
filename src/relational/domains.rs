@@ -102,6 +102,7 @@ impl AbsLoc {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Obj {
+    AtAddr(u128),
     Ptr(AbsLoc),
     Compound(HashMap<usize, Obj>),
     Index(HashMap<BTreeSet<Local>, Obj>),
@@ -110,6 +111,7 @@ pub enum Obj {
 impl std::fmt::Debug for Obj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AtAddr(n) => write!(f, "@{}", n),
             Self::Ptr(l) => write!(f, "{:?}", l),
             Self::Compound(fs) => {
                 write!(f, "[")?;
@@ -183,8 +185,7 @@ impl Obj {
                 }
                 AccElem::Symbolic(local1) => {
                     if !matches!(self, Obj::Index(_)) {
-                        *self =
-                            Obj::Index([(local1.clone(), Obj::default())].into_iter().collect());
+                        *self = Obj::Index(HashMap::from_iter([(local1.clone(), Obj::default())]));
                     }
                     let Obj::Index(fields) = self else { unreachable!() };
                     match fields.keys().find(|local2| !local1.is_disjoint(local2)) {
@@ -214,22 +215,22 @@ impl Obj {
         }
     }
 
-    fn substitute(&mut self, old_id: NodeId, new_id: NodeId) {
+    fn substitute(&mut self, old_loc: &AbsLoc, new_loc: &AbsLoc) {
         match self {
-            Obj::Ptr(loc) => {
-                if loc.root == old_id {
-                    assert!(loc.projection.is_empty());
-                    loc.root = new_id;
+            Self::AtAddr(_) => {}
+            Self::Ptr(loc) => {
+                if loc == old_loc {
+                    *loc = new_loc.clone();
                 }
             }
-            Obj::Compound(fs) => {
+            Self::Compound(fs) => {
                 for obj in fs.values_mut() {
-                    obj.substitute(old_id, new_id);
+                    obj.substitute(old_loc, new_loc);
                 }
             }
-            Obj::Index(fs) => {
+            Self::Index(fs) => {
                 for obj in fs.values_mut() {
-                    obj.substitute(old_id, new_id);
+                    obj.substitute(old_loc, new_loc);
                 }
             }
         }
@@ -237,17 +238,18 @@ impl Obj {
 
     fn extend_loc(&mut self, loc: &AbsLoc) {
         match self {
-            Obj::Ptr(curr_loc) => {
+            Self::AtAddr(_) => {}
+            Self::Ptr(curr_loc) => {
                 if curr_loc == loc {
                     curr_loc.projection.push(AccElem::Int(0));
                 }
             }
-            Obj::Compound(fs) => {
+            Self::Compound(fs) => {
                 for obj in fs.values_mut() {
                     obj.extend_loc(loc);
                 }
             }
-            Obj::Index(fs) => {
+            Self::Index(fs) => {
                 for obj in fs.values_mut() {
                     obj.extend_loc(loc);
                 }
@@ -257,6 +259,7 @@ impl Obj {
 
     fn invalidate_symbolic(&mut self, local: Local) {
         match self {
+            Self::AtAddr(_) => {}
             Self::Ptr(_) => {}
             Self::Compound(fs) => {
                 for obj in fs.values_mut() {
@@ -281,6 +284,7 @@ impl Obj {
 
     fn pointing_locations(&self) -> Vec<AbsLoc> {
         match self {
+            Self::AtAddr(_) => vec![],
             Self::Ptr(loc) => vec![loc.clone()],
             Self::Compound(fs) => fs
                 .values()
@@ -310,29 +314,21 @@ impl Obj {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Node {
     pub obj: Obj,
-    pub at_addr: Option<u128>,
 }
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(addr) = self.at_addr {
-            write!(f, "{:?}@{:?}", self.obj, addr)
-        } else {
-            write!(f, "{:?}", self.obj)
-        }
+        write!(f, "{:?}", self.obj)
     }
 }
 
 impl Node {
     #[inline]
-    fn new() -> Self {
-        Node {
-            obj: Obj::default(),
-            at_addr: None,
-        }
+    fn new(obj: Obj) -> Self {
+        Self { obj }
     }
 
     pub fn as_ptr(&self) -> &AbsLoc {
@@ -352,7 +348,7 @@ impl Node {
 pub struct Graph {
     pub nodes: Vec<Node>,
     locals: HashMap<Local, NodeId>,
-    ints: HashMap<u128, NodeId>,
+    ints: HashMap<u128, AbsLoc>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -385,13 +381,6 @@ impl Graph {
             let node2 = &other.nodes[id2];
             let id = id_map[&(id1, id2)];
 
-            if let (Some(i1), Some(i2)) = (node1.at_addr, node2.at_addr) {
-                if i1 == i2 {
-                    joined.nodes[id].at_addr = Some(i1);
-                    joined.ints.insert(i1, id);
-                }
-            }
-
             let mut obj = Obj::default();
             join_objs(
                 &node1.obj,
@@ -400,6 +389,7 @@ impl Graph {
                 &mut joined,
                 &mut id_map,
                 &mut remaining,
+                AbsLoc::new_root(id),
             );
             joined.nodes[id].obj = obj;
         }
@@ -422,12 +412,6 @@ impl Graph {
             let node1 = &self.nodes[id1];
             let node2 = &other.nodes[id2];
 
-            match (node1.at_addr, node2.at_addr) {
-                (None, Some(_)) => return false,
-                (Some(i1), Some(i2)) if i1 != i2 => return false,
-                _ => {}
-            }
-
             if !ord_objs(&node1.obj, &node2.obj, &mut id_set, &mut remaining) {
                 return false;
             }
@@ -438,20 +422,20 @@ impl Graph {
 
     fn add_node(&mut self) -> (NodeId, &mut Node) {
         let id = self.nodes.len();
-        self.nodes.push(Node::new());
+        self.nodes.push(Node::default());
         (id, &mut self.nodes[id])
     }
 
-    fn get_int_node(&mut self, n: u128) -> NodeId {
+    fn get_int_node(&mut self, n: u128) -> AbsLoc {
         if let Some(id) = self.ints.get(&n) {
-            *id
+            id.clone()
         } else {
             let id = self.nodes.len();
-            let mut node = Node::new();
-            node.at_addr = Some(n);
+            let node = Node::new(Obj::AtAddr(n));
             self.nodes.push(node);
-            self.ints.insert(n, id);
-            id
+            let loc = AbsLoc::new_root(id);
+            self.ints.insert(n, loc.clone());
+            loc
         }
     }
 
@@ -533,9 +517,9 @@ impl Graph {
     }
 
     fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: u128) {
-        let id = self.get_int_node(n);
+        let loc = self.get_int_node(n);
         let obj = self.lvalue(x, deref);
-        *obj = Obj::Ptr(AbsLoc::new(id, vec![]));
+        *obj = Obj::Ptr(loc);
     }
 
     pub fn x_eq(&mut self, x: &AccPath, deref: bool) {
@@ -610,21 +594,20 @@ impl Graph {
     }
 
     pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: u128) {
-        let ptr = self.set_obj_ptr(|this| this.lvalue(x, deref));
-        assert!(ptr.projection.is_empty());
-        let id = ptr.root;
-        if let Some(n_id) = self.ints.get(&n) {
-            let n_id = *n_id;
-            self.substitute(id, n_id);
+        let ptr_loc = self.set_obj_ptr(|this| this.lvalue(x, deref));
+        if let Some(n_loc) = self.ints.get(&n) {
+            let n_loc = n_loc.clone();
+            self.substitute(&ptr_loc, &n_loc);
         } else {
-            self.nodes[id].at_addr = Some(n);
-            self.ints.insert(n, id);
+            let obj = self.obj_at_location_mut(&ptr_loc, false);
+            *obj = Obj::AtAddr(n);
+            self.ints.insert(n, ptr_loc);
         }
     }
 
-    fn substitute(&mut self, old_id: NodeId, new_id: NodeId) {
+    fn substitute(&mut self, old_loc: &AbsLoc, new_loc: &AbsLoc) {
         for node in &mut self.nodes {
-            node.obj.substitute(old_id, new_id);
+            node.obj.substitute(old_loc, new_loc);
         }
     }
 
@@ -658,17 +641,21 @@ impl Graph {
     }
 
     pub fn get_local_as_int(&self, x: usize) -> Option<u128> {
-        self.get_x_as_int(&AccPath::new(Local::from_usize(x), vec![]))
+        self.get_x_as_int(&AccPath::new(Local::from_usize(x), vec![]), false)
     }
 
-    pub fn get_x_as_int(&self, x: &AccPath) -> Option<u128> {
+    pub fn get_x_as_int(&self, x: &AccPath, deref: bool) -> Option<u128> {
         let id = self.locals.get(&x.local)?;
-        let loc = self.get_pointed_loc(*id, &x.projection)?;
-        if loc.projection.is_empty() {
-            self.nodes[loc.root].at_addr
+        let loc = if deref {
+            let mut loc = self.get_pointed_loc(*id, &[])?;
+            loc.projection.extend(x.projection.to_owned());
+            self.get_pointed_loc(loc.root, &loc.projection)?
         } else {
-            None
-        }
+            self.get_pointed_loc(*id, &x.projection)?
+        };
+        let obj = self.obj_at_location(&loc)?;
+        let Obj::AtAddr(n) = obj else { return None };
+        Some(*n)
     }
 
     pub fn get_deref_x_as_int(&self, x: &AccPath) -> Option<u128> {
@@ -676,11 +663,9 @@ impl Graph {
         let mut loc = self.get_pointed_loc(*id, &[])?;
         loc.projection.extend(x.projection.to_owned());
         let loc = self.get_pointed_loc(loc.root, &loc.projection)?;
-        if loc.projection.is_empty() {
-            self.nodes[loc.root].at_addr
-        } else {
-            None
-        }
+        let obj = self.obj_at_location(&loc)?;
+        let Obj::AtAddr(n) = obj else { return None };
+        Some(*n)
     }
 
     pub fn invalidate_symbolic(&mut self, local: Local) {
@@ -707,11 +692,12 @@ impl Graph {
         } else {
             let obj: *mut Obj = obj;
             let next_id = self.nodes.len();
-            let loc = AbsLoc::new(next_id, vec![]);
+            let loc = AbsLoc::new(next_id, vec![AccElem::Int(0)]);
             unsafe {
                 *obj = Obj::Ptr(loc.clone());
             }
-            self.nodes.push(Node::new());
+            let obj = Obj::Compound(HashMap::from_iter([(0, Obj::default())]));
+            self.nodes.push(Node::new(obj));
             loc
         }
     }
@@ -722,7 +708,7 @@ impl Graph {
         Some(loc.root)
     }
 
-    fn obj_at_location(&self, loc: &AbsLoc) -> Option<&Obj> {
+    pub fn obj_at_location(&self, loc: &AbsLoc) -> Option<&Obj> {
         self.nodes[loc.root].obj.project(&loc.projection)
     }
 
@@ -732,7 +718,7 @@ impl Graph {
 
     pub fn invalidate_deref(&mut self, local: Local, mut depth: usize, opt_id: Option<usize>) {
         let id = *some_or!(self.locals.get(&local), return);
-        let mut locs = vec![AbsLoc::new(id, vec![])];
+        let mut locs = vec![AbsLoc::new_root(id)];
         while !locs.is_empty() {
             if depth == 0 {
                 for l in locs {
@@ -773,9 +759,22 @@ fn join_objs(
     joined: &mut Graph,
     id_map: &mut HashMap<(NodeId, NodeId), NodeId>,
     remaining: &mut Vec<(NodeId, NodeId)>,
+    curr_loc: AbsLoc,
 ) {
     match (obj1, obj2) {
+        (Obj::AtAddr(i1), Obj::AtAddr(i2)) => {
+            if i1 == i2 {
+                *obj = Obj::AtAddr(*i1);
+            }
+            joined.ints.insert(*i1, curr_loc);
+        }
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
+            println!(
+                "{:?} {:?} {:?}",
+                l1,
+                l2,
+                cmp_projection(&l1.projection, &l2.projection)
+            );
             if let Some(l) = cmp_projection(&l1.projection, &l2.projection) {
                 let idp = (l1.root, l2.root);
                 let nid = if let Some(id) = id_map.get(&idp) {
@@ -794,7 +793,9 @@ fn join_objs(
             for (f, obj1) in fs1 {
                 let obj2 = some_or!(fs2.get(f), continue);
                 let mut nobj = Obj::default();
-                join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
+                let mut curr_loc = curr_loc.clone();
+                curr_loc.projection.push(AccElem::Int(*f));
+                join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
                 fs.insert(*f, nobj);
             }
         }
@@ -803,11 +804,11 @@ fn join_objs(
             for (l1, obj1) in fs1 {
                 for (l2, obj2) in fs2 {
                     let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
-                    if !l.is_empty() {
-                        let mut nobj = Obj::default();
-                        join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining);
-                        fs.insert(l, nobj);
-                    }
+                    let mut nobj = Obj::default();
+                    let mut curr_loc = curr_loc.clone();
+                    curr_loc.projection.push(AccElem::Symbolic(l.clone()));
+                    join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
+                    fs.insert(l, nobj);
                 }
             }
             *obj = Obj::Index(fs);
@@ -823,17 +824,12 @@ fn cmp_projection(proj1: &[AccElem], proj2: &[AccElem]) -> Option<Vec<AccElem>> 
     let mut proj = vec![];
     for e in proj1.iter().zip(proj2) {
         match e {
-            (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => {
-                proj.push(AccElem::Int(*i1));
-            }
+            (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => proj.push(AccElem::Int(*i1)),
             (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
                 let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
-                if l.is_empty() {
-                    return None;
-                }
                 proj.push(AccElem::Symbolic(l));
             }
-            _ => return None,
+            _ => proj.push(AccElem::Symbolic(BTreeSet::new())),
         }
     }
     Some(proj)
@@ -846,6 +842,7 @@ fn ord_objs(
     remaining: &mut Vec<(NodeId, NodeId)>,
 ) -> bool {
     match (obj1, obj2) {
+        (Obj::AtAddr(i1), Obj::AtAddr(i2)) => i1 == i2,
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
             let idp = (l1.root, l2.root);
             if !id_set.contains(&idp) {

@@ -58,14 +58,15 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                     body.source_info(access.location).span,
                     access.ctx
                 );
+                println!("{:?}", body.stmt_at(access.location));
+                println!("{:?}", state);
                 if let Some(obj) = obj {
                     let Obj::Compound(fields) = obj else { unreachable!() };
                     for (i, obj) in fields {
                         if let Obj::Ptr(loc) = obj {
-                            if loc.projection().is_empty() {
-                                let node = &g.nodes[loc.root()];
-                                if let Some(v) = node.at_addr {
-                                    println!("{}: {}", i, v);
+                            if let Some(obj) = g.obj_at_location(loc) {
+                                if let Obj::AtAddr(n) = obj {
+                                    println!("{}: {}", i, n);
                                 } else {
                                     println!("{}: loc<{:?}>", i, obj);
                                 }

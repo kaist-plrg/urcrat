@@ -98,6 +98,17 @@ pub fn analyze_fn(
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
+    // for bbd in body.basic_blocks.iter() {
+    //     for stmt in &bbd.statements {
+    //         println!("{:?}", stmt);
+    //     }
+    //     if !matches!(
+    //         bbd.terminator().kind,
+    //         TerminatorKind::Return | TerminatorKind::Assert { .. }
+    //     ) {
+    //         println!("{:?}", bbd.terminator().kind);
+    //     }
+    // }
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let rpo_map = compute_rpo_map(body, &loop_blocks);
@@ -166,12 +177,17 @@ impl<'tcx> Analyzer<'tcx, '_> {
             let mut next_state = state.clone();
             let bbd = &self.body.basic_blocks[location.block];
             let nexts = if let Some(stmt) = bbd.statements.get(location.statement_index) {
+                println!("{:?}", next_state);
+                println!("{:?}: {:?}", location, stmt);
                 self.transfer_stmt(stmt, &mut next_state);
                 vec![(location.successor_within_block(), next_state)]
             } else {
+                println!("{:?}", next_state);
+                println!("{:?}: {:?}", location, bbd.terminator().kind);
                 let v = self.discriminant_values.get(&location.block);
                 self.transfer_term(bbd.terminator(), v, &next_state)
             };
+            println!("{:?}", nexts);
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
                 let joined = next_state.join(&new_next_state);
