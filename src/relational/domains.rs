@@ -57,7 +57,50 @@ impl AbsMem {
 
 type NodeId = usize;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccElem {
+    Int(u128),
+    Symbolic(BTreeSet<Local>),
+}
+
+impl std::fmt::Debug for AccElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccElem::Int(i) => write!(f, "{}", i),
+            AccElem::Symbolic(s) => write!(f, "{:?}", s),
+        }
+    }
+}
+
+impl AccElem {
+    fn equiv(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(n1), Self::Int(n2)) => n1 == n2,
+            (Self::Symbolic(l1), Self::Symbolic(l2)) => !l1.is_disjoint(l2),
+            _ => false,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Int(n1), Self::Int(n2)) if n1 == n2 => Self::Int(*n1),
+            (Self::Symbolic(l1), Self::Symbolic(l2)) => {
+                Self::Symbolic(l1.intersection(l2).cloned().collect())
+            }
+            _ => Self::Symbolic(BTreeSet::new()),
+        }
+    }
+
+    fn ord(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(n1), Self::Int(n2)) => n1 == n2,
+            (Self::Symbolic(l1), Self::Symbolic(l2)) => l2.is_subset(l1),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AbsLoc {
     root: NodeId,
     projection: Vec<AccElem>,
@@ -104,8 +147,7 @@ impl AbsLoc {
 pub enum Obj {
     AtAddr(u128),
     Ptr(AbsLoc),
-    Compound(HashMap<usize, Obj>),
-    Index(HashMap<BTreeSet<Local>, Obj>),
+    Compound(HashMap<AccElem, Obj>),
 }
 
 impl std::fmt::Debug for Obj {
@@ -114,18 +156,6 @@ impl std::fmt::Debug for Obj {
             Self::AtAddr(n) => write!(f, "@{}", n),
             Self::Ptr(l) => write!(f, "{:?}", l),
             Self::Compound(fs) => {
-                write!(f, "[")?;
-                let mut v = fs.keys().copied().collect::<Vec<_>>();
-                v.sort();
-                for (i, k) in v.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}: {:?}", k, fs[k])?;
-                }
-                write!(f, "]")
-            }
-            Self::Index(fs) => {
                 write!(f, "[")?;
                 let mut v = fs.keys().cloned().collect::<Vec<_>>();
                 v.sort();
@@ -151,20 +181,19 @@ impl Default for Obj {
 impl Obj {
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
         if let Some(elem) = proj.get(0) {
+            let Obj::Compound(fields) = self else { return None };
             let inner = match elem {
-                AccElem::Int(n) => {
-                    let Obj::Compound(fields) = self else { return None };
-                    fields.get(n)?
-                }
-                AccElem::Symbolic(local1) => {
-                    let Obj::Index(fields) = self else { return None };
-                    fields.iter().find_map(|(local2, obj)| {
-                        if local1.is_disjoint(local2) {
-                            None
-                        } else {
-                            Some(obj)
-                        }
-                    })?
+                AccElem::Int(n) => fields.get(&AccElem::Int(*n))?,
+                AccElem::Symbolic(_) => {
+                    fields.iter().find_map(
+                        |(field, obj)| {
+                            if field.equiv(elem) {
+                                Some(obj)
+                            } else {
+                                None
+                            }
+                        },
+                    )?
                 }
             };
             inner.project(&proj[1..])
@@ -175,40 +204,39 @@ impl Obj {
 
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
         if let Some(elem) = proj.get(0) {
-            let inner = match elem {
-                AccElem::Int(n) => {
-                    if !matches!(self, Obj::Compound(_)) {
-                        *self = Obj::default();
-                    }
-                    let Obj::Compound(fields) = self else { unreachable!() };
-                    fields.entry(*n).or_insert(Obj::default())
-                }
-                AccElem::Symbolic(local1) => {
-                    if !matches!(self, Obj::Index(_)) {
-                        *self = Obj::Index(HashMap::from_iter([(local1.clone(), Obj::default())]));
-                    }
-                    let Obj::Index(fields) = self else { unreachable!() };
-                    match fields.keys().find(|local2| !local1.is_disjoint(local2)) {
-                        Some(local2) => {
-                            let mut local2 = local2.clone();
-                            let obj = fields.remove(&local2).unwrap();
-                            local2.extend(local1);
-                            if write {
-                                fields.clear();
-                            }
-                            fields.insert(local2.clone(), obj);
-                            fields.get_mut(&local2).unwrap()
-                        }
-                        None => {
-                            if write {
-                                fields.clear();
-                            }
-                            fields.insert(local1.clone(), Obj::default());
-                            fields.get_mut(local1).unwrap()
-                        }
-                    }
-                }
+            let fields = match self {
+                Obj::Compound(field) => std::mem::take(field),
+                _ => HashMap::new(),
             };
+            let mut new_fields = HashMap::new();
+            let mut exists = false;
+            let mut elem = elem.clone();
+            for (field, obj) in fields {
+                match (&field, &mut elem) {
+                    (AccElem::Int(n1), AccElem::Int(n2)) => {
+                        if n1 == n2 {
+                            exists = true;
+                        }
+                        new_fields.insert(field, obj);
+                    }
+                    (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) if !l1.is_disjoint(l2) => {
+                        exists = true;
+                        l2.extend(l1);
+                        new_fields.insert(elem.clone(), obj);
+                    }
+                    _ => {
+                        if !write {
+                            new_fields.insert(field, obj);
+                        }
+                    }
+                }
+            }
+            if !exists {
+                new_fields.insert(elem.clone(), Obj::default());
+            }
+            *self = Obj::Compound(new_fields);
+            let Obj::Compound(fields) = self else { unreachable!() };
+            let inner = fields.get_mut(&elem).unwrap();
             inner.project_mut(&proj[1..], write)
         } else {
             self
@@ -224,11 +252,6 @@ impl Obj {
                 }
             }
             Self::Compound(fs) => {
-                for obj in fs.values_mut() {
-                    obj.substitute(old_loc, new_loc);
-                }
-            }
-            Self::Index(fs) => {
                 for obj in fs.values_mut() {
                     obj.substitute(old_loc, new_loc);
                 }
@@ -249,11 +272,6 @@ impl Obj {
                     obj.extend_loc(loc);
                 }
             }
-            Self::Index(fs) => {
-                for obj in fs.values_mut() {
-                    obj.extend_loc(loc);
-                }
-            }
         }
     }
 
@@ -262,17 +280,16 @@ impl Obj {
             Self::AtAddr(_) => {}
             Self::Ptr(_) => {}
             Self::Compound(fs) => {
-                for obj in fs.values_mut() {
-                    obj.invalidate_symbolic(local);
-                }
-            }
-            Self::Index(fs) => {
-                while let Some(ls) = fs.keys().find(|ls| ls.contains(&local)) {
-                    let mut ls = ls.clone();
-                    let obj = fs.remove(&ls).unwrap();
+                while let Some(f) = fs.keys().find(|f| {
+                    let AccElem::Symbolic(ls) = f else { return false };
+                    ls.contains(&local)
+                }) {
+                    let f = f.clone();
+                    let obj = fs.remove(&f).unwrap();
+                    let AccElem::Symbolic(mut ls) = f else { unreachable!() };
                     ls.remove(&local);
                     if !ls.is_empty() {
-                        fs.insert(ls, obj);
+                        fs.insert(AccElem::Symbolic(ls), obj);
                     }
                 }
                 for obj in fs.values_mut() {
@@ -290,10 +307,6 @@ impl Obj {
                 .values()
                 .flat_map(|obj| obj.pointing_locations())
                 .collect(),
-            Self::Index(fs) => fs
-                .values()
-                .flat_map(|obj| obj.pointing_locations())
-                .collect(),
         }
     }
 
@@ -302,15 +315,15 @@ impl Obj {
         loc
     }
 
-    pub fn field(&self, i: usize) -> &Obj {
+    pub fn field(&self, i: u128) -> &Obj {
         let Obj::Compound(fs) = self else { panic!() };
-        fs.get(&i).unwrap()
+        fs.get(&AccElem::Int(i)).unwrap()
     }
 
     pub fn symbolic_obj(&self, index: &[usize]) -> Option<&Obj> {
-        let Obj::Index(fs) = self else { panic!() };
+        let Obj::Compound(fs) = self else { panic!() };
         let index = index.iter().copied().map(Local::from_usize).collect();
-        fs.get(&index)
+        fs.get(&AccElem::Symbolic(index))
     }
 }
 
@@ -335,7 +348,7 @@ impl Node {
         self.obj.as_ptr()
     }
 
-    pub fn field(&self, i: usize) -> &Obj {
+    pub fn field(&self, i: u128) -> &Obj {
         self.obj.field(i)
     }
 
@@ -371,26 +384,28 @@ impl Graph {
         for (l1, id1) in &self.locals {
             let (_, id2) = some_or!(other.locals.iter().find(|(l2, _)| l1 == *l2), continue);
             let (id, _) = joined.get_local_node_mut(*l1);
-            let idp = (*id1, *id2);
-            id_map.insert(idp, id);
+            let idp = (AbsLoc::new_root(*id1), AbsLoc::new_root(*id2));
+            id_map.insert(idp.clone(), id);
             remaining.push(idp);
         }
 
-        while let Some((id1, id2)) = remaining.pop() {
-            let node1 = &self.nodes[id1];
-            let node2 = &other.nodes[id2];
-            let id = id_map[&(id1, id2)];
+        while let Some((loc1, loc2)) = remaining.pop() {
+            let obj1 = self.obj_at_location(&loc1);
+            let obj2 = other.obj_at_location(&loc2);
+            let id = id_map[&(loc1, loc2)];
 
             let mut obj = Obj::default();
-            join_objs(
-                &node1.obj,
-                &node2.obj,
-                &mut obj,
-                &mut joined,
-                &mut id_map,
-                &mut remaining,
-                AbsLoc::new_root(id),
-            );
+            if let (Some(obj1), Some(obj2)) = (obj1, obj2) {
+                join_objs(
+                    obj1,
+                    obj2,
+                    &mut obj,
+                    &mut joined,
+                    &mut id_map,
+                    &mut remaining,
+                    AbsLoc::new_root(id),
+                );
+            }
             joined.nodes[id].obj = obj;
         }
 
@@ -565,7 +580,7 @@ impl Graph {
                     *obj = Obj::Ptr(loc);
                 }
                 OpVal::Int(idx) => {
-                    *n += idx as usize;
+                    *n += idx;
                     let obj = self.lvalue(x, false);
                     *obj = Obj::Ptr(loc);
                 }
@@ -586,7 +601,7 @@ impl Graph {
         let obj = self.lvalue(x, false);
         let elem = loc.projection.last_mut().unwrap();
         if let AccElem::Int(n) = elem {
-            *n += idx as usize;
+            *n += idx;
             *obj = Obj::Ptr(loc);
         } else {
             *obj = Obj::default();
@@ -696,7 +711,7 @@ impl Graph {
             unsafe {
                 *obj = Obj::Ptr(loc.clone());
             }
-            let obj = Obj::Compound(HashMap::from_iter([(0, Obj::default())]));
+            let obj = Obj::Compound(HashMap::from_iter([(AccElem::Int(0), Obj::default())]));
             self.nodes.push(Node::new(obj));
             loc
         }
@@ -757,8 +772,8 @@ fn join_objs(
     obj2: &Obj,
     obj: &mut Obj,
     joined: &mut Graph,
-    id_map: &mut HashMap<(NodeId, NodeId), NodeId>,
-    remaining: &mut Vec<(NodeId, NodeId)>,
+    id_map: &mut HashMap<(AbsLoc, AbsLoc), NodeId>,
+    remaining: &mut Vec<(AbsLoc, AbsLoc)>,
     curr_loc: AbsLoc,
 ) {
     match (obj1, obj2) {
@@ -769,49 +784,34 @@ fn join_objs(
             joined.ints.insert(*i1, curr_loc);
         }
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
-            println!(
-                "{:?} {:?} {:?}",
-                l1,
-                l2,
-                cmp_projection(&l1.projection, &l2.projection)
-            );
-            if let Some(l) = cmp_projection(&l1.projection, &l2.projection) {
-                let idp = (l1.root, l2.root);
-                let nid = if let Some(id) = id_map.get(&idp) {
-                    *id
-                } else {
-                    let (id, _) = joined.add_node();
-                    id_map.insert(idp, id);
-                    remaining.push(idp);
-                    id
-                };
-                *obj = Obj::Ptr(AbsLoc::new(nid, l));
-            }
+            let (idp, l) = if let Some(l) = cmp_projection(&l1.projection, &l2.projection) {
+                ((AbsLoc::new_root(l1.root), AbsLoc::new_root(l2.root)), l)
+            } else {
+                ((l1.clone(), l2.clone()), vec![])
+            };
+            let nid = if let Some(id) = id_map.get(&idp) {
+                *id
+            } else {
+                let (id, _) = joined.add_node();
+                id_map.insert(idp.clone(), id);
+                remaining.push(idp);
+                id
+            };
+            *obj = Obj::Ptr(AbsLoc::new(nid, l));
         }
         (Obj::Compound(fs1), Obj::Compound(fs2)) => {
-            let Obj::Compound(fs) = obj else { unreachable!() };
-            for (f, obj1) in fs1 {
-                let obj2 = some_or!(fs2.get(f), continue);
-                let mut nobj = Obj::default();
-                let mut curr_loc = curr_loc.clone();
-                curr_loc.projection.push(AccElem::Int(*f));
-                join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
-                fs.insert(*f, nobj);
-            }
-        }
-        (Obj::Index(fs1), Obj::Index(fs2)) => {
             let mut fs = HashMap::new();
-            for (l1, obj1) in fs1 {
-                for (l2, obj2) in fs2 {
-                    let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
+            for (f1, obj1) in fs1 {
+                for (f2, obj2) in fs2 {
+                    let f = f1.join(f2);
                     let mut nobj = Obj::default();
                     let mut curr_loc = curr_loc.clone();
-                    curr_loc.projection.push(AccElem::Symbolic(l.clone()));
+                    curr_loc.projection.push(f.clone());
                     join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
-                    fs.insert(l, nobj);
+                    fs.insert(f, nobj);
                 }
             }
-            *obj = Obj::Index(fs);
+            *obj = Obj::Compound(fs);
         }
         _ => {}
     }
@@ -827,9 +827,12 @@ fn cmp_projection(proj1: &[AccElem], proj2: &[AccElem]) -> Option<Vec<AccElem>> 
             (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => proj.push(AccElem::Int(*i1)),
             (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
                 let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
+                if l.is_empty() {
+                    return None;
+                }
                 proj.push(AccElem::Symbolic(l));
             }
-            _ => proj.push(AccElem::Symbolic(BTreeSet::new())),
+            _ => return None,
         }
     }
     Some(proj)
@@ -842,6 +845,7 @@ fn ord_objs(
     remaining: &mut Vec<(NodeId, NodeId)>,
 ) -> bool {
     match (obj1, obj2) {
+        (_, Obj::Compound(fs)) if fs.is_empty() => true,
         (Obj::AtAddr(i1), Obj::AtAddr(i2)) => i1 == i2,
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
             let idp = (l1.root, l2.root);
@@ -851,14 +855,10 @@ fn ord_objs(
             }
             ord_projection(&l1.projection, &l2.projection)
         }
-        (Obj::Compound(fs1), Obj::Compound(fs2)) => fs2.iter().all(|(f, obj2)| {
-            let obj1 = some_or!(fs1.get(f), return false);
-            ord_objs(obj1, obj2, id_set, remaining)
-        }),
-        (Obj::Index(fs1), Obj::Index(fs2)) => fs2.iter().all(|(l2, obj2)| {
+        (Obj::Compound(fs1), Obj::Compound(fs2)) => fs2.iter().all(|(f2, obj2)| {
             let obj1 = fs1
                 .iter()
-                .find_map(|(l1, obj1)| if l2.is_subset(l1) { Some(obj1) } else { None });
+                .find_map(|(f1, obj1)| if f1.ord(f2) { Some(obj1) } else { None });
             let obj1 = some_or!(obj1, return false);
             ord_objs(obj1, obj2, id_set, remaining)
         }),

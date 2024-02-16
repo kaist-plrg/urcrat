@@ -66,15 +66,15 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                         if let Obj::Ptr(loc) = obj {
                             if let Some(obj) = g.obj_at_location(loc) {
                                 if let Obj::AtAddr(n) = obj {
-                                    println!("{}: {}", i, n);
+                                    println!("{:?}: {}", i, n);
                                 } else {
-                                    println!("{}: loc<{:?}>", i, obj);
+                                    println!("{:?}: loc<{:?}>", i, obj);
                                 }
                             } else {
-                                println!("{}: loc<{:?}>", i, obj);
+                                println!("{:?}: loc<{:?}>", i, obj);
                             }
                         } else {
-                            println!("{}: {:?}", i, obj);
+                            println!("{:?}: {:?}", i, obj);
                         }
                     }
                 } else {

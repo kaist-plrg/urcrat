@@ -825,7 +825,6 @@ fn test_join_loop() {
         }
         ",
         |g, _, _| {
-            println!("{:?}", g);
             let n = get_nodes(&g, 1..=2);
             assert_eq!(n[&1].as_ptr(), n[&2].as_ptr());
             assert_eq!(g.get_local_as_int(1), None);
@@ -1341,24 +1340,55 @@ fn test_for_switch() {
 }
 
 #[test]
-fn test_for_switch_offset() {
-    // _1 = const 0_i32
-    // _2 = const 0_usize as *mut s (PointerFromExposedAddress)
-    // _3 = _2
+fn test_loop_offset() {
+    // _2 = const 0_i32
+    // _3 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _4 = _3
     // goto -> bb1
-    // _5 = _3
-    // _8 = const 10_i32
-    // _7 = move _8 as isize (IntToInt)
-    // _6 = std::ptr::mut_ptr::<impl *mut s>::offset(_2, move _7)
-    // _4 = Lt(move _5, move _6)
-    // switchInt(move _4) -> [0: bb7, otherwise: bb3]
-    // switchInt(((*_3).0: i32)) -> [0: bb4, otherwise: bb5]
-    // _9 = ((*_3).0: i32)
-    // _1 = move _9
-    // goto -> bb5
-    // _11 = _3
-    // _10 = std::ptr::mut_ptr::<impl *mut s>::offset(move _11, const 1_isize)
-    // _3 = move _10
+    // switchInt(_1) -> [0: bb6, otherwise: bb2]
+    // switchInt((*_4)) -> [0: bb3, otherwise: bb4]
+    // _5 = (*_4)
+    // _2 = move _5
+    // goto -> bb4
+    // _7 = _4
+    // _6 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _7, const 1_isize)
+    // _4 = move _6
+    // goto -> bb1
+    analyze_fn_with(
+        "",
+        "b: bool",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut w: *mut libc::c_int = 0 as *mut libc::c_int;
+        let mut z: *mut libc::c_int = w;
+        while b {
+            match *z {
+                0 => y = *z,
+                _ => {}
+            }
+            z = z.offset(1);
+        }
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_loop_offset_struct() {
+    // _2 = const 0_i32
+    // _3 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _4 = _3
+    // goto -> bb1
+    // switchInt(_1) -> [0: bb6, otherwise: bb2]
+    // switchInt((*_4)) -> [0: bb3, otherwise: bb4]
+    // _5 = (*_4)
+    // _2 = move _5
+    // goto -> bb4
+    // _7 = _4
+    // _6 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _7, const 1_isize)
+    // _4 = move _6
     // goto -> bb1
     analyze_fn_with(
         "
@@ -1368,21 +1398,21 @@ fn test_for_switch_offset() {
             pub x: libc::c_int,
         }
         ",
-        "",
+        "b: bool",
         "
         let mut y: libc::c_int = 0 as libc::c_int;
-        let mut s: *mut s = 0 as *mut s;
-        let mut t: *mut s = s;
-        while t < s.offset(10 as libc::c_int as isize) {
-            match (*t).x {
-                0 => y = (*t).x,
+        let mut w: *mut s = 0 as *mut s;
+        let mut z: *mut s = w;
+        while b {
+            match (*z).x {
+                0 => y = (*z).x,
                 _ => {}
             }
-            t = t.offset(1);
+            z = z.offset(1);
         }
         ",
         |g, _, _| {
-            // assert_eq!(g.get_local_as_int(1), Some(0));
+            assert_eq!(g.get_local_as_int(2), Some(0));
         },
     );
 }

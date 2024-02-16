@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use rustc_abi::FieldIdx;
 use rustc_middle::{
@@ -173,13 +173,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
-                    let l = l.extended(&[AccElem::Int(field.index())]);
+                    let l = l.extended(&[AccElem::Int(field.index() as _)]);
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
                         let v = self.transfer_op(op, state);
-                        let l = l.extended(&[AccElem::Int(field.index())]);
+                        let l = l.extended(&[AccElem::Int(field.index() as _)]);
                         let suffixes = self.get_path_suffixes(&l, l_deref);
                         state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
@@ -306,9 +306,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 statement_index: 0,
                             };
                             let mut state = state.clone();
-                            // println!("BEFORE FILTER {:?} {:?}", location, state);
                             state.gm().filter_x_int(&discr, is_deref, v);
-                            // println!(" AFTER FILTER {:?} {:?}", location, state);
                             (location, state)
                         })
                         .chain(std::iter::once((
@@ -582,30 +580,15 @@ impl AccPath {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum AccElem {
-    Int(usize),
-    Symbolic(BTreeSet<Local>),
-}
-
-impl std::fmt::Debug for AccElem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AccElem::Int(i) => write!(f, "{}", i),
-            AccElem::Symbolic(s) => write!(f, "{:?}", s),
-        }
-    }
-}
-
 impl AccElem {
     fn from_elem(proj: PlaceElem<'_>, state: &AbsMem) -> Option<Self> {
         match proj {
             ProjectionElem::Deref => None,
-            ProjectionElem::Field(i, _) => Some(AccElem::Int(i.index())),
+            ProjectionElem::Field(i, _) => Some(AccElem::Int(i.index() as _)),
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
                 if let Some(i) = state.g().get_x_as_int(&path, false) {
-                    Some(AccElem::Int(i as usize))
+                    Some(AccElem::Int(i))
                 } else {
                     Some(AccElem::Symbolic(state.g().find_aliases(local)))
                 }
