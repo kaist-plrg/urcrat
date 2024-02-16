@@ -868,11 +868,22 @@ fn ord_objs(
 
 fn ord_projection(proj1: &[AccElem], proj2: &[AccElem]) -> bool {
     if proj1.len() != proj2.len() {
-        return false;
+        return true;
     }
-    proj1.iter().zip(proj2).all(|e| match e {
-        (AccElem::Int(i1), AccElem::Int(i2)) => i1 == i2,
-        (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => l2.is_subset(l1),
-        _ => false,
-    })
+    let mut b = true;
+    for e in proj1.iter().zip(proj2) {
+        match e {
+            (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => {}
+            (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
+                if l1.is_disjoint(l2) {
+                    return true;
+                }
+                if !l2.is_subset(l1) {
+                    b = false;
+                }
+            }
+            _ => return true,
+        }
+    }
+    b
 }
