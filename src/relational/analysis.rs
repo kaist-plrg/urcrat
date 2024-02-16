@@ -21,25 +21,25 @@ use rustc_span::def_id::LocalDefId;
 use super::*;
 use crate::*;
 
-pub fn analyze_path(path: &Path) -> AnalysisResults {
-    analyze_input(compile_util::path_to_input(path))
+pub fn analyze_path(path: &Path, gc: bool) -> AnalysisResults {
+    analyze_input(compile_util::path_to_input(path), gc)
 }
 
-pub fn analyze_str(code: &str) -> AnalysisResults {
-    analyze_input(compile_util::str_to_input(code))
+pub fn analyze_str(code: &str, gc: bool) -> AnalysisResults {
+    analyze_input(compile_util::str_to_input(code), gc)
 }
 
-fn analyze_input(input: Input) -> AnalysisResults {
+fn analyze_input(input: Input, gc: bool) -> AnalysisResults {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, analyze).unwrap()
+    compile_util::run_compiler(config, |tcx| analyze(tcx, gc)).unwrap()
 }
 
-pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
+pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
     let prog_info = relational::ProgInfo::new(tcx);
     let functions = prog_info
         .reachability
         .keys()
-        .map(|def_id| (*def_id, analyze_fn(tcx, &prog_info, *def_id)))
+        .map(|def_id| (*def_id, analyze_fn(tcx, &prog_info, *def_id, gc)))
         .collect();
     AnalysisResults { functions }
 }
@@ -95,20 +95,12 @@ pub fn analyze_fn(
     tcx: TyCtxt<'_>,
     prog_info: &ProgInfo,
     local_def_id: LocalDefId,
+    gc: bool,
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    // for bbd in body.basic_blocks.iter() {
-    //     for stmt in &bbd.statements {
-    //         println!("{:?}", stmt);
-    //     }
-    //     if !matches!(
-    //         bbd.terminator().kind,
-    //         TerminatorKind::Return | TerminatorKind::Assert { .. }
-    //     ) {
-    //         println!("{:?}", bbd.terminator().kind);
-    //     }
-    // }
+    // println!("{}", compile_util::body_to_str(&body));
+    // println!("{}", compile_util::body_size(&body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let rpo_map = compute_rpo_map(body, &loop_blocks);
@@ -140,6 +132,7 @@ pub fn analyze_fn(
         local_def_id,
         discriminant_values,
         prog_info,
+        gc,
     };
     analyzer.analyze()
 }
@@ -154,13 +147,13 @@ pub struct Analyzer<'tcx, 'a> {
     pub tcx: TyCtxt<'tcx>,
     body: &'tcx Body<'tcx>,
     rpo_map: HashMap<BasicBlock, usize>,
-    #[allow(unused)]
     dead_locals: Vec<BitSet<Local>>,
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
     local_def_id: LocalDefId,
     discriminant_values: HashMap<BasicBlock, DiscrVal>,
     prog_info: &'a ProgInfo,
+    gc: bool,
 }
 
 impl<'tcx> Analyzer<'tcx, '_> {
@@ -175,22 +168,28 @@ impl<'tcx> Analyzer<'tcx, '_> {
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
-            let mut next_state = state.clone();
-            let bbd = &self.body.basic_blocks[location.block];
-            let nexts = if let Some(stmt) = bbd.statements.get(location.statement_index) {
-                self.transfer_stmt(stmt, &mut next_state);
-                vec![(location.successor_within_block(), next_state)]
-            } else {
-                let v = self.discriminant_values.get(&location.block);
-                self.transfer_term(bbd.terminator(), v, &next_state)
-            };
+            let nexts = self.body.stmt_at(location).either(
+                |stmt| {
+                    let mut next_state = state.clone();
+                    self.transfer_stmt(stmt, &mut next_state);
+                    vec![(location.successor_within_block(), next_state)]
+                },
+                |terminator| {
+                    let v = self.discriminant_values.get(&location.block);
+                    self.transfer_term(terminator, v, state)
+                },
+            );
+            println!("{:?}", state);
+            println!("{:?} {:?}", location, self.body.stmt_at(location));
+            println!("{:?}", nexts);
+            println!("-----------------");
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
-                let joined = next_state.join(&new_next_state);
-                // if next_location.statement_index == 0 {
-                //     let dead_locals = &self.dead_locals[next_location.block.as_usize()];
-                //     joined.clear_dead_locals(dead_locals);
-                // }
+                let mut joined = next_state.join(&new_next_state);
+                if self.gc && next_location.statement_index == 0 {
+                    let dead_locals = &self.dead_locals[next_location.block.as_usize()];
+                    joined.clear_dead_locals(dead_locals);
+                }
                 if !joined.ord(next_state) {
                     states.insert(next_location, joined);
                     work_list.push(next_location);

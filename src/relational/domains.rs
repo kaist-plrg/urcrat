@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use etrace::some_or;
+use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::Local;
 
 use super::*;
@@ -53,6 +54,19 @@ impl AbsMem {
             (Self::Mem(g1), Self::Mem(g2)) => g1.ord(g2),
         }
     }
+
+    pub fn size(&self) -> (usize, usize) {
+        match self {
+            Self::Bot => (0, 0),
+            Self::Mem(g) => (g.locals.len(), g.nodes.len()),
+        }
+    }
+
+    pub fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+        if let Self::Mem(g) = self {
+            g.clear_dead_locals(dead_locals);
+        }
+    }
 }
 
 type NodeId = usize;
@@ -96,6 +110,13 @@ impl AccElem {
             (Self::Int(n1), Self::Int(n2)) => n1 == n2,
             (Self::Symbolic(l1), Self::Symbolic(l2)) => l2.is_subset(l1),
             _ => false,
+        }
+    }
+
+    fn locals(&self) -> HashSet<Local> {
+        match self {
+            Self::Int(_) => HashSet::new(),
+            Self::Symbolic(l) => l.iter().cloned().collect(),
         }
     }
 }
@@ -306,6 +327,25 @@ impl Obj {
             Self::Compound(fs) => fs
                 .values()
                 .flat_map(|obj| obj.pointing_locations())
+                .collect(),
+        }
+    }
+
+    fn locals(&self) -> HashSet<Local> {
+        match self {
+            Self::AtAddr(_) => HashSet::new(),
+            Self::Ptr(loc) => loc
+                .projection
+                .iter()
+                .flat_map(|elem| elem.locals())
+                .collect(),
+            Self::Compound(fs) => fs
+                .iter()
+                .flat_map(|(f, obj)| {
+                    let mut ls = f.locals();
+                    ls.extend(obj.locals());
+                    ls
+                })
                 .collect(),
         }
     }
@@ -764,6 +804,16 @@ impl Graph {
 
     pub fn get_local_node(&self, local: usize) -> &Node {
         &self.nodes[self.get_local_id(local)]
+    }
+
+    fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+        let locals: HashSet<_> = self
+            .nodes
+            .iter()
+            .flat_map(|node| node.obj.locals())
+            .collect();
+        self.locals
+            .retain(|local, _| !dead_locals.contains(*local) || locals.contains(local));
     }
 }
 

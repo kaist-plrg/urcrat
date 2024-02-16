@@ -55,7 +55,7 @@ where F: FnOnce(Graph, AnalysisResults, TyCtxt<'_>) + Send {
         types, name, params, code
     );
     run_compiler(&code, |tcx| {
-        let res = analyze(tcx);
+        let res = analyze(tcx, false);
         let def_id = find_fn(name, tcx);
         let loc = find_return(def_id, tcx);
         let state = res.functions[&def_id][&loc].clone();

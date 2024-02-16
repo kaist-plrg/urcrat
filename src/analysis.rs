@@ -47,7 +47,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
         visitor.visit_body(body);
         if !visitor.accesses.is_empty() {
             println!("{:?}", local_def_id);
-            let states = relational::analyze_fn(tcx, &prog_info, local_def_id);
+            let states = relational::analyze_fn(tcx, &prog_info, local_def_id, true);
             for access in &visitor.accesses {
                 let state = &states[&access.location];
                 let (path, is_deref) = access.get_path(state);
@@ -58,8 +58,8 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                     body.source_info(access.location).span,
                     access.ctx
                 );
-                println!("{:?}", body.stmt_at(access.location));
-                println!("{:?}", state);
+                println!("{:?} {:?}", access.location, body.stmt_at(access.location));
+                // println!("{:?}", state);
                 if let Some(obj) = obj {
                     let Obj::Compound(fields) = obj else { unreachable!() };
                     for (i, obj) in fields {
