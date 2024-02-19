@@ -633,14 +633,16 @@ pub struct MayAlias {
 
 impl AliasGraph {
     pub fn find_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<MayAlias> {
-        let id = VarId::Local(CallStr::Empty, f, l.as_u32());
-        let node = self.id_to_node[&id];
-        let pointed_node = self.points_to[&node];
-
         let mut aliases = HashSet::new();
         let mut done = HashSet::new();
         let mut remainings = HashSet::new();
-        remainings.insert((pointed_node, 0));
+
+        for (id, node) in &self.id_to_node {
+            let VarId::Local(_, local_def_id, local) = id else { continue };
+            if *local_def_id == f && *local == l.as_u32() {
+                remainings.insert((self.points_to[node], 0));
+            }
+        }
 
         while !remainings.is_empty() {
             let mut new_remainings = HashSet::new();
@@ -675,12 +677,17 @@ impl AliasGraph {
         l: Local,
         tcx: TyCtxt<'_>,
     ) -> HashSet<LocalDefId> {
-        let id = VarId::Local(CallStr::Empty, f, l.as_u32());
-        let node = self.id_to_node[&id];
-        let pointed_fn = self.points_to_fn[&node];
-        let nodes = &self.fn_pointed_by[&pointed_fn];
-        nodes
+        self.id_to_node
             .iter()
+            .filter_map(|(id, node)| {
+                let VarId::Local(_, local_def_id, local) = id else { return None };
+                if *local_def_id == f && *local == l.as_u32() {
+                    Some(&self.fn_pointed_by[&self.points_to_fn[node]])
+                } else {
+                    None
+                }
+            })
+            .flatten()
             .filter_map(|node| {
                 let VarId::Global(_, f) = node else { return None };
                 let node = tcx.hir().find_by_def_id(*f).unwrap();

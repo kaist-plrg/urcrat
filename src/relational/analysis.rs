@@ -179,10 +179,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     self.transfer_term(terminator, v, state)
                 },
             );
-            println!("{:?}", state);
-            println!("{:?} {:?}", location, self.body.stmt_at(location));
-            println!("{:?}", nexts);
-            println!("-----------------");
+            // println!("{:?}", state);
+            // println!("{:?} {:?}", location, self.body.stmt_at(location));
+            // println!("{:?}", nexts);
+            // println!("-----------------");
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
                 let mut joined = next_state.join(&new_next_state);
