@@ -1437,3 +1437,46 @@ fn test_memcpy() {
         },
     );
 }
+
+#[test]
+fn test_fn_sensitivity() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _5 = &mut _1
+    // _4 = &raw mut (*_5)
+    // _3 = foo::g(move _4)
+    // _8 = &mut _2
+    // _7 = &raw mut (*_8)
+    // _6 = foo::g(move _7)
+    analyze_fn(
+        "
+        fn g(mut x: *mut libc::c_int) {}
+        let mut x: libc::c_int = 0;
+        let mut y: libc::c_int = 0;
+        g(&mut x);
+        g(&mut y);
+        ",
+        |x, t, res, tcx| {
+            let (f, _) = find_item("foo", tcx);
+            let (_, gt0) = get_xts(
+                CallStr::Single(f, BasicBlock::from_usize(0)),
+                "g",
+                &res,
+                tcx,
+            );
+            let (_, gt1) = get_xts(
+                CallStr::Single(f, BasicBlock::from_usize(1)),
+                "g",
+                &res,
+                tcx,
+            );
+            assert_eq!(t[4].var_ty, x[1]);
+            assert_eq!(t[5].var_ty, x[1]);
+            assert_eq!(gt0[1].var_ty, x[1]);
+            assert_eq!(t[7].var_ty, x[2]);
+            assert_eq!(t[8].var_ty, x[2]);
+            assert_eq!(gt1[1].var_ty, x[2]);
+            assert_ne!(x[1], x[2]);
+        },
+    );
+}
