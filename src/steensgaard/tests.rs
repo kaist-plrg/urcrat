@@ -25,21 +25,26 @@ where F: FnOnce(Vec<VarId>, Vec<Type>, AnalysisResults, TyCtxt<'_>) + Send {
     );
     run_compiler(&code, |tcx| {
         let res = analyze(tcx);
-        let (x, t) = get_xts(name, &res, tcx);
+        let (x, t) = get_xts(CallStr::Empty, name, &res, tcx);
         f(x, t, res, tcx);
     });
 }
 
-fn get_xt(name: &str, res: &AnalysisResults, tcx: TyCtxt<'_>) -> (VarId, Type) {
+fn get_xt(cstr: CallStr, name: &str, res: &AnalysisResults, tcx: TyCtxt<'_>) -> (VarId, Type) {
     let (def_id, _) = find_item(name, tcx);
-    let x = res.global(def_id);
+    let x = res.global(cstr, def_id);
     let t = res.var_ty(x);
     (x, t)
 }
 
-fn get_xts(name: &str, res: &AnalysisResults, tcx: TyCtxt<'_>) -> (Vec<VarId>, Vec<Type>) {
+fn get_xts(
+    cstr: CallStr,
+    name: &str,
+    res: &AnalysisResults,
+    tcx: TyCtxt<'_>,
+) -> (Vec<VarId>, Vec<Type>) {
     let (def_id, n) = find_item(name, tcx);
-    let x: Vec<_> = (0..n).map(|i| res.local(def_id, i)).collect();
+    let x: Vec<_> = (0..n).map(|i| res.local(cstr, def_id, i)).collect();
     let t = x.iter().map(|x| res.var_ty(*x)).collect();
     (x, t)
 }
@@ -880,7 +885,7 @@ fn test_eq_static() {
         ",
         |_, t, _, tcx| {
             let (def_id, _) = find_item("x", tcx);
-            let x = VarId::Global(CallString::Empty, def_id);
+            let x = VarId::Global(CallStr::Empty, def_id);
             assert_eq!(t[1].var_ty, x);
             assert_eq!(t[2].var_ty, x);
             assert_eq!(t[3].var_ty, x);
@@ -901,7 +906,7 @@ fn test_eq_thread_local_static() {
         ",
         |_, t, _, tcx| {
             let (def_id, _) = find_item("x", tcx);
-            let x = VarId::Global(CallString::Empty, def_id);
+            let x = VarId::Global(CallStr::Empty, def_id);
             assert_eq!(t[1].var_ty, x);
             assert_eq!(t[2].var_ty, x);
             assert_eq!(t[3].var_ty, x);
@@ -940,7 +945,7 @@ fn test_static_eq() {
         x = &mut y;
         ",
         |x, t, res, tcx| {
-            let (xx, xt) = get_xt("x", &res, tcx);
+            let (xx, xt) = get_xt(CallStr::Empty, "x", &res, tcx);
             assert_eq!(t[4].var_ty, xx);
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
@@ -959,8 +964,8 @@ fn test_static2() {
         };
         ",
         |_, _, res, tcx| {
-            let (xx, _) = get_xt("x", &res, tcx);
-            let (_, yt) = get_xt("y", &res, tcx);
+            let (xx, _) = get_xt(CallStr::Empty, "x", &res, tcx);
+            let (_, yt) = get_xt(CallStr::Empty, "y", &res, tcx);
             assert_eq!(yt.var_ty, xx);
         },
     );
@@ -979,7 +984,13 @@ fn test_fn_arg() {
         g(&mut x);
         ",
         |x, t, res, tcx| {
-            let (_, gt) = get_xts("g", &res, tcx);
+            let (f, _) = find_item("foo", tcx);
+            let (_, gt) = get_xts(
+                CallStr::Single(f, BasicBlock::from_usize(0)),
+                "g",
+                &res,
+                tcx,
+            );
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
             assert_eq!(gt[1].var_ty, x[1]);
@@ -1006,7 +1017,13 @@ fn test_fn_ret() {
         let mut y: *mut libc::c_int = g(&mut x);
         ",
         |x, t, res, tcx| {
-            let (_, gt) = get_xts("g", &res, tcx);
+            let (f, _) = find_item("foo", tcx);
+            let (_, gt) = get_xts(
+                CallStr::Single(f, BasicBlock::from_usize(0)),
+                "g",
+                &res,
+                tcx,
+            );
             assert_eq!(t[2].var_ty, x[1]);
             assert_eq!(t[3].var_ty, x[1]);
             assert_eq!(t[4].var_ty, x[1]);
@@ -1041,8 +1058,8 @@ fn test_fn_ptr() {
         let mut y: *mut libc::c_int = h.unwrap()(&mut x);
         ",
         |x, t, res, tcx| {
-            let (_, gt) = get_xt("g", &res, tcx);
-            let (_, gts) = get_xts("g", &res, tcx);
+            let (_, gt) = get_xt(CallStr::Empty, "g", &res, tcx);
+            let (_, gts) = get_xts(CallStr::Empty, "g", &res, tcx);
             assert_eq!(t[1].fn_ty, gt.fn_ty);
             assert_eq!(t[2].fn_ty, gt.fn_ty);
             assert_eq!(t[5].fn_ty, gt.fn_ty);
@@ -1070,9 +1087,11 @@ fn test_fn_ptrs() {
     // _2 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _4)
     // _5 = foo::h as fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
     // _2 = std::option::Option::<fn(*mut i32) -> *mut i32>::Some(move _5)
-    // _8 = &mut _1
-    // _7 = &raw mut (*_8)
-    // _6 = foo::g(move _7)
+    // _8 = _2
+    // _7 = std::option::Option::<fn(*mut i32) -> *mut i32>::unwrap(move _8)
+    // _10 = &mut _1
+    // _9 = &raw mut (*_10)
+    // _6 = move _7(move _9)
     analyze_fn(
         "
         fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
@@ -1089,17 +1108,17 @@ fn test_fn_ptrs() {
         } else {
             Some(h as fn(*mut libc::c_int) -> *mut libc::c_int)
         };
-        let mut y: *mut libc::c_int = g(&mut x);
+        let mut y: *mut libc::c_int = i.unwrap()(&mut x);
         ",
         |x, t, res, tcx| {
-            let (_, gt) = get_xt("g", &res, tcx);
-            let (_, gts) = get_xts("g", &res, tcx);
-            let (_, ht) = get_xt("h", &res, tcx);
-            let (_, hts) = get_xts("h", &res, tcx);
+            let (_, gt) = get_xt(CallStr::Empty, "g", &res, tcx);
+            let (_, gts) = get_xts(CallStr::Empty, "g", &res, tcx);
+            let (_, ht) = get_xt(CallStr::Empty, "h", &res, tcx);
+            let (_, hts) = get_xts(CallStr::Empty, "h", &res, tcx);
 
             assert_eq!(t[6].var_ty, x[1]);
-            assert_eq!(t[7].var_ty, x[1]);
-            assert_eq!(t[8].var_ty, x[1]);
+            assert_eq!(t[9].var_ty, x[1]);
+            assert_eq!(t[10].var_ty, x[1]);
             assert_eq!(gts[0].var_ty, x[1]);
             assert_eq!(gts[1].var_ty, x[1]);
             assert_eq!(hts[0].var_ty, x[1]);
@@ -1108,6 +1127,8 @@ fn test_fn_ptrs() {
             assert_eq!(t[2].fn_ty, gt.fn_ty);
             assert_eq!(t[4].fn_ty, gt.fn_ty);
             assert_eq!(t[5].fn_ty, gt.fn_ty);
+            assert_eq!(t[7].fn_ty, gt.fn_ty);
+            assert_eq!(t[8].fn_ty, gt.fn_ty);
             assert_eq!(ht.fn_ty, gt.fn_ty);
         },
     );
@@ -1336,8 +1357,20 @@ fn test_variadic() {
         g(0 as libc::c_int, &mut x as *mut libc::c_int);
         ",
         |fx, ft, res, tcx| {
-            let (gx, gt) = get_xts("g", &res, tcx);
-            let (hx, ht) = get_xts("h", &res, tcx);
+            let (f, _) = find_item("foo", tcx);
+            let (gx, gt) = get_xts(
+                CallStr::Single(f, BasicBlock::from_usize(0)),
+                "g",
+                &res,
+                tcx,
+            );
+            let (g, _) = find_item("g", tcx);
+            let (hx, ht) = get_xts(
+                CallStr::Single(g, BasicBlock::from_usize(2)),
+                "h",
+                &res,
+                tcx,
+            );
 
             assert_eq!(ht[3].var_ty, hx[1]);
             assert_eq!(ht[4].var_ty, hx[1]);
