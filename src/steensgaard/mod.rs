@@ -10,8 +10,8 @@ use rustc_hir::{ForeignItemKind, Item, ItemKind, Node};
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
-        BinOp, ConstantKind, Local, Operand, Rvalue, Statement, StatementKind, Terminator,
-        TerminatorKind,
+        BasicBlock, BinOp, ConstantKind, Local, Operand, Rvalue, Statement, StatementKind,
+        Terminator, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -55,7 +55,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                     if !matches!(item.kind, ForeignItemKind::Static(_, _)) {
                         continue;
                     }
-                    let id = VarId::Global(item.owner_id.def_id);
+                    let id = VarId::Global(CallString::Empty, item.owner_id.def_id);
                     analyzer.insert_and_allocate(id);
                 }
             }
@@ -64,24 +64,24 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                 let local_decls = body.local_decls.len();
 
                 for i in 0..local_decls {
-                    let id = VarId::Local(local_def_id, i as _);
+                    let id = VarId::Local(CallString::Empty, local_def_id, i as _);
                     analyzer.insert_and_allocate(id);
                 }
 
-                let id = VarId::Global(local_def_id);
+                let id = VarId::Global(CallString::Empty, local_def_id);
                 analyzer.insert_and_allocate(id);
-                analyzer.x_eq_y(id, VarId::Local(local_def_id, 0));
+                analyzer.x_eq_y(id, VarId::Local(CallString::Empty, local_def_id, 0));
             }
             ItemKind::Fn(_, _, _) => {
                 let body = tcx.optimized_mir(def_id);
                 let local_decls = body.local_decls.len();
 
                 for i in 0..local_decls {
-                    let id = VarId::Local(local_def_id, i as _);
+                    let id = VarId::Local(CallString::Empty, local_def_id, i as _);
                     analyzer.insert_and_allocate(id);
                 }
 
-                let id = VarId::Global(local_def_id);
+                let id = VarId::Global(CallString::Empty, local_def_id);
                 analyzer.insert_and_allocate(id);
                 analyzer.x_eq_fn(id, local_def_id, body.arg_count);
             }
@@ -123,17 +123,36 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallString {
+    Empty,
+    Single(LocalDefId, BasicBlock),
+}
+
+impl std::fmt::Debug for CallString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallString::Empty => write!(f, "ε"),
+            CallString::Single(id, bb) => {
+                write!(f, "{:?}:{:?}", id.local_def_index.index(), bb.index())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarId {
-    Global(LocalDefId),
-    Local(LocalDefId, u32),
+    Global(CallString, LocalDefId),
+    Local(CallString, LocalDefId, u32),
     Temp(usize),
 }
 
 impl std::fmt::Debug for VarId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Global(id) => write!(f, "#{:?}", id.local_def_index.index()),
-            Self::Local(id, i) => write!(f, "#{:?}_{}", id.local_def_index.index(), i),
+            Self::Global(cs, id) => write!(f, "[{:?}]#{:?}", cs, id.local_def_index.index()),
+            Self::Local(cs, id, i) => {
+                write!(f, "[{:?}]#{:?}_{}", cs, id.local_def_index.index(), i)
+            }
             Self::Temp(i) => write!(f, "#t{}", i),
         }
     }
@@ -436,12 +455,12 @@ impl std::fmt::Debug for AnalysisResults {
 impl AnalysisResults {
     #[inline]
     pub fn local(&self, f: LocalDefId, i: u32) -> VarId {
-        self.vars[&VarId::Local(f, i)]
+        self.vars[&VarId::Local(CallString::Empty, f, i)]
     }
 
     #[inline]
     pub fn global(&self, f: LocalDefId) -> VarId {
-        self.vars[&VarId::Global(f)]
+        self.vars[&VarId::Global(CallString::Empty, f)]
     }
 
     #[inline]
@@ -505,7 +524,7 @@ pub struct MayAlias {
 
 impl AliasGraph {
     pub fn find_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<MayAlias> {
-        let id = VarId::Local(f, l.as_u32());
+        let id = VarId::Local(CallString::Empty, f, l.as_u32());
         let node = self.id_to_node[&id];
         let pointed_node = self.points_to[&node];
 
@@ -519,7 +538,7 @@ impl AliasGraph {
             for (node, depth) in remainings {
                 done.insert(node);
                 for node in &self.node_to_ids[&node] {
-                    let VarId::Local(f, l) = *node else { continue };
+                    let VarId::Local(_, f, l) = *node else { continue };
                     let alias = MayAlias {
                         function: f,
                         local: Local::from_u32(l),
@@ -547,14 +566,14 @@ impl AliasGraph {
         l: Local,
         tcx: TyCtxt<'_>,
     ) -> HashSet<LocalDefId> {
-        let id = VarId::Local(f, l.as_u32());
+        let id = VarId::Local(CallString::Empty, f, l.as_u32());
         let node = self.id_to_node[&id];
         let pointed_fn = self.points_to_fn[&node];
         let nodes = &self.fn_pointed_by[&pointed_fn];
         nodes
             .iter()
             .filter_map(|node| {
-                let VarId::Global(f) = node else { return None };
+                let VarId::Global(_, f) = node else { return None };
                 let node = tcx.hir().find_by_def_id(*f).unwrap();
                 if matches!(
                     node,
@@ -590,7 +609,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
 
     fn transfer_stmt(&mut self, func: LocalDefId, stmt: &Statement<'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
-        let l_id = VarId::Local(func, l.local.as_u32());
+        let l_id = VarId::Local(CallString::Empty, func, l.local.as_u32());
         let l_deref = l.is_indirect_first_projection();
         match r {
             Rvalue::Use(r)
@@ -599,7 +618,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             | Rvalue::UnaryOp(_, r) => self.transfer_operand(func, l_id, l_deref, r),
             Rvalue::Ref(_, _, r) => {
                 assert!(!l_deref);
-                let r_id = VarId::Local(func, r.local.as_u32());
+                let r_id = VarId::Local(CallString::Empty, func, r.local.as_u32());
                 if r.is_indirect_first_projection() {
                     self.x_eq_y(l_id, r_id);
                 } else {
@@ -608,13 +627,13 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             }
             Rvalue::ThreadLocalRef(def_id) => {
                 assert!(!l_deref);
-                let r_id = VarId::Global(def_id.as_local().unwrap());
+                let r_id = VarId::Global(CallString::Empty, def_id.as_local().unwrap());
                 self.x_eq_ref_y(l_id, r_id);
             }
             Rvalue::AddressOf(_, r) => {
                 assert!(!l_deref);
                 assert!(r.is_indirect_first_projection());
-                let r_id = VarId::Local(func, r.local.as_u32());
+                let r_id = VarId::Local(CallString::Empty, func, r.local.as_u32());
                 self.x_eq_y(l_id, r_id);
             }
             Rvalue::Len(_) => unreachable!(),
@@ -637,7 +656,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
                 assert!(!l_deref);
-                let r_id = VarId::Local(func, r.local.as_u32());
+                let r_id = VarId::Local(CallString::Empty, func, r.local.as_u32());
                 if r.is_indirect_first_projection() {
                     self.x_eq_deref_y(l_id, r_id);
                 } else {
@@ -651,7 +670,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         match r {
             Operand::Copy(r) | Operand::Move(r) => {
                 let r_deref = r.is_indirect_first_projection();
-                let r_id = VarId::Local(func, r.local.as_u32());
+                let r_id = VarId::Local(CallString::Empty, func, r.local.as_u32());
                 match (l_deref, r_deref) {
                     (false, false) => self.x_eq_y(l_id, r_id),
                     (false, true) => self.x_eq_deref_y(l_id, r_id),
@@ -667,7 +686,8 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                         Scalar::Int(_) => {}
                         Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
                             GlobalAlloc::Static(def_id) => {
-                                let r_id = VarId::Global(def_id.as_local().unwrap());
+                                let r_id =
+                                    VarId::Global(CallString::Empty, def_id.as_local().unwrap());
                                 assert!(!l_deref);
                                 self.x_eq_ref_y(l_id, r_id);
                             }
@@ -681,7 +701,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                         let name = self.def_id_to_string(*def_id);
                         if !name.contains("{extern#") {
-                            let r_id = VarId::Global(def_id.as_local().unwrap());
+                            let r_id = VarId::Global(CallString::Empty, def_id.as_local().unwrap());
                             assert!(!l_deref);
                             self.x_eq_y(l_id, r_id);
                         }
@@ -704,12 +724,12 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             return;
         };
         assert!(!destination.is_indirect_first_projection());
-        let d_id = VarId::Local(caller, destination.local.as_u32());
+        let d_id = VarId::Local(CallString::Empty, caller, destination.local.as_u32());
 
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
                 assert!(!func.is_indirect_first_projection());
-                let callee = VarId::Local(caller, func.local.as_u32());
+                let callee = VarId::Local(CallString::Empty, caller, func.local.as_u32());
                 self.transfer_intra_call(caller, callee, args, d_id);
             }
             Operand::Constant(box constant) => {
@@ -733,7 +753,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     } else if seg1.contains("{extern#") {
                         self.transfer_c_call(caller, seg0, inputs, output, args, d_id);
                     } else {
-                        let callee = VarId::Global(local_def_id);
+                        let callee = VarId::Global(CallString::Empty, local_def_id);
                         self.transfer_intra_call(caller, callee, args, d_id);
                     }
                 } else {
@@ -770,7 +790,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             match a {
                 Operand::Copy(a) | Operand::Move(a) => {
                     assert!(!a.is_indirect_first_projection());
-                    let a_id = VarId::Local(caller, a.local.as_u32());
+                    let a_id = VarId::Local(CallString::Empty, caller, a.local.as_u32());
                     let (vt, ft) = self.variable_type(a_id);
                     self.var_cond_join(p.var_ty, vt);
                     self.fn_cond_join(p.fn_ty, ft);
@@ -814,16 +834,16 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             let r = args[0].place().unwrap();
             assert!(!l.is_indirect_first_projection());
             assert!(!r.is_indirect_first_projection());
-            let l_id = VarId::Local(caller, l.local.as_u32());
-            let r_id = VarId::Local(caller, r.local.as_u32());
+            let l_id = VarId::Local(CallString::Empty, caller, l.local.as_u32());
+            let r_id = VarId::Local(CallString::Empty, caller, r.local.as_u32());
             self.deref_x_eq_deref_y(l_id, r_id);
         } else if COPY_C_FNS.contains(name) {
             let l = args[0].place().unwrap();
             let r = args[1].place().unwrap();
             assert!(!l.is_indirect_first_projection());
             assert!(!r.is_indirect_first_projection());
-            let l_id = VarId::Local(caller, l.local.as_u32());
-            let r_id = VarId::Local(caller, r.local.as_u32());
+            let l_id = VarId::Local(CallString::Empty, caller, l.local.as_u32());
+            let r_id = VarId::Local(CallString::Empty, caller, r.local.as_u32());
             self.deref_x_eq_deref_y(l_id, r_id);
             self.x_eq_y(dst, l_id);
         } else {
@@ -857,7 +877,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             ("", "", "ptr", "write_volatile") => {
                 let l = args[0].place().unwrap();
                 assert!(!l.is_indirect_first_projection());
-                let l_id = VarId::Local(caller, l.local.as_u32());
+                let l_id = VarId::Local(CallString::Empty, caller, l.local.as_u32());
                 self.transfer_operand(caller, l_id, true, &args[1]);
             }
             ("", "clone", "Clone", "clone")
@@ -866,7 +886,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             | ("", "", "ptr", "read_volatile") => {
                 let a = args[0].place().unwrap();
                 assert!(!a.is_indirect_first_projection());
-                let a_id = VarId::Local(caller, a.local.as_u32());
+                let a_id = VarId::Local(CallString::Empty, caller, a.local.as_u32());
                 self.x_eq_deref_y(dst, a_id);
             }
             ("", "", "vec", "from_elem") => {
@@ -877,8 +897,8 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let r = args[1].place().unwrap();
                 assert!(!l.is_indirect_first_projection());
                 assert!(!r.is_indirect_first_projection());
-                let l_id = VarId::Local(caller, l.local.as_u32());
-                let r_id = VarId::Local(caller, r.local.as_u32());
+                let l_id = VarId::Local(CallString::Empty, caller, l.local.as_u32());
+                let r_id = VarId::Local(CallString::Empty, caller, r.local.as_u32());
                 self.deref_x_eq_deref_y(l_id, r_id);
                 self.x_eq_y(dst, l_id);
             }
@@ -1040,11 +1060,12 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
     fn x_eq_fn(&mut self, x: VarId, func: LocalDefId, args: usize) {
         let args = (1..=args)
             .map(|i| {
-                let (var_ty, fn_ty) = self.variable_type(VarId::Local(func, i as _));
+                let (var_ty, fn_ty) =
+                    self.variable_type(VarId::Local(CallString::Empty, func, i as _));
                 Type { var_ty, fn_ty }
             })
             .collect();
-        let (var_ty, fn_ty) = self.variable_type(VarId::Local(func, 0));
+        let (var_ty, fn_ty) = self.variable_type(VarId::Local(CallString::Empty, func, 0));
         let ret = Type { var_ty, fn_ty };
         let t = FnType::Lambda(args, ret);
 

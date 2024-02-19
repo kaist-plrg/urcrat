@@ -880,7 +880,7 @@ fn test_eq_static() {
         ",
         |_, t, _, tcx| {
             let (def_id, _) = find_item("x", tcx);
-            let x = VarId::Global(def_id);
+            let x = VarId::Global(CallString::Empty, def_id);
             assert_eq!(t[1].var_ty, x);
             assert_eq!(t[2].var_ty, x);
             assert_eq!(t[3].var_ty, x);
@@ -901,7 +901,7 @@ fn test_eq_thread_local_static() {
         ",
         |_, t, _, tcx| {
             let (def_id, _) = find_item("x", tcx);
-            let x = VarId::Global(def_id);
+            let x = VarId::Global(CallString::Empty, def_id);
             assert_eq!(t[1].var_ty, x);
             assert_eq!(t[2].var_ty, x);
             assert_eq!(t[3].var_ty, x);
