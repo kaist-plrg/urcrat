@@ -207,41 +207,55 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => OpVal::Other,
-                ConstantKind::Val(value, ty) => match value {
-                    ConstValue::Scalar(scalar) => match scalar {
-                        Scalar::Int(i) => match ty.kind() {
-                            TyKind::Int(int_ty) => {
-                                let v = match int_ty {
-                                    IntTy::Isize => i.try_to_i64().unwrap() as _,
-                                    IntTy::I8 => i.try_to_i8().unwrap() as _,
-                                    IntTy::I16 => i.try_to_i16().unwrap() as _,
-                                    IntTy::I32 => i.try_to_i32().unwrap() as _,
-                                    IntTy::I64 => i.try_to_i64().unwrap() as _,
-                                    IntTy::I128 => i.try_to_i128().unwrap() as _,
-                                };
-                                OpVal::Int(v)
-                            }
-                            TyKind::Uint(uint_ty) => {
-                                let v = match uint_ty {
-                                    UintTy::Usize => i.try_to_u64().unwrap() as _,
-                                    UintTy::U8 => i.try_to_u8().unwrap() as _,
-                                    UintTy::U16 => i.try_to_u16().unwrap() as _,
-                                    UintTy::U32 => i.try_to_u32().unwrap() as _,
-                                    UintTy::U64 => i.try_to_u64().unwrap() as _,
-                                    UintTy::U128 => i.try_to_u128().unwrap(),
-                                };
-                                OpVal::Int(v)
-                            }
-                            _ => OpVal::Other,
-                        },
-                        Scalar::Ptr(_, _) => OpVal::Other,
-                    },
-                    ConstValue::ZeroSized => OpVal::Other,
-                    ConstValue::Slice { .. } => unreachable!(),
-                    ConstValue::ByRef { .. } => unreachable!(),
-                },
+                ConstantKind::Unevaluated(constant, ty) => {
+                    if ty.is_integral() {
+                        if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
+                            self.transfer_const_value(v, ty)
+                        } else {
+                            OpVal::Other
+                        }
+                    } else {
+                        OpVal::Other
+                    }
+                }
+                ConstantKind::Val(value, ty) => self.transfer_const_value(value, ty),
             },
+        }
+    }
+
+    fn transfer_const_value(&self, value: ConstValue<'_>, ty: Ty<'_>) -> OpVal {
+        match value {
+            ConstValue::Scalar(scalar) => match scalar {
+                Scalar::Int(i) => match ty.kind() {
+                    TyKind::Int(int_ty) => {
+                        let v = match int_ty {
+                            IntTy::Isize => i.try_to_i64().unwrap() as _,
+                            IntTy::I8 => i.try_to_i8().unwrap() as _,
+                            IntTy::I16 => i.try_to_i16().unwrap() as _,
+                            IntTy::I32 => i.try_to_i32().unwrap() as _,
+                            IntTy::I64 => i.try_to_i64().unwrap() as _,
+                            IntTy::I128 => i.try_to_i128().unwrap() as _,
+                        };
+                        OpVal::Int(v)
+                    }
+                    TyKind::Uint(uint_ty) => {
+                        let v = match uint_ty {
+                            UintTy::Usize => i.try_to_u64().unwrap() as _,
+                            UintTy::U8 => i.try_to_u8().unwrap() as _,
+                            UintTy::U16 => i.try_to_u16().unwrap() as _,
+                            UintTy::U32 => i.try_to_u32().unwrap() as _,
+                            UintTy::U64 => i.try_to_u64().unwrap() as _,
+                            UintTy::U128 => i.try_to_u128().unwrap(),
+                        };
+                        OpVal::Int(v)
+                    }
+                    _ => OpVal::Other,
+                },
+                Scalar::Ptr(_, _) => OpVal::Other,
+            },
+            ConstValue::ZeroSized => OpVal::Other,
+            ConstValue::Slice { .. } => unreachable!(),
+            ConstValue::ByRef { .. } => unreachable!(),
         }
     }
 
