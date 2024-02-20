@@ -360,7 +360,7 @@ impl Obj {
         fs.get(&AccElem::Int(i)).unwrap()
     }
 
-    pub fn symbolic_obj(&self, index: &[usize]) -> Option<&Obj> {
+    pub fn symbolic(&self, index: &[usize]) -> Option<&Obj> {
         let Obj::Compound(fs) = self else { panic!() };
         let index = index.iter().copied().map(Local::from_usize).collect();
         fs.get(&AccElem::Symbolic(index))
@@ -368,6 +368,7 @@ impl Obj {
 }
 
 #[derive(Clone, PartialEq, Eq, Default)]
+#[repr(transparent)]
 pub struct Node {
     pub obj: Obj,
 }
@@ -378,22 +379,24 @@ impl std::fmt::Debug for Node {
     }
 }
 
+impl std::ops::Deref for Node {
+    type Target = Obj;
+
+    fn deref(&self) -> &Self::Target {
+        &self.obj
+    }
+}
+
+impl std::ops::DerefMut for Node {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.obj
+    }
+}
+
 impl Node {
     #[inline]
     fn new(obj: Obj) -> Self {
         Self { obj }
-    }
-
-    pub fn as_ptr(&self) -> &AbsLoc {
-        self.obj.as_ptr()
-    }
-
-    pub fn field(&self, i: u128) -> &Obj {
-        self.obj.field(i)
-    }
-
-    pub fn symbolic(&self, index: &[usize]) -> Option<&Obj> {
-        self.obj.symbolic_obj(index)
     }
 }
 
@@ -467,7 +470,7 @@ impl Graph {
             let node1 = &self.nodes[id1];
             let node2 = &other.nodes[id2];
 
-            if !ord_objs(&node1.obj, &node2.obj, &mut id_set, &mut remaining) {
+            if !ord_objs(node1, node2, &mut id_set, &mut remaining) {
                 return false;
             }
         }
@@ -533,11 +536,11 @@ impl Graph {
             let mut loc = self.get_pointed_loc(*id, &[])?;
             loc.projection.extend(x.projection.to_owned());
             let node = &self.nodes[loc.root];
-            node.obj.project(&loc.projection)
+            node.project(&loc.projection)
         } else {
             let id = self.locals.get(&x.local)?;
             let node = &self.nodes[*id];
-            node.obj.project(&x.projection)
+            node.project(&x.projection)
         }
     }
 
@@ -547,10 +550,10 @@ impl Graph {
             let mut loc = self.get_pointed_loc_mut(id, &[], true);
             loc.projection.extend(x.projection.to_owned());
             let node = &mut self.nodes[loc.root];
-            node.obj.project_mut(&loc.projection, true)
+            node.project_mut(&loc.projection, true)
         } else {
             let (_, node) = self.get_local_node_mut(x.local);
-            node.obj.project_mut(&x.projection, true)
+            node.project_mut(&x.projection, true)
         }
     }
 
@@ -662,13 +665,13 @@ impl Graph {
 
     fn substitute(&mut self, old_loc: &AbsLoc, new_loc: &AbsLoc) {
         for node in &mut self.nodes {
-            node.obj.substitute(old_loc, new_loc);
+            node.substitute(old_loc, new_loc);
         }
     }
 
     fn extend_loc(&mut self, loc: &AbsLoc) {
         for node in &mut self.nodes {
-            node.obj.extend_loc(loc);
+            node.extend_loc(loc);
         }
     }
 
@@ -725,18 +728,18 @@ impl Graph {
 
     pub fn invalidate_symbolic(&mut self, local: Local) {
         for node in &mut self.nodes {
-            node.obj.invalidate_symbolic(local);
+            node.invalidate_symbolic(local);
         }
     }
 
     fn get_pointed_loc(&self, node_id: NodeId, proj: &[AccElem]) -> Option<AbsLoc> {
-        let obj = self.nodes[node_id].obj.project(proj)?;
+        let obj = self.nodes[node_id].project(proj)?;
         let Obj::Ptr(loc) = obj else { return None };
         Some(loc.clone())
     }
 
     fn get_pointed_loc_mut(&mut self, node_id: NodeId, proj: &[AccElem], write: bool) -> AbsLoc {
-        self.set_obj_ptr(|this| this.nodes[node_id].obj.project_mut(proj, write))
+        self.set_obj_ptr(|this| this.nodes[node_id].project_mut(proj, write))
     }
 
     #[inline]
@@ -764,11 +767,11 @@ impl Graph {
     }
 
     pub fn obj_at_location(&self, loc: &AbsLoc) -> Option<&Obj> {
-        self.nodes[loc.root].obj.project(&loc.projection)
+        self.nodes[loc.root].project(&loc.projection)
     }
 
     fn obj_at_location_mut(&mut self, loc: &AbsLoc, write: bool) -> &mut Obj {
-        self.nodes[loc.root].obj.project_mut(&loc.projection, write)
+        self.nodes[loc.root].project_mut(&loc.projection, write)
     }
 
     pub fn invalidate_deref(&mut self, local: Local, mut depth: usize, opt_id: Option<usize>) {
@@ -807,11 +810,7 @@ impl Graph {
     }
 
     fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
-        let locals: HashSet<_> = self
-            .nodes
-            .iter()
-            .flat_map(|node| node.obj.locals())
-            .collect();
+        let locals: HashSet<_> = self.nodes.iter().flat_map(|node| node.locals()).collect();
         self.locals
             .retain(|local, _| !dead_locals.contains(*local) || locals.contains(local));
     }
