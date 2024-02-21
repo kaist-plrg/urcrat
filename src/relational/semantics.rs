@@ -398,7 +398,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 assert_eq!(code, "BitfieldStruct");
                                 true
                             } else if seg1.contains("{extern#") {
-                                self.transfer_c_call(inputs, args, &mut state);
+                                self.transfer_c_call(seg0, inputs, args, &mut state);
                                 true
                             } else {
                                 self.transfer_intra_call(
@@ -440,7 +440,16 @@ impl<'tcx> Analyzer<'tcx, '_> {
         }
     }
 
-    fn transfer_c_call(&self, inputs: &[Ty<'_>], args: &[Operand<'_>], state: &mut AbsMem) {
+    fn transfer_c_call(
+        &self,
+        name: &str,
+        inputs: &[Ty<'_>],
+        args: &[Operand<'_>],
+        state: &mut AbsMem,
+    ) {
+        if name == "realloc" || name == "free" {
+            return;
+        }
         let graph = state.gm();
         for (ty, arg) in inputs.iter().zip(args) {
             if ty.is_mutable_ptr() {
