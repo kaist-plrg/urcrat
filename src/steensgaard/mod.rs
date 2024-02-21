@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
 };
 
@@ -237,6 +237,31 @@ pub enum CallStr {
     Single(LocalDefId, BasicBlock),
 }
 
+impl PartialOrd for CallStr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CallStr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+
+        use rustc_index::Idx;
+        match (self, other) {
+            (Self::Empty, Self::Empty) => Equal,
+            (Self::Empty, Self::Single(_, _)) => Less,
+            (Self::Single(_, _), Self::Empty) => Greater,
+            (Self::Single(id1, bb1), Self::Single(id2, bb2)) => {
+                match id1.index().cmp(&id2.index()) {
+                    Equal => bb1.cmp(bb2),
+                    x => x,
+                }
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for CallStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -267,8 +292,40 @@ impl std::fmt::Debug for VarId {
     }
 }
 
+impl PartialOrd for VarId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VarId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+
+        use rustc_index::Idx;
+        match (self, other) {
+            (Self::Global(cs1, id1), Self::Global(cs2, id2)) => match cs1.cmp(cs2) {
+                Equal => id1.index().cmp(&id2.index()),
+                x => x,
+            },
+            (Self::Global(_, _), _) => Less,
+            (Self::Local(_, _, _), Self::Global(_, _)) => Greater,
+            (Self::Local(cs1, id1, l1), Self::Local(cs2, id2, l2)) => match cs1.cmp(cs2) {
+                Equal => match id1.index().cmp(&id2.index()) {
+                    Equal => l1.cmp(l2),
+                    x => x,
+                },
+                x => x,
+            },
+            (Self::Local(_, _, _), _) => Less,
+            (Self::Temp(i1), Self::Temp(i2)) => i1.cmp(i2),
+            (Self::Temp(_), _) => Greater,
+        }
+    }
+}
+
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FnId(usize);
 
 impl std::fmt::Debug for FnId {
@@ -539,7 +596,7 @@ pub struct AnalysisResults {
 
 impl std::fmt::Debug for AnalysisResults {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut inv_vars: HashMap<_, HashSet<_>> = HashMap::new();
+        let mut inv_vars: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
         for (k, v) in &self.vars {
             inv_vars.entry(v).or_default().insert(k);
         }
@@ -548,7 +605,7 @@ impl std::fmt::Debug for AnalysisResults {
             writeln!(f, "{:?}: {:?}", ids, ty)?;
         }
 
-        let mut inv_fns: HashMap<_, HashSet<_>> = HashMap::new();
+        let mut inv_fns: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
         for (k, v) in &self.fns {
             inv_fns.entry(v).or_default().insert(k);
         }
