@@ -638,6 +638,14 @@ impl AnalysisResults {
 
     pub fn get_alias_graph(&self) -> AliasGraph {
         let id_to_node = self.vars.clone();
+        let mut local_to_nodes: HashMap<_, HashSet<_>> = HashMap::new();
+        for (id, node) in &id_to_node {
+            let VarId::Local(_, local_def_id, local) = id else { continue };
+            local_to_nodes
+                .entry((*local_def_id, *local))
+                .or_default()
+                .insert(*node);
+        }
         let node_to_ids = inv(&id_to_node);
         let (points_to, points_to_fn): (HashMap<_, _>, HashMap<_, _>) = self
             .var_tys
@@ -651,6 +659,7 @@ impl AnalysisResults {
         let pointed_by_fn = inv(&points_to_fn);
         AliasGraph {
             id_to_node,
+            local_to_nodes,
             node_to_ids,
             points_to,
             pointed_by,
@@ -675,6 +684,7 @@ where
 #[derive(Debug)]
 pub struct AliasGraph {
     id_to_node: HashMap<VarId, VarId>,
+    local_to_nodes: HashMap<(LocalDefId, u32), HashSet<VarId>>,
     node_to_ids: HashMap<VarId, HashSet<VarId>>,
     points_to: HashMap<VarId, VarId>,
     pointed_by: HashMap<VarId, HashSet<VarId>>,
@@ -682,25 +692,23 @@ pub struct AliasGraph {
     fn_pointed_by: HashMap<FnId, HashSet<VarId>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MayAlias {
-    pub function: LocalDefId,
-    pub local: Local,
-    pub depth: usize,
-}
-
 impl AliasGraph {
-    pub fn find_may_aliases(&self, f: LocalDefId, l: Local) -> HashSet<MayAlias> {
+    pub fn find_may_aliases(
+        &self,
+        fls: &[(LocalDefId, Local)],
+        caller: LocalDefId,
+    ) -> HashSet<(Local, usize)> {
         let mut aliases = HashSet::new();
         let mut done = HashSet::new();
-        let mut remainings = HashSet::new();
 
-        for (id, node) in &self.id_to_node {
-            let VarId::Local(_, local_def_id, local) = id else { continue };
-            if *local_def_id == f && *local == l.as_u32() {
-                remainings.insert((self.points_to[node], 0));
-            }
-        }
+        let mut remainings: HashSet<_> = fls
+            .iter()
+            .flat_map(|(local_def_id, local)| {
+                self.local_to_nodes[&(*local_def_id, local.as_u32())]
+                    .iter()
+                    .map(|node| (self.points_to[node], 0))
+            })
+            .collect();
 
         while !remainings.is_empty() {
             let mut new_remainings = HashSet::new();
@@ -708,12 +716,9 @@ impl AliasGraph {
                 done.insert(node);
                 for node in &self.node_to_ids[&node] {
                     let VarId::Local(_, f, l) = *node else { continue };
-                    let alias = MayAlias {
-                        function: f,
-                        local: Local::from_u32(l),
-                        depth,
-                    };
-                    aliases.insert(alias);
+                    if f == caller {
+                        aliases.insert((Local::from_u32(l), depth));
+                    }
                 }
                 if let Some(nodes) = self.pointed_by.get(&node) {
                     for node in nodes {

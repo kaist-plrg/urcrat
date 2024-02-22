@@ -224,41 +224,23 @@ impl<'tcx> Analyzer<'tcx, '_> {
     }
 
     pub fn locals_invalidated_by_call(&self, callee: LocalDefId) -> HashSet<(Local, usize)> {
-        self.prog_info.reachability[&callee]
+        let fls: Vec<_> = self.prog_info.reachability[&callee]
             .iter()
             .flat_map(|func| {
                 self.prog_info.indirect_assigns[func]
                     .iter()
-                    .flat_map(|local| {
-                        self.prog_info
-                            .alias_graph
-                            .find_may_aliases(*func, *local)
-                            .into_iter()
-                            .filter_map(|alias| {
-                                if alias.function == self.local_def_id {
-                                    Some((alias.local, alias.depth))
-                                } else {
-                                    None
-                                }
-                            })
-                    })
+                    .map(|local| (*func, *local))
             })
-            .collect()
+            .collect();
+        self.prog_info
+            .alias_graph
+            .find_may_aliases(&fls, self.local_def_id)
     }
 
     pub fn find_may_aliases(&self, local: Local) -> HashSet<(Local, usize)> {
         self.prog_info
             .alias_graph
-            .find_may_aliases(self.local_def_id, local)
-            .into_iter()
-            .filter_map(|alias| {
-                if alias.function == self.local_def_id {
-                    Some((alias.local, alias.depth))
-                } else {
-                    None
-                }
-            })
-            .collect()
+            .find_may_aliases(&[(self.local_def_id, local)], self.local_def_id)
     }
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
