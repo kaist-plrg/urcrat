@@ -7,6 +7,8 @@ use urcrat::*;
 struct Args {
     #[arg(short, long)]
     log_file: Option<PathBuf>,
+    #[arg(short, long)]
+    include_union: Vec<String>,
     input: PathBuf,
 }
 
@@ -23,6 +25,8 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    // relational::analyze_path(&file);
-    analysis::analyze_path(&file);
+    let conf = analysis::Config {
+        unions: args.include_union.into_iter().collect(),
+    };
+    analysis::analyze_path(&file, &conf);
 }
