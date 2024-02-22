@@ -51,10 +51,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
-        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
-            continue;
-        }
-        let body = tcx.optimized_mir(def_id);
+        let body = match item.kind {
+            ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
+            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+            _ => continue,
+        };
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
         for (bb, callee) in visitor.calls {

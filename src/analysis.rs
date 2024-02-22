@@ -61,7 +61,7 @@ pub fn analyze(tcx: TyCtxt<'_>) {
                 println!("{:?} {:?}", access.location, body.stmt_at(access.location));
                 // println!("{:?}", state);
                 if let Some(obj) = obj {
-                    let Obj::Compound(fields) = obj else { unreachable!() };
+                    let Obj::Compound(fields) = obj else { continue };
                     for (i, obj) in fields {
                         if let Obj::Ptr(loc) = obj {
                             if let Some(obj) = g.obj_at_location(loc) {
