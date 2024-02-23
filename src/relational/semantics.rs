@@ -88,7 +88,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             Rvalue::Repeat(r, len) => {
                 let r = self.transfer_op(r, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
-                for i in 0..len {
+                for i in 0..len.min(10) {
                     let l = l.extended(&[AccElem::Int(i as _)]);
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);

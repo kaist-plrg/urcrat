@@ -304,7 +304,7 @@ impl TyStructure {
                     .unwrap()
                     .try_to_u64()
                     .unwrap() as usize;
-                Self::Array(Box::new(Self::from_ty(*ty, def_id, tcx)), len)
+                Self::Array(Box::new(Self::from_ty(*ty, def_id, tcx)), len.min(10))
             }
             _ => Self::Leaf,
         }
@@ -333,7 +333,7 @@ fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
         TyStructure::Array(box ty, len) => {
             if let Some(elem) = proj.get(0) {
                 if let AccElem::Int(n) = elem {
-                    assert!(*n < *len as u128);
+                    assert!(*n < *len as u128, "{} {}", n, len);
                 }
                 get_path_suffixes(ty, &proj[1..])
             } else {
