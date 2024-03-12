@@ -52,6 +52,7 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 pub mod analysis;
+pub mod andersen;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod graph;
