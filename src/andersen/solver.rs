@@ -15,6 +15,12 @@ pub struct Solver {
     worklist: Vec<(Loc, Loc)>,
 }
 
+impl Default for Solver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Solver {
     pub fn new() -> Self {
         Self {

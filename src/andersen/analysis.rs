@@ -14,7 +14,6 @@ use rustc_middle::{
     ty::{IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::DefId;
 
 use super::*;
 use crate::compile_util;
@@ -290,16 +289,16 @@ impl<'tcx> Analyzer<'tcx> {
 
     fn transfer_term(
         &mut self,
-        term: &Terminator<'tcx>,
-        local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-        owner: LocalDefId,
-        location: Location,
+        _term: &Terminator<'tcx>,
+        _local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
+        _owner: LocalDefId,
+        _location: Location,
     ) {
     }
 
-    fn def_id_to_string(&self, def_id: DefId) -> String {
-        self.tcx.def_path(def_id).to_string_no_crate_verbose()
-    }
+    // fn def_id_to_string(&self, def_id: DefId) -> String {
+    //     self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    // }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -382,16 +381,6 @@ impl DLoc {
     }
 
     #[inline]
-    fn new_loc(loc: Loc) -> Self {
-        Self::new(false, false, loc)
-    }
-
-    #[inline]
-    fn new_deref(loc: Loc) -> Self {
-        Self::new(false, true, loc)
-    }
-
-    #[inline]
     fn new_ref(loc: Loc) -> Self {
         Self::new(true, false, loc)
     }
@@ -399,12 +388,6 @@ impl DLoc {
     #[inline]
     fn push(mut self, proj: usize) -> Self {
         self.loc = self.loc.push(proj);
-        self
-    }
-
-    #[inline]
-    fn extend<I: IntoIterator<Item = usize>>(mut self, proj: I) -> Self {
-        self.loc = self.loc.extend(proj);
         self
     }
 
