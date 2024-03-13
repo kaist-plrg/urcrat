@@ -1086,7 +1086,7 @@ fn test_call() {
     // _1 = const 0_i32
     // _3 = &mut _1
     // _2 = &raw mut (*_3)
-    // _4 = g(_2) -> [return: bb1, unwind continue]
+    // _4 = g(_2)
     // _5 = const 0_i32
     // _7 = &mut _5
     // _6 = &raw mut (*_7)
@@ -1124,6 +1124,75 @@ fn test_call() {
             assert_eq!(res.get(&ro(g, 2)), None);
             assert_eq!(res.get(&ro(g, 3)), Some(&set([ro(g, 2)])));
             assert_eq!(res.get(&ro(g, 4)), Some(&set([ro(g, 2)])));
+        },
+    );
+}
+
+#[test]
+fn test_fn_ptr_some() {
+    // _0 = _1
+    //
+    // _2 = g as unsafe extern "C" fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _1 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::Some(move _2)
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return x;
+        }
+        ",
+        "",
+        "
+        let mut x: Option::<unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int> = Some(
+            g as unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int,
+        );
+        ",
+        |res, f, tcx| {
+            let g = find("g", tcx);
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&lo(f, 1, [0])), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([gl(g)])));
+        },
+    );
+}
+
+#[test]
+fn test_fn_ptr_after() {
+    // _0 = _1
+    //
+    // _2 = g as unsafe extern "C" fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _1 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::Some(move _2)
+    // _3 = const 0_i32
+    // _5 = &mut _3
+    // _4 = &raw mut (*_5)
+    // _7 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::unwrap(_1)
+    // _6 = move _7(_4)
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return x;
+        }
+        ",
+        "",
+        "
+        let mut x: Option::<unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int> = Some(
+            g as unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int,
+        );
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: *mut libc::c_int = &mut y;
+        let mut w: *mut libc::c_int = x.unwrap()(z);
+        ",
+        |res, f, tcx| {
+            let g = find("g", tcx);
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&lo(f, 1, [0])), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 3)), None);
+            assert_eq!(res.get(&ro(f, 4)), Some(&set([ro(f, 3)])));
+            assert_eq!(res.get(&ro(f, 5)), Some(&set([ro(f, 3)])));
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([ro(f, 3)])));
+            assert_eq!(res.get(&ro(f, 7)), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(g, 0)), Some(&set([ro(f, 3)])));
+            assert_eq!(res.get(&ro(g, 1)), Some(&set([ro(f, 3)])));
         },
     );
 }

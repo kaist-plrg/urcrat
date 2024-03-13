@@ -313,11 +313,18 @@ impl<'tcx> Analyzer<'tcx> {
         else {
             return;
         };
-        let dst = DLoc::from_place(*destination, ctx.owner);
+        assert!(destination.projection.is_empty());
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
-                // assert!(!func.is_indirect_first_projection());
-                // self.transfer_intra_call(cstr, caller, callee, args, d_id);
+                assert!(func.projection.is_empty());
+                let func = DLoc::from_place(*func, ctx.owner);
+                if let Some(callees) = self.solver.solution(&func.loc) {
+                    for callee in callees.clone() {
+                        assert!(callee.projection.is_empty());
+                        let LocRoot::Global(local_def_id) = callee.root else { panic!() };
+                        self.transfer_intra_call(args, *destination, local_def_id, ctx);
+                    }
+                }
             }
             Operand::Constant(box constant) => {
                 let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
@@ -329,9 +336,6 @@ impl<'tcx> Analyzer<'tcx> {
                 let seg1 = segs.pop().unwrap_or_default();
                 let seg2 = segs.pop().unwrap_or_default();
                 let seg3 = segs.pop().unwrap_or_default();
-                let sig = self.tcx.fn_sig(def_id).skip_binder();
-                let inputs = sig.inputs().skip_binder();
-                let output = sig.output().skip_binder();
                 if let Some(local_def_id) = def_id.as_local() {
                     if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
                         let span = self.tcx.span_of_impl(impl_def_id).unwrap();
@@ -340,18 +344,10 @@ impl<'tcx> Analyzer<'tcx> {
                     } else if seg1.contains("{extern#") {
                         // self.transfer_c_call(cstr, caller, seg0, inputs, output, args, d_id);
                     } else {
-                        self.transfer_intra_call(args, dst, local_def_id, inputs, output, ctx);
+                        self.transfer_intra_call(args, *destination, local_def_id, ctx);
                     }
                 } else {
-                    // self.transfer_rust_call(
-                    //     cstr,
-                    //     caller,
-                    //     (seg3, seg2, seg1, seg0),
-                    //     inputs,
-                    //     output,
-                    //     args,
-                    //     d_id,
-                    // );
+                    self.transfer_rust_call(args, *destination, (seg3, seg2, seg1, seg0), ctx);
                 }
             }
         }
@@ -360,12 +356,12 @@ impl<'tcx> Analyzer<'tcx> {
     fn transfer_intra_call(
         &mut self,
         args: &[Operand<'tcx>],
-        dst: DLoc,
+        dst: Place<'tcx>,
         callee: LocalDefId,
-        inputs: &[Ty<'tcx>],
-        output: Ty<'tcx>,
         ctx: Context<'_, 'tcx>,
     ) {
+        let inputs = self.get_input_tys(callee.to_def_id());
+
         for (i, (ty, arg)) in inputs.iter().zip(args).enumerate() {
             let arg = some_or!(self.transfer_op(arg, ctx), continue);
             let root = LocRoot::Local(callee, Local::from_usize(i + 1));
@@ -377,11 +373,56 @@ impl<'tcx> Analyzer<'tcx> {
         let root = LocRoot::Local(callee, Local::from_usize(0));
         let loc = Loc::new_root(root);
         let ret = DLoc::new_loc(loc);
+        let output = dst.ty(ctx.locals, self.tcx).ty;
+        let dst = DLoc::from_place(dst, ctx.owner);
         self.transfer_assign(dst, ret, output);
+    }
+
+    fn transfer_rust_call(
+        &mut self,
+        args: &[Operand<'tcx>],
+        dst: Place<'tcx>,
+        callee: (&str, &str, &str, &str),
+        ctx: Context<'_, 'tcx>,
+    ) {
+        match callee {
+            ("", "option" | "result", _, "unwrap") => {
+                assert_eq!(args.len(), 1);
+                if let Some(arg) = self.transfer_op(&args[0], ctx) {
+                    let ty = dst.ty(ctx.locals, self.tcx).ty;
+                    let dst = DLoc::from_place(dst, ctx.owner);
+                    self.transfer_assign(dst, arg.push(0), ty);
+                }
+            }
+            (_, "slice", _, "as_ptr" | "as_mut_ptr")
+            | ("ptr", _, _, "offset" | "offset_from")
+            | ("ops", "deref", _, "deref" | "deref_mut")
+            | ("", "vec", _, "as_mut_ptr" | "leak")
+            | ("", "", "ptr", "write_volatile")
+            | ("", "clone", "Clone", "clone")
+            | ("", "ffi", _, "as_va_list")
+            | ("", "ffi", _, "arg")
+            | ("", "", "ptr", "read_volatile")
+            | ("", "", "vec", "from_elem")
+            | ("", "unix", _, "memcpy") => {}
+            ("", "num", _, name) if name.starts_with("overflowing_") => {}
+            (_, _, "AsmCastTrait", _)
+            | ("", "cast", "ToPrimitive", _)
+            | ("", "cmp", "PartialEq", _)
+            | ("", "cmp", "PartialOrd", _)
+            | ("", "convert", _, _)
+            | ("ops", "arith", _, _)
+            | ("", "f128_t", _, _) => {}
+            _ => panic!("{:?}", callee),
+        }
     }
 
     fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    }
+
+    fn get_input_tys(&self, func: DefId) -> &'tcx [Ty<'tcx>] {
+        self.tcx.fn_sig(func).skip_binder().inputs().skip_binder()
     }
 }
 
