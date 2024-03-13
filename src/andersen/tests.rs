@@ -1244,3 +1244,54 @@ fn test_fn_ptr_before() {
         },
     );
 }
+
+#[test]
+fn test_array_as_mut_ptr() {
+    // _1 = [const 0_i32; 2]
+    // _4 = &mut _1
+    // _3 = move _4 as &mut [i32] (PointerCoercion(Unsize))
+    // _2 = core::slice::<impl [i32]>::as_mut_ptr(move _3)
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 2] = [0; 2];
+        let mut y: *mut libc::c_int = x.as_mut_ptr();
+        ",
+        |res, f, _| {
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([lo(f, 1, [0])])));
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 4)), Some(&set([ro(f, 1)])));
+        },
+    );
+}
+
+#[test]
+fn test_array_offset() {
+    // _1 = [const 0_i32; 2]
+    // _7 = &mut _1
+    // _6 = move _7 as &mut [i32] (PointerCoercion(Unsize))
+    // _5 = core::slice::<impl [i32]>::as_mut_ptr(move _6) -> [return: bb1, unwind continue]
+    // _9 = const 1_i32
+    // _8 = move _9 as isize (IntToInt)
+    // _4 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _5, move _8) -> [return: bb2, unwind continue]
+    // _3 = &mut (*_4)
+    // _2 = &raw mut (*_3)
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 2] = [0; 2];
+        let mut y: *mut libc::c_int = &mut *x.as_mut_ptr().offset(1 as libc::c_int as isize)
+            as *mut libc::c_int;
+        ",
+        |res, f, _| {
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([lo(f, 1, [0])])));
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([lo(f, 1, [0])])));
+            assert_eq!(res.get(&ro(f, 4)), Some(&set([lo(f, 1, [0])])));
+            assert_eq!(res.get(&ro(f, 5)), Some(&set([lo(f, 1, [0])])));
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 7)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 8)), None);
+            assert_eq!(res.get(&ro(f, 9)), None);
+        },
+    );
+}

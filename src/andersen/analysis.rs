@@ -350,7 +350,8 @@ impl<'tcx> Analyzer<'tcx> {
                         self.transfer_intra_call(args, dst, output, local_def_id);
                     }
                 } else {
-                    self.transfer_rust_call(args, dst, output, (seg3, seg2, seg1, seg0));
+                    let inputs = self.get_input_tys(*def_id);
+                    self.transfer_rust_call(args, dst, output, inputs, (seg3, seg2, seg1, seg0));
                 }
             }
         }
@@ -384,28 +385,43 @@ impl<'tcx> Analyzer<'tcx> {
         args: Vec<Option<DLoc>>,
         dst: DLoc,
         output: Ty<'tcx>,
+        inputs: &[Ty<'tcx>],
         callee: (&str, &str, &str, &str),
     ) {
+        if (output.is_unit() || output.is_never() || output.is_primitive())
+            && inputs.iter().filter(|t| !t.is_primitive()).count() < 2
+        {
+            return;
+        }
         match callee {
             ("", "option" | "result", _, "unwrap") => {
-                assert_eq!(args.len(), 1);
                 if let Some(arg) = &args[0] {
                     self.transfer_assign(dst, arg.clone().push(0), output);
                 }
             }
-            (_, "slice", _, "as_ptr" | "as_mut_ptr")
-            | ("ptr", _, _, "offset" | "offset_from")
-            | ("ops", "deref", _, "deref" | "deref_mut")
-            | ("", "vec", _, "as_mut_ptr" | "leak")
+            (_, "slice", _, "as_ptr" | "as_mut_ptr") => {
+                if let Some(arg) = &args[0] {
+                    let arg = arg.clone().with_ref(true).with_deref(true).push(0);
+                    self.transfer_assign(dst, arg, output);
+                }
+            }
+            ("ptr", _, _, "offset") => {
+                if let Some(arg) = &args[0] {
+                    self.transfer_assign(dst, arg.clone(), output);
+                }
+            }
+            ("", "unix", _, "memcpy") => todo!(),
+            ("", "num", _, name) if name.starts_with("overflowing_") => {}
+            ("", "vec", _, "leak")
+            | ("", "", "vec", "from_elem")
+            | ("ptr", _, _, "offset_from")
             | ("", "", "ptr", "write_volatile")
+            | ("", "", "ptr", "read_volatile")
+            | ("ops", "deref", _, "deref" | "deref_mut")
             | ("", "clone", "Clone", "clone")
             | ("", "ffi", _, "as_va_list")
             | ("", "ffi", _, "arg")
-            | ("", "", "ptr", "read_volatile")
-            | ("", "", "vec", "from_elem")
-            | ("", "unix", _, "memcpy") => {}
-            ("", "num", _, name) if name.starts_with("overflowing_") => {}
-            (_, _, "AsmCastTrait", _)
+            | (_, _, "AsmCastTrait", _)
             | ("", "cast", "ToPrimitive", _)
             | ("", "cmp", "PartialEq", _)
             | ("", "cmp", "PartialOrd", _)
