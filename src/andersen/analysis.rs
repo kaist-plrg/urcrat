@@ -3,17 +3,19 @@ use std::{
     path::Path,
 };
 
+use etrace::some_or;
 use rustc_hir::{def_id::LocalDefId, ItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
         AggregateKind, ConstantKind, Local, LocalDecl, Location, Operand, Place, PlaceElem, Rvalue,
-        Statement, StatementKind, Terminator,
+        Statement, StatementKind, Terminator, TerminatorKind,
     },
     ty::{IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
 use rustc_session::config::Input;
+use rustc_span::def_id::DefId;
 
 use super::*;
 use crate::compile_util;
@@ -48,24 +50,47 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
             _ => continue,
         };
+        println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for (statement_index, stmt) in bbd.statements.iter().enumerate() {
                 let location = Location {
                     block,
                     statement_index,
                 };
-                println!("{:?}", stmt);
-                analyzer.transfer_stmt(stmt, &body.local_decls, local_def_id, location);
+                let ctx = Context::new(&body.local_decls, local_def_id, location);
+                analyzer.transfer_stmt(stmt, ctx);
             }
             let terminator = bbd.terminator();
             let location = Location {
                 block,
                 statement_index: bbd.statements.len(),
             };
-            analyzer.transfer_term(terminator, &body.local_decls, local_def_id, location);
+            let ctx = Context::new(&body.local_decls, local_def_id, location);
+            analyzer.transfer_term(terminator, ctx);
         }
     }
     analyzer.solver.solutions()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Context<'a, 'tcx> {
+    locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
+    owner: LocalDefId,
+    location: Location,
+}
+
+impl<'a, 'tcx> Context<'a, 'tcx> {
+    fn new(
+        locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
+        owner: LocalDefId,
+        location: Location,
+    ) -> Self {
+        Self {
+            locals,
+            owner,
+            location,
+        }
+    }
 }
 
 struct Analyzer<'tcx> {
@@ -81,30 +106,24 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn transfer_stmt(
-        &mut self,
-        stmt: &Statement<'tcx>,
-        local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-        owner: LocalDefId,
-        location: Location,
-    ) {
+    fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Context<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
-        let ty = l.ty(local_decls, self.tcx).ty;
-        let l = DLoc::from_place(*l, owner);
+        let ty = l.ty(ctx.locals, self.tcx).ty;
+        let l = DLoc::from_place(*l, ctx.owner);
         match r {
             Rvalue::Use(r) => {
-                if let Some(r) = self.transfer_op(r, owner, location) {
+                if let Some(r) = self.transfer_op(r, ctx) {
                     self.transfer_assign(l, r, ty);
                 }
             }
             Rvalue::Repeat(r, _) => {
-                if let Some(r) = self.transfer_op(r, owner, location) {
+                if let Some(r) = self.transfer_op(r, ctx) {
                     let TyKind::Array(ty, _) = ty.kind() else { unreachable!() };
                     self.transfer_assign(l.push(0), r, *ty);
                 }
             }
             Rvalue::Ref(_, _, r) => {
-                let r = DLoc::from_place(*r, owner).with_ref(true);
+                let r = DLoc::from_place(*r, ctx.owner).with_ref(true);
                 self.transfer_assign(l, r, ty);
             }
             Rvalue::ThreadLocalRef(r) => {
@@ -114,12 +133,12 @@ impl<'tcx> Analyzer<'tcx> {
             }
             Rvalue::AddressOf(_, r) => {
                 assert!(r.is_indirect_first_projection());
-                let r = DLoc::from_place(*r, owner).with_deref(false);
+                let r = DLoc::from_place(*r, ctx.owner).with_deref(false);
                 self.transfer_assign(l, r, ty);
             }
             Rvalue::Len(_) => {}
             Rvalue::Cast(_, r, _) => {
-                if let Some(r) = self.transfer_op(r, owner, location) {
+                if let Some(r) = self.transfer_op(r, ctx) {
                     self.transfer_assign(l, r, ty);
                 }
             }
@@ -131,7 +150,7 @@ impl<'tcx> Analyzer<'tcx> {
             Rvalue::Aggregate(box kind, fs) => match kind {
                 AggregateKind::Array(ty) => {
                     for f in fs.iter() {
-                        if let Some(r) = self.transfer_op(f, owner, location) {
+                        if let Some(r) = self.transfer_op(f, ctx) {
                             self.transfer_assign(l.clone().push(0), r, *ty);
                         }
                     }
@@ -140,7 +159,7 @@ impl<'tcx> Analyzer<'tcx> {
                     let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
                     let variant = adt_def.variant(*v_idx);
                     for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
-                        if let Some(r) = self.transfer_op(f, owner, location) {
+                        if let Some(r) = self.transfer_op(f, ctx) {
                             let ty = d.ty(self.tcx, generic_args);
                             let i = if let Some(idx) = idx { *idx } else { i };
                             self.transfer_assign(l.clone().push(i.as_usize()), r, ty);
@@ -151,7 +170,7 @@ impl<'tcx> Analyzer<'tcx> {
             },
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
-                let r = DLoc::from_place(*r, owner);
+                let r = DLoc::from_place(*r, ctx.owner);
                 self.transfer_assign(l, r, ty);
             }
         }
@@ -250,14 +269,11 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn transfer_op(
-        &mut self,
-        op: &Operand<'tcx>,
-        owner: LocalDefId,
-        location: Location,
-    ) -> Option<DLoc> {
+    fn transfer_op(&mut self, op: &Operand<'tcx>, ctx: Context<'_, 'tcx>) -> Option<DLoc> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => Some(DLoc::from_place(*place, owner)),
+            Operand::Copy(place) | Operand::Move(place) => {
+                Some(DLoc::from_place(*place, ctx.owner))
+            }
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
                 ConstantKind::Unevaluated(_, _) => None,
@@ -270,7 +286,7 @@ impl<'tcx> Analyzer<'tcx> {
                                 Some(DLoc::new_ref(loc))
                             }
                             GlobalAlloc::Memory(_) => {
-                                let loc = Loc::new_root(LocRoot::Alloc(owner, location));
+                                let loc = Loc::new_root(LocRoot::Alloc(ctx.owner, ctx.location));
                                 Some(DLoc::new_ref(loc))
                             }
                             _ => unreachable!(),
@@ -287,18 +303,86 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn transfer_term(
-        &mut self,
-        _term: &Terminator<'tcx>,
-        _local_decls: &IndexVec<Local, LocalDecl<'tcx>>,
-        _owner: LocalDefId,
-        _location: Location,
-    ) {
+    fn transfer_term(&mut self, term: &Terminator<'tcx>, ctx: Context<'_, 'tcx>) {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &term.kind
+        else {
+            return;
+        };
+        let dst = DLoc::from_place(*destination, ctx.owner);
+        match func {
+            Operand::Copy(func) | Operand::Move(func) => {
+                // assert!(!func.is_indirect_first_projection());
+                // self.transfer_intra_call(cstr, caller, callee, args, d_id);
+            }
+            Operand::Constant(box constant) => {
+                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                assert!(matches!(value, ConstValue::ZeroSized));
+                let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                let name = self.def_id_to_string(*def_id);
+                let mut segs: Vec<_> = name.split("::").collect();
+                let seg0 = segs.pop().unwrap_or_default();
+                let seg1 = segs.pop().unwrap_or_default();
+                let seg2 = segs.pop().unwrap_or_default();
+                let seg3 = segs.pop().unwrap_or_default();
+                let sig = self.tcx.fn_sig(def_id).skip_binder();
+                let inputs = sig.inputs().skip_binder();
+                let output = sig.output().skip_binder();
+                if let Some(local_def_id) = def_id.as_local() {
+                    if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
+                        let span = self.tcx.span_of_impl(impl_def_id).unwrap();
+                        let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
+                        assert_eq!(code, "BitfieldStruct");
+                    } else if seg1.contains("{extern#") {
+                        // self.transfer_c_call(cstr, caller, seg0, inputs, output, args, d_id);
+                    } else {
+                        self.transfer_intra_call(args, dst, local_def_id, inputs, output, ctx);
+                    }
+                } else {
+                    // self.transfer_rust_call(
+                    //     cstr,
+                    //     caller,
+                    //     (seg3, seg2, seg1, seg0),
+                    //     inputs,
+                    //     output,
+                    //     args,
+                    //     d_id,
+                    // );
+                }
+            }
+        }
     }
 
-    // fn def_id_to_string(&self, def_id: DefId) -> String {
-    //     self.tcx.def_path(def_id).to_string_no_crate_verbose()
-    // }
+    fn transfer_intra_call(
+        &mut self,
+        args: &[Operand<'tcx>],
+        dst: DLoc,
+        callee: LocalDefId,
+        inputs: &[Ty<'tcx>],
+        output: Ty<'tcx>,
+        ctx: Context<'_, 'tcx>,
+    ) {
+        for (i, (ty, arg)) in inputs.iter().zip(args).enumerate() {
+            let arg = some_or!(self.transfer_op(arg, ctx), continue);
+            let root = LocRoot::Local(callee, Local::from_usize(i + 1));
+            let loc = Loc::new_root(root);
+            let param = DLoc::new_loc(loc);
+            self.transfer_assign(param, arg, *ty);
+        }
+
+        let root = LocRoot::Local(callee, Local::from_usize(0));
+        let loc = Loc::new_root(root);
+        let ret = DLoc::new_loc(loc);
+        self.transfer_assign(dst, ret, output);
+    }
+
+    fn def_id_to_string(&self, def_id: DefId) -> String {
+        self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -378,6 +462,11 @@ impl DLoc {
             deref,
             loc,
         }
+    }
+
+    #[inline]
+    fn new_loc(loc: Loc) -> Self {
+        Self::new(false, false, loc)
     }
 
     #[inline]

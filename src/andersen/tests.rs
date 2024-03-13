@@ -1074,3 +1074,56 @@ fn test_byte_literal() {
         },
     );
 }
+
+#[test]
+fn test_call() {
+    // _2 = const 0_i32
+    // _4 = &mut _2
+    // _3 = &raw mut (*_4)
+    // _1 = move _3
+    // _0 = _1
+    //
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = g(_2) -> [return: bb1, unwind continue]
+    // _5 = const 0_i32
+    // _7 = &mut _5
+    // _6 = &raw mut (*_7)
+    // _4 = move _6
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            let mut y: libc::c_int = 0 as libc::c_int;
+            x = &mut y;
+            return x;
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: *mut libc::c_int = g(y);
+        let mut w: libc::c_int = 0 as libc::c_int;
+        z = &mut w;
+        ",
+        |res, f, tcx| {
+            let g = find("g", tcx);
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([ro(f, 1)])));
+            assert_eq!(
+                res.get(&ro(f, 4)),
+                Some(&set([ro(f, 1), ro(f, 5), ro(g, 2)]))
+            );
+            assert_eq!(res.get(&ro(f, 5)), None);
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([ro(f, 5)])));
+            assert_eq!(res.get(&ro(f, 7)), Some(&set([ro(f, 5)])));
+            assert_eq!(res.get(&ro(g, 0)), Some(&set([ro(f, 1), ro(g, 2)])));
+            assert_eq!(res.get(&ro(g, 1)), Some(&set([ro(f, 1), ro(g, 2)])));
+            assert_eq!(res.get(&ro(g, 2)), None);
+            assert_eq!(res.get(&ro(g, 3)), Some(&set([ro(g, 2)])));
+            assert_eq!(res.get(&ro(g, 4)), Some(&set([ro(g, 2)])));
+        },
+    );
+}

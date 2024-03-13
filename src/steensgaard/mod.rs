@@ -144,11 +144,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         for cstr in &cstrss[&local_def_id] {
             for (bb, bbd) in body.basic_blocks.iter_enumerated() {
                 for stmt in &bbd.statements {
-                    // println!("{:?}", stmt);
                     analyzer.transfer_stmt(*cstr, local_def_id, stmt);
                 }
                 let term = bbd.terminator();
-                // println!("{:?}", term.kind);
                 analyzer.transfer_term(*cstr, local_def_id, term, bb);
             }
         }
