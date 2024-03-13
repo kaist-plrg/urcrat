@@ -1196,3 +1196,51 @@ fn test_fn_ptr_after() {
         },
     );
 }
+
+#[test]
+fn test_fn_ptr_before() {
+    // _0 = _1
+    //
+    // _1 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::None
+    // _2 = const 0_i32
+    // _4 = &mut _2
+    // _3 = &raw mut (*_4)
+    // _7 = _1
+    // _6 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::unwrap(move _7)
+    // _5 = move _6(_3)
+    // _9 = g as unsafe extern "C" fn(*mut i32) -> *mut i32 (PointerCoercion(ReifyFnPointer))
+    // _8 = std::option::Option::<unsafe extern "C" fn(*mut i32) -> *mut i32>::Some(move _9)
+    // _1 = move _8
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            return x;
+        }
+        ",
+        "",
+        "
+        let mut x: Option::<unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int> = None;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: *mut libc::c_int = &mut y;
+        let mut w: *mut libc::c_int = x.unwrap()(z);
+        x = Some(g as unsafe extern \"C\" fn(*mut libc::c_int) -> *mut libc::c_int);
+        ",
+        |res, f, tcx| {
+            let g = find("g", tcx);
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&lo(f, 1, [0])), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 2)), None);
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(f, 4)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(f, 5)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 7)), None);
+            assert_eq!(res.get(&lo(f, 7, [0])), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 8)), None);
+            assert_eq!(res.get(&lo(f, 8, [0])), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(f, 9)), Some(&set([gl(g)])));
+            assert_eq!(res.get(&ro(g, 0)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(g, 1)), Some(&set([ro(f, 2)])));
+        },
+    );
+}

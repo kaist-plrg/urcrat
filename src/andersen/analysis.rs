@@ -94,7 +94,7 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
 
 struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
-    state: State,
+    state: State<'tcx>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
@@ -310,6 +310,11 @@ impl<'tcx> Analyzer<'tcx> {
             return;
         };
         assert!(destination.projection.is_empty());
+
+        let args: Vec<_> = args.iter().map(|arg| self.transfer_op(arg, ctx)).collect();
+        let output = destination.ty(ctx.locals, self.tcx).ty;
+        let dst = DLoc::from_place(*destination, ctx.owner);
+
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
                 assert!(func.projection.is_empty());
@@ -318,9 +323,11 @@ impl<'tcx> Analyzer<'tcx> {
                     for callee in callees.clone() {
                         assert!(callee.projection.is_empty());
                         let LocRoot::Global(local_def_id) = callee.root else { panic!() };
-                        self.transfer_intra_call(args, *destination, local_def_id, ctx);
+                        self.transfer_intra_call(args.clone(), dst.clone(), output, local_def_id);
                     }
                 }
+                let call = CallInfo::new(args, dst, output);
+                self.add_call(func.loc, call);
             }
             Operand::Constant(box constant) => {
                 let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
@@ -340,10 +347,10 @@ impl<'tcx> Analyzer<'tcx> {
                     } else if seg1.contains("{extern#") {
                         // self.transfer_c_call(cstr, caller, seg0, inputs, output, args, d_id);
                     } else {
-                        self.transfer_intra_call(args, *destination, local_def_id, ctx);
+                        self.transfer_intra_call(args, dst, output, local_def_id);
                     }
                 } else {
-                    self.transfer_rust_call(args, *destination, (seg3, seg2, seg1, seg0), ctx);
+                    self.transfer_rust_call(args, dst, output, (seg3, seg2, seg1, seg0));
                 }
             }
         }
@@ -351,15 +358,15 @@ impl<'tcx> Analyzer<'tcx> {
 
     fn transfer_intra_call(
         &mut self,
-        args: &[Operand<'tcx>],
-        dst: Place<'tcx>,
+        args: Vec<Option<DLoc>>,
+        dst: DLoc,
+        output: Ty<'tcx>,
         callee: LocalDefId,
-        ctx: Context<'_, 'tcx>,
     ) {
         let inputs = self.get_input_tys(callee.to_def_id());
 
         for (i, (ty, arg)) in inputs.iter().zip(args).enumerate() {
-            let arg = some_or!(self.transfer_op(arg, ctx), continue);
+            let arg = some_or!(arg, continue);
             let root = LocRoot::Local(callee, Local::from_usize(i + 1));
             let loc = Loc::new_root(root);
             let param = DLoc::new_loc(loc);
@@ -369,25 +376,21 @@ impl<'tcx> Analyzer<'tcx> {
         let root = LocRoot::Local(callee, Local::from_usize(0));
         let loc = Loc::new_root(root);
         let ret = DLoc::new_loc(loc);
-        let output = dst.ty(ctx.locals, self.tcx).ty;
-        let dst = DLoc::from_place(dst, ctx.owner);
         self.transfer_assign(dst, ret, output);
     }
 
     fn transfer_rust_call(
         &mut self,
-        args: &[Operand<'tcx>],
-        dst: Place<'tcx>,
+        args: Vec<Option<DLoc>>,
+        dst: DLoc,
+        output: Ty<'tcx>,
         callee: (&str, &str, &str, &str),
-        ctx: Context<'_, 'tcx>,
     ) {
         match callee {
             ("", "option" | "result", _, "unwrap") => {
                 assert_eq!(args.len(), 1);
-                if let Some(arg) = self.transfer_op(&args[0], ctx) {
-                    let ty = dst.ty(ctx.locals, self.tcx).ty;
-                    let dst = DLoc::from_place(dst, ctx.owner);
-                    self.transfer_assign(dst, arg.push(0), ty);
+                if let Some(arg) = &args[0] {
+                    self.transfer_assign(dst, arg.clone().push(0), output);
                 }
             }
             (_, "slice", _, "as_ptr" | "as_mut_ptr")
@@ -452,9 +455,22 @@ impl<'tcx> Analyzer<'tcx> {
         self.state.token_tos.entry(x).or_default().insert((y, proj));
     }
 
+    fn add_call(&mut self, x: Loc, call: CallInfo<'tcx>) {
+        self.state.calls.entry(x).or_default().push(call);
+    }
+
     fn propagate(&mut self) {
         while let Some(tx) = self.state.worklist.pop() {
             let (t, x) = tx;
+            if t.projection.is_empty() {
+                if let LocRoot::Global(callee) = t.root {
+                    if let Some(cs) = self.state.calls.get(&x) {
+                        for c in cs.clone() {
+                            self.transfer_intra_call(c.args, c.dst, c.output, callee)
+                        }
+                    }
+                }
+            }
             if let Some(ys) = self.state.froms.get(&x) {
                 for (y, proj) in ys.clone() {
                     self.add_edge(t.clone().extend(proj), y);
@@ -486,14 +502,29 @@ impl<'tcx> Analyzer<'tcx> {
         self.tcx.fn_sig(func).skip_binder().inputs().skip_binder()
     }
 }
+
 #[derive(Default)]
-struct State {
+struct State<'tcx> {
     solutions: HashMap<Loc, HashSet<Loc>>,
     successors: HashMap<Loc, HashSet<Loc>>,
     froms: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
     tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
     token_tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
+    calls: HashMap<Loc, Vec<CallInfo<'tcx>>>,
     worklist: Vec<(Loc, Loc)>,
+}
+
+#[derive(Clone)]
+struct CallInfo<'tcx> {
+    args: Vec<Option<DLoc>>,
+    dst: DLoc,
+    output: Ty<'tcx>,
+}
+
+impl<'tcx> CallInfo<'tcx> {
+    fn new(args: Vec<Option<DLoc>>, dst: DLoc, output: Ty<'tcx>) -> Self {
+        Self { args, dst, output }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
