@@ -17,7 +17,6 @@ use rustc_middle::{
 use rustc_session::config::Input;
 use rustc_span::def_id::DefId;
 
-use super::*;
 use crate::compile_util;
 
 pub type AnalysisResults = HashMap<Loc, HashSet<Loc>>;
@@ -69,10 +68,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             analyzer.transfer_term(terminator, ctx);
         }
     }
-    analyzer.solver.solutions()
+    analyzer.state.solutions
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Context<'a, 'tcx> {
     locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
     owner: LocalDefId,
@@ -95,14 +94,14 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
 
 struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
-    solver: Solver,
+    state: State,
 }
 
 impl<'tcx> Analyzer<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            solver: Solver::new(),
+            state: State::default(),
         }
     }
 
@@ -222,49 +221,46 @@ impl<'tcx> Analyzer<'tcx> {
             (true, false, true) => unreachable!(),
             (true, false, false) => {
                 let l_root = l.loc.only_root();
-                if let Some(ts) = self.solver.solution(&l_root) {
+                if let Some(ts) = self.state.solutions.get(&l_root) {
                     for t in ts.clone() {
-                        self.solver
-                            .add_edge(r.loc.clone(), t.extend(l.loc.projection.clone()));
+                        self.add_edge(r.loc.clone(), t.extend(l.loc.projection.clone()));
                     }
                 }
-                self.solver.add_to(l_root, r.loc, l.loc.projection);
-                self.solver.propagate();
+                self.add_to(l_root, r.loc, l.loc.projection);
+                self.propagate();
             }
             (false, true, true) => {
                 if r.loc.projection.is_empty() {
-                    self.solver.add_edge(r.loc, l.loc);
-                    self.solver.propagate();
+                    self.add_edge(r.loc, l.loc);
+                    self.propagate();
                 } else {
                     let r_root = r.loc.only_root();
-                    if let Some(ts) = self.solver.solution(&r_root) {
+                    if let Some(ts) = self.state.solutions.get(&r_root) {
                         for t in ts.clone() {
-                            self.solver
-                                .add_token(t.extend(r.loc.projection.clone()), l.loc.clone());
+                            self.add_token(t.extend(r.loc.projection.clone()), l.loc.clone());
                         }
                     }
-                    self.solver.add_token_to(r_root, l.loc, r.loc.projection);
-                    self.solver.propagate();
+                    self.add_token_to(r_root, l.loc, r.loc.projection);
+                    self.propagate();
                 }
             }
             (false, true, false) => {
-                self.solver.add_token(r.loc, l.loc);
-                self.solver.propagate();
+                self.add_token(r.loc, l.loc);
+                self.propagate();
             }
             (false, false, true) => {
                 let r_root = r.loc.only_root();
-                if let Some(ts) = self.solver.solution(&r_root) {
+                if let Some(ts) = self.state.solutions.get(&r_root) {
                     for t in ts.clone() {
-                        self.solver
-                            .add_edge(t.extend(r.loc.projection.clone()), l.loc.clone());
+                        self.add_edge(t.extend(r.loc.projection.clone()), l.loc.clone());
                     }
                 }
-                self.solver.add_from(r_root, l.loc, r.loc.projection);
-                self.solver.propagate();
+                self.add_from(r_root, l.loc, r.loc.projection);
+                self.propagate();
             }
             (false, false, false) => {
-                self.solver.add_edge(r.loc, l.loc);
-                self.solver.propagate();
+                self.add_edge(r.loc, l.loc);
+                self.propagate();
             }
         }
     }
@@ -318,7 +314,7 @@ impl<'tcx> Analyzer<'tcx> {
             Operand::Copy(func) | Operand::Move(func) => {
                 assert!(func.projection.is_empty());
                 let func = DLoc::from_place(*func, ctx.owner);
-                if let Some(callees) = self.solver.solution(&func.loc) {
+                if let Some(callees) = self.state.solutions.get(&func.loc) {
                     for callee in callees.clone() {
                         assert!(callee.projection.is_empty());
                         let LocRoot::Global(local_def_id) = callee.root else { panic!() };
@@ -417,6 +413,71 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
+    fn add_token(&mut self, t: Loc, v: Loc) {
+        if self
+            .state
+            .solutions
+            .entry(v.clone())
+            .or_default()
+            .insert(t.clone())
+        {
+            self.state.worklist.push((t, v));
+        }
+    }
+
+    fn add_edge(&mut self, x: Loc, y: Loc) {
+        if x != y
+            && self
+                .state
+                .successors
+                .entry(x.clone())
+                .or_default()
+                .insert(y.clone())
+        {
+            for t in some_or!(self.state.solutions.get(&x), return).clone() {
+                self.add_token(t, y.clone());
+            }
+        }
+    }
+
+    fn add_from(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+        self.state.froms.entry(x).or_default().insert((y, proj));
+    }
+
+    fn add_to(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+        self.state.tos.entry(x).or_default().insert((y, proj));
+    }
+
+    fn add_token_to(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+        self.state.token_tos.entry(x).or_default().insert((y, proj));
+    }
+
+    fn propagate(&mut self) {
+        while let Some(tx) = self.state.worklist.pop() {
+            let (t, x) = tx;
+            if let Some(ys) = self.state.froms.get(&x) {
+                for (y, proj) in ys.clone() {
+                    self.add_edge(t.clone().extend(proj), y);
+                }
+            }
+            if let Some(ys) = self.state.tos.get(&x) {
+                for (y, proj) in ys.clone() {
+                    self.add_edge(y, t.clone().extend(proj));
+                }
+            }
+            if let Some(ys) = self.state.token_tos.get(&x) {
+                for (y, proj) in ys.clone() {
+                    self.add_token(t.clone().extend(proj), y);
+                }
+            }
+            if let Some(ys) = self.state.successors.get(&x) {
+                for y in ys.clone() {
+                    self.add_token(t.clone(), y);
+                }
+            }
+        }
+    }
+
     fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
@@ -424,6 +485,15 @@ impl<'tcx> Analyzer<'tcx> {
     fn get_input_tys(&self, func: DefId) -> &'tcx [Ty<'tcx>] {
         self.tcx.fn_sig(func).skip_binder().inputs().skip_binder()
     }
+}
+#[derive(Default)]
+struct State {
+    solutions: HashMap<Loc, HashSet<Loc>>,
+    successors: HashMap<Loc, HashSet<Loc>>,
+    froms: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
+    tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
+    token_tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
+    worklist: Vec<(Loc, Loc)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -471,13 +541,13 @@ impl Loc {
     }
 
     #[inline]
-    pub fn push(mut self, proj: usize) -> Self {
+    fn push(mut self, proj: usize) -> Self {
         self.projection.push(proj);
         self
     }
 
     #[inline]
-    pub fn extend<I: IntoIterator<Item = usize>>(mut self, proj: I) -> Self {
+    fn extend<I: IntoIterator<Item = usize>>(mut self, proj: I) -> Self {
         self.projection.extend(proj);
         self
     }
@@ -488,11 +558,23 @@ impl Loc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DLoc {
     r#ref: bool,
     deref: bool,
     loc: Loc,
+}
+
+impl std::fmt::Debug for DLoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.r#ref {
+            write!(f, "&")?;
+        }
+        if self.deref {
+            write!(f, "*")?;
+        }
+        write!(f, "{:?}", self.loc)
+    }
 }
 
 impl DLoc {
