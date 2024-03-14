@@ -37,9 +37,10 @@ fn analyze_input(input: Input) -> AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
 
-    let mut vertices: HashSet<Loc> = HashSet::new();
-    let mut tokens: HashSet<Loc> = HashSet::new();
-    let mut max_depth = 0;
+    let mut vertices = HashSet::new();
+    let mut tokens = HashSet::new();
+    let mut alloc_vertices = HashSet::new();
+    let mut alloc_tokens = HashSet::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if item.ident.name.as_str() == "main" {
@@ -84,13 +85,21 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             if let TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) =
                 local_decl.ty.kind()
             {
-                let d = compute_depth(*ty, tcx);
-                max_depth = max_depth.max(d);
+                let (vs, ts) = vertices_and_tokens(*ty, tcx, vec![]);
+                alloc_vertices.extend(vs);
+                alloc_tokens.extend(ts);
             }
         }
     }
 
-    let mut analyzer = Analyzer::new(tcx, vertices, tokens, max_depth);
+    let mut analyzer = Analyzer {
+        tcx,
+        vertices,
+        tokens,
+        alloc_vertices,
+        alloc_tokens,
+        state: State::default(),
+    };
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if item.ident.name.as_str() == "main" {
@@ -140,13 +149,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 fn vertices_and_tokens<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    mut proj: Vec<usize>,
-) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    mut proj: Proj,
+) -> (Vec<Proj>, Vec<Proj>) {
     match ty.kind() {
         TyKind::Bool
         | TyKind::Char
         | TyKind::Float(_)
         | TyKind::Str
+        | TyKind::Slice(_)
         | TyKind::Never
         | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I128)
         | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U128) => {
@@ -200,30 +210,6 @@ fn vertices_and_tokens<'tcx>(
     }
 }
 
-fn compute_depth<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> usize {
-    match ty.kind() {
-        TyKind::Adt(adt_def, generic_args) => adt_def
-            .variants()
-            .iter()
-            .flat_map(|v| {
-                v.fields
-                    .iter()
-                    .map(|f| compute_depth(f.ty(tcx, generic_args), tcx))
-            })
-            .max()
-            .map(|d| d + 1)
-            .unwrap_or(0),
-        TyKind::Array(ty, _) => compute_depth(*ty, tcx) + 1,
-        TyKind::Tuple(tys) => tys
-            .iter()
-            .map(|ty| compute_depth(ty, tcx))
-            .max()
-            .map(|d| d + 1)
-            .unwrap_or(0),
-        _ => 0,
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Context<'a, 'tcx> {
     locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
@@ -249,26 +235,12 @@ struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
     vertices: HashSet<Loc>,
     tokens: HashSet<Loc>,
-    max_depth: usize,
+    alloc_vertices: HashSet<Proj>,
+    alloc_tokens: HashSet<Proj>,
     state: State<'tcx>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        vertices: HashSet<Loc>,
-        tokens: HashSet<Loc>,
-        max_depth: usize,
-    ) -> Self {
-        Self {
-            tcx,
-            vertices,
-            tokens,
-            max_depth,
-            state: State::default(),
-        }
-    }
-
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Context<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.locals, self.tcx).ty;
@@ -489,9 +461,16 @@ impl<'tcx> Analyzer<'tcx> {
                 let func = DLoc::from_place(*func, ctx.owner);
                 if let Some(callees) = self.state.solutions.get(&func.loc) {
                     for callee in callees.clone() {
-                        assert!(callee.projection.is_empty());
-                        let LocRoot::Global(local_def_id) = callee.root else { panic!() };
-                        self.transfer_intra_call(args.clone(), dst.clone(), output, local_def_id);
+                        if callee.projection.is_empty() {
+                            if let LocRoot::Global(local_def_id) = callee.root {
+                                self.transfer_intra_call(
+                                    args.clone(),
+                                    dst.clone(),
+                                    output,
+                                    local_def_id,
+                                );
+                            }
+                        }
                     }
                 }
                 let call = CallInfo::new(args, dst, output);
@@ -614,14 +593,14 @@ impl<'tcx> Analyzer<'tcx> {
 
     fn add_token(&mut self, t: Loc, v: Loc) {
         if t.is_alloc() {
-            if t.projection.len() > self.max_depth {
+            if !self.alloc_tokens.contains(&t.projection) {
                 return;
             }
         } else if !self.tokens.contains(&t) {
             return;
         }
         if v.is_alloc() {
-            if v.projection.len() > self.max_depth {
+            if !self.alloc_vertices.contains(&v.projection) {
                 return;
             }
         } else if !self.vertices.contains(&v) {
@@ -653,15 +632,15 @@ impl<'tcx> Analyzer<'tcx> {
         }
     }
 
-    fn add_from(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+    fn add_from(&mut self, x: Loc, y: Loc, proj: Proj) {
         self.state.froms.entry(x).or_default().insert((y, proj));
     }
 
-    fn add_to(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+    fn add_to(&mut self, x: Loc, y: Loc, proj: Proj) {
         self.state.tos.entry(x).or_default().insert((y, proj));
     }
 
-    fn add_token_to(&mut self, x: Loc, y: Loc, proj: Vec<usize>) {
+    fn add_token_to(&mut self, x: Loc, y: Loc, proj: Proj) {
         self.state.token_tos.entry(x).or_default().insert((y, proj));
     }
 
@@ -723,9 +702,9 @@ impl<'tcx> Analyzer<'tcx> {
 struct State<'tcx> {
     solutions: HashMap<Loc, HashSet<Loc>>,
     successors: HashMap<Loc, HashSet<Loc>>,
-    froms: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
-    tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
-    token_tos: HashMap<Loc, HashSet<(Loc, Vec<usize>)>>,
+    froms: HashMap<Loc, HashSet<(Loc, Proj)>>,
+    tos: HashMap<Loc, HashSet<(Loc, Proj)>>,
+    token_tos: HashMap<Loc, HashSet<(Loc, Proj)>>,
     calls: HashMap<Loc, Vec<CallInfo<'tcx>>>,
     worklist: Vec<(Loc, Loc)>,
 }
@@ -767,10 +746,12 @@ impl LocRoot {
     }
 }
 
+type Proj = Vec<usize>;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Loc {
     root: LocRoot,
-    projection: Vec<usize>,
+    projection: Proj,
 }
 
 impl std::fmt::Debug for Loc {

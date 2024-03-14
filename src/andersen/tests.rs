@@ -1487,3 +1487,59 @@ fn test_static_struct_ref() {
         },
     );
 }
+
+#[test]
+fn test_malloc_struct() {
+    // _1 = const 0_i32
+    // _5 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _4 = move _5 as u64 (IntToInt)
+    // _3 = malloc(move _4) -> [return: bb2, unwind continue]
+    // _2 = move _3 as *mut *mut i32 (PtrToPtr)
+    // _7 = &mut _1
+    // _6 = &raw mut (*_7)
+    // (*_2) = move _6
+    // _11 = std::mem::size_of::<s>() -> [return: bb3, unwind continue]
+    // _10 = move _11 as u64 (IntToInt)
+    // _9 = malloc(move _10) -> [return: bb4, unwind continue]
+    // _8 = move _9 as *mut s (PtrToPtr)
+    // _13 = &mut _1
+    // _12 = &raw mut (*_13)
+    // ((*_8).0: *mut i32) = move _12
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut *mut libc::c_int = malloc(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut *mut libc::c_int;
+        *y = &mut x;
+        let mut z: *mut s = malloc(::std::mem::size_of::<s>() as libc::c_ulong) as *mut s;
+        (*z).x = &mut x;
+        ",
+        |res, f, _| {
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([al(f, 1, 1)])));
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([al(f, 1, 1)])));
+            assert_eq!(res.get(&ro(f, 4)), None);
+            assert_eq!(res.get(&ro(f, 5)), None);
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 7)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 8)), Some(&set([al(f, 3, 1)])));
+            assert_eq!(res.get(&ro(f, 9)), Some(&set([al(f, 3, 1)])));
+            assert_eq!(res.get(&ro(f, 10)), None);
+            assert_eq!(res.get(&ro(f, 11)), None);
+            assert_eq!(res.get(&ro(f, 12)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 13)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&al(f, 1, 1)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&al(f, 3, 1)), None);
+            assert_eq!(res.get(&al(f, 3, 1).push(0)), Some(&set([ro(f, 1)])));
+        },
+    );
+}
