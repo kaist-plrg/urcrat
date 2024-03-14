@@ -32,6 +32,9 @@ where F: FnOnce(AnalysisResults, LocalDefId, TyCtxt<'_>) + Send {
     let code = format!(
         "
         extern crate libc;
+        extern \"C\" {{
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }}
         {}
         unsafe extern \"C\" fn {}({}) {{
             {}
@@ -1292,6 +1295,27 @@ fn test_array_offset() {
             assert_eq!(res.get(&ro(f, 7)), Some(&set([ro(f, 1)])));
             assert_eq!(res.get(&ro(f, 8)), None);
             assert_eq!(res.get(&ro(f, 9)), None);
+        },
+    );
+}
+
+#[test]
+fn test_malloc() {
+    // _4 = std::mem::size_of::<i32>()
+    // _3 = move _4 as u64 (IntToInt)
+    // _2 = malloc(move _3)
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = malloc(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        ",
+        |res, f, _| {
+            assert_eq!(res.get(&ro(f, 1)), Some(&set([al(f, 1, 1)])));
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([al(f, 1, 1)])));
+            assert_eq!(res.get(&ro(f, 3)), None);
+            assert_eq!(res.get(&ro(f, 4)), None);
         },
     );
 }

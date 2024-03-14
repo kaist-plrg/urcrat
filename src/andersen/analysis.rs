@@ -4,7 +4,7 @@ use std::{
 };
 
 use etrace::some_or;
-use rustc_hir::{def_id::LocalDefId, ItemKind};
+use rustc_hir::{def_id::LocalDefId, ItemKind, Node};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
@@ -12,7 +12,7 @@ use rustc_middle::{
         AggregateKind, ConstantKind, Local, LocalDecl, Location, Operand, Place, PlaceElem, Rvalue,
         Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{IntTy, Ty, TyCtxt, TyKind, UintTy},
+    ty::{IntTy, Ty, TyCtxt, TyKind, TypeAndMut, UintTy},
 };
 use rustc_session::config::Input;
 use rustc_span::def_id::DefId;
@@ -36,7 +36,8 @@ fn analyze_input(input: Input) -> AnalysisResults {
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
-    let mut analyzer = Analyzer::new(tcx);
+
+    let mut max_depth = 0;
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if item.ident.name.as_str() == "main" {
@@ -49,7 +50,39 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
             _ => continue,
         };
-        println!("{}", compile_util::body_to_str(body));
+        if let Some(m) = body
+            .local_decls
+            .iter()
+            .map(|l| {
+                let ty = if let TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) =
+                    l.ty.kind()
+                {
+                    *ty
+                } else {
+                    l.ty
+                };
+                compute_depth(ty, tcx)
+            })
+            .max()
+        {
+            max_depth = max_depth.max(m);
+        }
+    }
+
+    let mut analyzer = Analyzer::new(tcx, max_depth);
+    for item_id in hir.items() {
+        let item = hir.item(item_id);
+        if item.ident.name.as_str() == "main" {
+            continue;
+        }
+        let local_def_id = item.owner_id.def_id;
+        let def_id = local_def_id.to_def_id();
+        let body = match item.kind {
+            ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
+            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+            _ => continue,
+        };
+        // println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for (statement_index, stmt) in bbd.statements.iter().enumerate() {
                 let location = Location {
@@ -69,6 +102,30 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
     analyzer.state.solutions
+}
+
+fn compute_depth<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> usize {
+    match ty.kind() {
+        TyKind::Adt(adt_def, generic_args) => adt_def
+            .variants()
+            .iter()
+            .flat_map(|v| {
+                v.fields
+                    .iter()
+                    .map(|f| compute_depth(f.ty(tcx, generic_args), tcx))
+            })
+            .max()
+            .map(|d| d + 1)
+            .unwrap_or(0),
+        TyKind::Array(ty, _) => compute_depth(*ty, tcx) + 1,
+        TyKind::Tuple(tys) => tys
+            .iter()
+            .map(|ty| compute_depth(ty, tcx))
+            .max()
+            .map(|d| d + 1)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -94,13 +151,15 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
 
 struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
+    max_depth: usize,
     state: State<'tcx>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
+    fn new(tcx: TyCtxt<'tcx>, max_depth: usize) -> Self {
         Self {
             tcx,
+            max_depth,
             state: State::default(),
         }
     }
@@ -142,7 +201,7 @@ impl<'tcx> Analyzer<'tcx> {
                 }
             }
             Rvalue::BinaryOp(_, _) => {}
-            Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
+            Rvalue::CheckedBinaryOp(_, _) => {}
             Rvalue::NullaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(_, _) => {}
             Rvalue::Discriminant(_) => {}
@@ -293,6 +352,10 @@ impl<'tcx> Analyzer<'tcx> {
                         let loc = Loc::new_root(LocRoot::Global(def_id.as_local()?));
                         Some(DLoc::new_ref(loc))
                     }
+                    ConstValue::Slice { .. } => {
+                        let loc = Loc::new_root(LocRoot::Alloc(ctx.owner, ctx.location));
+                        Some(DLoc::new_ref(loc))
+                    }
                     _ => unreachable!(),
                 },
             },
@@ -345,13 +408,14 @@ impl<'tcx> Analyzer<'tcx> {
                         let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
                         assert_eq!(code, "BitfieldStruct");
                     } else if seg1.contains("{extern#") {
-                        // self.transfer_c_call(cstr, caller, seg0, inputs, output, args, d_id);
+                        self.transfer_c_call(dst, output, ctx);
                     } else {
                         self.transfer_intra_call(args, dst, output, local_def_id);
                     }
                 } else {
-                    let inputs = self.get_input_tys(*def_id);
-                    self.transfer_rust_call(args, dst, output, inputs, (seg3, seg2, seg1, seg0));
+                    let inputs = self.get_input_tys(*def_id).unwrap();
+                    let callee = (seg3, seg2, seg1, seg0);
+                    self.transfer_rust_call(args, dst, output, inputs, callee, ctx);
                 }
             }
         }
@@ -364,7 +428,7 @@ impl<'tcx> Analyzer<'tcx> {
         output: Ty<'tcx>,
         callee: LocalDefId,
     ) {
-        let inputs = self.get_input_tys(callee.to_def_id());
+        let inputs = some_or!(self.get_input_tys(callee.to_def_id()), return);
 
         for (i, (ty, arg)) in inputs.iter().zip(args).enumerate() {
             let arg = some_or!(arg, continue);
@@ -380,6 +444,13 @@ impl<'tcx> Analyzer<'tcx> {
         self.transfer_assign(dst, ret, output);
     }
 
+    fn transfer_c_call(&mut self, dst: DLoc, output: Ty<'tcx>, ctx: Context<'_, 'tcx>) {
+        if output.is_unsafe_ptr() {
+            let loc = Loc::new_root(LocRoot::Alloc(ctx.owner, ctx.location));
+            self.transfer_assign(dst, DLoc::new_ref(loc), output);
+        }
+    }
+
     fn transfer_rust_call(
         &mut self,
         args: Vec<Option<DLoc>>,
@@ -387,6 +458,7 @@ impl<'tcx> Analyzer<'tcx> {
         output: Ty<'tcx>,
         inputs: &[Ty<'tcx>],
         callee: (&str, &str, &str, &str),
+        ctx: Context<'_, 'tcx>,
     ) {
         if (output.is_unit() || output.is_never() || output.is_primitive())
             && inputs.iter().filter(|t| !t.is_primitive()).count() < 2
@@ -410,9 +482,12 @@ impl<'tcx> Analyzer<'tcx> {
                     self.transfer_assign(dst, arg.clone(), output);
                 }
             }
-            ("", "unix", _, "memcpy") => todo!(),
+            ("", "vec", _, "leak" | "as_mut_ptr") => {
+                let loc = Loc::new_root(LocRoot::Alloc(ctx.owner, ctx.location));
+                self.transfer_assign(dst, DLoc::new_ref(loc), output);
+            }
             ("", "num", _, name) if name.starts_with("overflowing_") => {}
-            ("", "vec", _, "leak")
+            ("", "unix", _, "memcpy")
             | ("", "", "vec", "from_elem")
             | ("ptr", _, _, "offset_from")
             | ("", "", "ptr", "write_volatile")
@@ -433,6 +508,9 @@ impl<'tcx> Analyzer<'tcx> {
     }
 
     fn add_token(&mut self, t: Loc, v: Loc) {
+        if t.projection.len() > self.max_depth || v.projection.len() > self.max_depth {
+            return;
+        }
         if self
             .state
             .solutions
@@ -514,8 +592,14 @@ impl<'tcx> Analyzer<'tcx> {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
 
-    fn get_input_tys(&self, func: DefId) -> &'tcx [Ty<'tcx>] {
-        self.tcx.fn_sig(func).skip_binder().inputs().skip_binder()
+    fn get_input_tys(&self, func: DefId) -> Option<&'tcx [Ty<'tcx>]> {
+        if let Some(node) = self.tcx.hir().get_if_local(func) {
+            let Node::Item(item) = node else { return None };
+            if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                return None;
+            }
+        }
+        Some(self.tcx.fn_sig(func).skip_binder().inputs().skip_binder())
     }
 }
 

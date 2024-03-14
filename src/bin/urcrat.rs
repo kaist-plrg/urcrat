@@ -29,5 +29,8 @@ fn main() {
     //     unions: args.include_union.into_iter().collect(),
     // };
     // analysis::analyze_path(&file, &conf);
-    andersen::analyze_path(&file);
+    let start = std::time::Instant::now();
+    let res = andersen::analyze_path(&file);
+    let elapsed = start.elapsed();
+    println!("{:?} {:?}", res.len(), elapsed);
 }
