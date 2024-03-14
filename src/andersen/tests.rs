@@ -1319,3 +1319,171 @@ fn test_malloc() {
         },
     );
 }
+
+#[test]
+fn test_static_struct_field_eq() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _5 = const {alloc1: *mut s}
+    // ((*_5).0: *mut i32) = move _3
+    // _7 = &mut _2
+    // _6 = &raw mut (*_7)
+    // _8 = const {alloc1: *mut s}
+    // ((*_8).1: *mut i32) = move _6
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        pub static mut z: s = s {
+            x: 0 as *const libc::c_int as *mut libc::c_int,
+            y: 0 as *const libc::c_int as *mut libc::c_int,
+        };
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        z.x = &mut x;
+        z.y = &mut y;
+        ",
+        |res, f, tcx| {
+            let z = find("z", tcx);
+            assert_eq!(res.get(&ro(f, 1)), None);
+            assert_eq!(res.get(&ro(f, 2)), None);
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 4)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&ro(f, 5)), Some(&set([gl(z)])));
+            assert_eq!(res.get(&ro(f, 6)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(f, 7)), Some(&set([ro(f, 2)])));
+            assert_eq!(res.get(&ro(f, 8)), Some(&set([gl(z)])));
+            assert_eq!(res.get(&gl(z)), None);
+            assert_eq!(res.get(&gl(z).push(0)), Some(&set([ro(f, 1)])));
+            assert_eq!(res.get(&gl(z).push(1)), Some(&set([ro(f, 2)])));
+        },
+    );
+}
+
+#[test]
+fn test_static_struct_field_ref() {
+    // _3 = const {alloc1: *mut s}
+    // _2 = &mut ((*_3).0: i32)
+    // _1 = &raw mut (*_2)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+        }
+        pub static mut y: s = s { x: 0 };
+        ",
+        "",
+        "
+        let mut x: *mut libc::c_int = &mut y.x;
+        ",
+        |res, f, tcx| {
+            let y = find("y", tcx);
+            assert_eq!(res.get(&ro(f, 1)), Some(&set([gl(y).push(0)])));
+            assert_eq!(res.get(&ro(f, 2)), Some(&set([gl(y).push(0)])));
+            assert_eq!(res.get(&ro(f, 3)), Some(&set([gl(y)])));
+            assert_eq!(res.get(&gl(y)), None);
+        },
+    );
+}
+
+#[test]
+fn test_static_ref() {
+    // _3 = const {alloc1: *mut i32}
+    // _2 = &(*_3)
+    // _1 = &raw const (*_2)
+    // _0 = move _1 as *mut i32 (PtrToPtr)
+    analyze_fn_with(
+        "
+        pub static mut x: libc::c_int = 0 as libc::c_int;
+        pub static mut y: *mut libc::c_int = unsafe {
+            &x as *const libc::c_int as *mut libc::c_int
+        };
+        ",
+        "",
+        "
+        ",
+        |res, _, tcx| {
+            let x = find("x", tcx);
+            let y = find("y", tcx);
+            assert_eq!(res.get(&gl(x)), None);
+            assert_eq!(res.get(&gl(y)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(y, 0)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(y, 1)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(y, 2)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(y, 3)), Some(&set([gl(x)])));
+        },
+    );
+}
+
+#[test]
+fn test_static_struct_ref() {
+    // _5 = const {alloc1: *mut i32}
+    // _4 = &(*_5)
+    // _3 = &raw const (*_4)
+    // _2 = move _3 as *mut i32 (PtrToPtr)
+    // _9 = const {alloc2: *mut i32}
+    // _8 = &(*_9)
+    // _7 = &raw const (*_8)
+    // _6 = move _7 as *mut i32 (PtrToPtr)
+    // _1 = s { x: move _2, y: move _6 }
+    // _0 = _1
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        pub static mut x: libc::c_int = 0 as libc::c_int;
+        pub static mut y: libc::c_int = 0 as libc::c_int;
+        pub static mut z: s = unsafe {
+            {
+                let mut init = s {
+                    x: &x as *const libc::c_int as *mut libc::c_int,
+                    y: &y as *const libc::c_int as *mut libc::c_int,
+                };
+                init
+            }
+        };
+        ",
+        "",
+        "
+        ",
+        |res, _, tcx| {
+            let x = find("x", tcx);
+            let y = find("y", tcx);
+            let z = find("z", tcx);
+            assert_eq!(res.get(&gl(x)), None);
+            assert_eq!(res.get(&gl(y)), None);
+            assert_eq!(res.get(&gl(z)), None);
+            assert_eq!(res.get(&gl(z).push(0)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&gl(z).push(1)), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 0)), None);
+            assert_eq!(res.get(&lo(z, 0, [0])), Some(&set([gl(x)])));
+            assert_eq!(res.get(&lo(z, 0, [1])), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 1)), None);
+            assert_eq!(res.get(&lo(z, 1, [0])), Some(&set([gl(x)])));
+            assert_eq!(res.get(&lo(z, 1, [1])), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 2)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(z, 3)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(z, 4)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(z, 5)), Some(&set([gl(x)])));
+            assert_eq!(res.get(&ro(z, 6)), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 7)), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 8)), Some(&set([gl(y)])));
+            assert_eq!(res.get(&ro(z, 9)), Some(&set([gl(y)])));
+        },
+    );
+}

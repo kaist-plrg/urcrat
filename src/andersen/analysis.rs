@@ -37,6 +37,8 @@ fn analyze_input(input: Input) -> AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
 
+    let mut vertices: HashSet<Loc> = HashSet::new();
+    let mut tokens: HashSet<Loc> = HashSet::new();
     let mut max_depth = 0;
     for item_id in hir.items() {
         let item = hir.item(item_id);
@@ -45,31 +47,50 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
-        let body = match item.kind {
-            ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
-            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+        let (body, is_static) = match item.kind {
+            ItemKind::Fn(_, _, _) => {
+                let root = LocRoot::Global(local_def_id);
+                let loc = Loc::new_root(root);
+                tokens.insert(loc);
+
+                (tcx.optimized_mir(def_id), false)
+            }
+            ItemKind::Static(_, _, _) => (tcx.mir_for_ctfe(def_id), true),
             _ => continue,
         };
-        if let Some(m) = body
-            .local_decls
-            .iter()
-            .map(|l| {
-                let ty = if let TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) =
-                    l.ty.kind()
-                {
-                    *ty
-                } else {
-                    l.ty
-                };
-                compute_depth(ty, tcx)
-            })
-            .max()
-        {
-            max_depth = max_depth.max(m);
+        for (local, local_decl) in body.local_decls.iter_enumerated() {
+            let (vs, ts) = vertices_and_tokens(local_decl.ty, tcx, vec![]);
+            for v in vs {
+                if is_static && local.as_usize() == 0 {
+                    let root = LocRoot::Global(local_def_id);
+                    let loc = Loc::new(root, v.clone());
+                    vertices.insert(loc);
+                }
+                let root = LocRoot::Local(local_def_id, local);
+                let loc = Loc::new(root, v);
+                vertices.insert(loc);
+            }
+            for t in ts {
+                if is_static && local.as_usize() == 0 {
+                    let root = LocRoot::Global(local_def_id);
+                    let loc = Loc::new(root, t.clone());
+                    tokens.insert(loc);
+                }
+                let root = LocRoot::Local(local_def_id, local);
+                let loc = Loc::new(root, t);
+                tokens.insert(loc);
+            }
+
+            if let TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) =
+                local_decl.ty.kind()
+            {
+                let d = compute_depth(*ty, tcx);
+                max_depth = max_depth.max(d);
+            }
         }
     }
 
-    let mut analyzer = Analyzer::new(tcx, max_depth);
+    let mut analyzer = Analyzer::new(tcx, vertices, tokens, max_depth);
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if item.ident.name.as_str() == "main" {
@@ -79,7 +100,19 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let def_id = local_def_id.to_def_id();
         let body = match item.kind {
             ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
-            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+            ItemKind::Static(_, _, _) => {
+                let body = tcx.mir_for_ctfe(def_id);
+
+                let l0 = Local::from_usize(0);
+                let ty = body.local_decls[l0].ty;
+                let l_root = LocRoot::Global(local_def_id);
+                let l = DLoc::new_loc(Loc::new_root(l_root));
+                let r_root = LocRoot::Local(local_def_id, l0);
+                let r = DLoc::new_loc(Loc::new_root(r_root));
+                analyzer.transfer_assign(l, r, ty);
+
+                body
+            }
             _ => continue,
         };
         // println!("{}", compile_util::body_to_str(body));
@@ -102,6 +135,69 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
     analyzer.state.solutions
+}
+
+fn vertices_and_tokens<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    mut proj: Vec<usize>,
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    match ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never
+        | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I128)
+        | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U128) => {
+            (vec![], vec![proj])
+        }
+        TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Foreign(_)
+        | TyKind::RawPtr(_)
+        | TyKind::Ref(_, _, _)
+        | TyKind::FnDef(_, _)
+        | TyKind::FnPtr(_) => (vec![proj.clone()], vec![proj]),
+        TyKind::Adt(adt_def, generic_args) => {
+            let mut vertices = vec![];
+            let mut tokens = vec![];
+            for v in adt_def.variants() {
+                for (i, f) in v.fields.iter_enumerated() {
+                    let i = i.as_usize();
+                    let ty = f.ty(tcx, generic_args);
+                    let mut proj = proj.clone();
+                    proj.push(i);
+                    let (vs, ts) = vertices_and_tokens(ty, tcx, proj);
+                    vertices.extend(vs);
+                    tokens.extend(ts);
+                }
+            }
+            tokens.push(proj);
+            (vertices, tokens)
+        }
+        TyKind::Array(ty, _) => {
+            let token = proj.clone();
+            proj.push(0);
+            let (vertices, mut tokens) = vertices_and_tokens(*ty, tcx, proj);
+            tokens.push(token);
+            (vertices, tokens)
+        }
+        TyKind::Tuple(tys) => {
+            let mut vertices = vec![];
+            let mut tokens = vec![];
+            for (i, ty) in tys.iter().enumerate() {
+                let mut proj = proj.clone();
+                proj.push(i);
+                let (vs, ts) = vertices_and_tokens(ty, tcx, proj);
+                vertices.extend(vs);
+                tokens.extend(ts);
+            }
+            tokens.push(proj);
+            (vertices, tokens)
+        }
+        _ => unreachable!("{:?}", ty),
+    }
 }
 
 fn compute_depth<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> usize {
@@ -151,14 +247,23 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
 
 struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
+    vertices: HashSet<Loc>,
+    tokens: HashSet<Loc>,
     max_depth: usize,
     state: State<'tcx>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, max_depth: usize) -> Self {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        vertices: HashSet<Loc>,
+        tokens: HashSet<Loc>,
+        max_depth: usize,
+    ) -> Self {
         Self {
             tcx,
+            vertices,
+            tokens,
             max_depth,
             state: State::default(),
         }
@@ -508,7 +613,18 @@ impl<'tcx> Analyzer<'tcx> {
     }
 
     fn add_token(&mut self, t: Loc, v: Loc) {
-        if t.projection.len() > self.max_depth || v.projection.len() > self.max_depth {
+        if t.is_alloc() {
+            if t.projection.len() > self.max_depth {
+                return;
+            }
+        } else if !self.tokens.contains(&t) {
+            return;
+        }
+        if v.is_alloc() {
+            if v.projection.len() > self.max_depth {
+                return;
+            }
+        } else if !self.vertices.contains(&v) {
             return;
         }
         if self
@@ -644,6 +760,13 @@ impl std::fmt::Debug for LocRoot {
     }
 }
 
+impl LocRoot {
+    #[inline]
+    fn is_alloc(&self) -> bool {
+        matches!(self, LocRoot::Alloc(_, _))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Loc {
     root: LocRoot,
@@ -672,7 +795,7 @@ impl Loc {
     }
 
     #[inline]
-    fn push(mut self, proj: usize) -> Self {
+    pub fn push(mut self, proj: usize) -> Self {
         self.projection.push(proj);
         self
     }
@@ -686,6 +809,11 @@ impl Loc {
     #[inline]
     fn only_root(&self) -> Self {
         Self::new_root(self.root)
+    }
+
+    #[inline]
+    fn is_alloc(&self) -> bool {
+        self.root.is_alloc()
     }
 }
 
