@@ -76,7 +76,7 @@ fn al(f: LocalDefId, block: usize, statement_index: usize) -> Loc {
 fn lo<I: IntoIterator<Item = usize>>(f: LocalDefId, i: usize, proj: I) -> Loc {
     Loc::new(
         LocRoot::Local(f, Local::from_usize(i)),
-        proj.into_iter().collect(),
+        Proj::from_iter(proj),
     )
 }
 

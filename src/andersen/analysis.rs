@@ -60,11 +60,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             _ => continue,
         };
         for (local, local_decl) in body.local_decls.iter_enumerated() {
-            let (vs, ts) = vertices_and_tokens(local_decl.ty, tcx, vec![]);
+            let (vs, ts) = vertices_and_tokens(local_decl.ty, tcx, Proj::empty());
             for v in vs {
                 if is_static && local.as_usize() == 0 {
                     let root = LocRoot::Global(local_def_id);
-                    let loc = Loc::new(root, v.clone());
+                    let loc = Loc::new(root, v);
                     vertices.insert(loc);
                 }
                 let root = LocRoot::Local(local_def_id, local);
@@ -74,7 +74,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             for t in ts {
                 if is_static && local.as_usize() == 0 {
                     let root = LocRoot::Global(local_def_id);
-                    let loc = Loc::new(root, t.clone());
+                    let loc = Loc::new(root, t);
                     tokens.insert(loc);
                 }
                 let root = LocRoot::Local(local_def_id, local);
@@ -85,7 +85,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             if let TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) =
                 local_decl.ty.kind()
             {
-                let (vs, ts) = vertices_and_tokens(*ty, tcx, vec![]);
+                let (vs, ts) = vertices_and_tokens(*ty, tcx, Proj::empty());
                 alloc_vertices.extend(vs);
                 alloc_tokens.extend(ts);
             }
@@ -149,7 +149,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 fn vertices_and_tokens<'tcx>(
     ty: Ty<'tcx>,
     tcx: TyCtxt<'tcx>,
-    mut proj: Proj,
+    proj: Proj,
 ) -> (Vec<Proj>, Vec<Proj>) {
     match ty.kind() {
         TyKind::Bool
@@ -168,7 +168,7 @@ fn vertices_and_tokens<'tcx>(
         | TyKind::RawPtr(_)
         | TyKind::Ref(_, _, _)
         | TyKind::FnDef(_, _)
-        | TyKind::FnPtr(_) => (vec![proj.clone()], vec![proj]),
+        | TyKind::FnPtr(_) => (vec![proj], vec![proj]),
         TyKind::Adt(adt_def, generic_args) => {
             let mut vertices = vec![];
             let mut tokens = vec![];
@@ -176,9 +176,7 @@ fn vertices_and_tokens<'tcx>(
                 for (i, f) in v.fields.iter_enumerated() {
                     let i = i.as_usize();
                     let ty = f.ty(tcx, generic_args);
-                    let mut proj = proj.clone();
-                    proj.push(i);
-                    let (vs, ts) = vertices_and_tokens(ty, tcx, proj);
+                    let (vs, ts) = vertices_and_tokens(ty, tcx, proj.push(i));
                     vertices.extend(vs);
                     tokens.extend(ts);
                 }
@@ -187,19 +185,15 @@ fn vertices_and_tokens<'tcx>(
             (vertices, tokens)
         }
         TyKind::Array(ty, _) => {
-            let token = proj.clone();
-            proj.push(0);
-            let (vertices, mut tokens) = vertices_and_tokens(*ty, tcx, proj);
-            tokens.push(token);
+            let (vertices, mut tokens) = vertices_and_tokens(*ty, tcx, proj.push(0));
+            tokens.push(proj);
             (vertices, tokens)
         }
         TyKind::Tuple(tys) => {
             let mut vertices = vec![];
             let mut tokens = vec![];
             for (i, ty) in tys.iter().enumerate() {
-                let mut proj = proj.clone();
-                proj.push(i);
-                let (vs, ts) = vertices_and_tokens(ty, tcx, proj);
+                let (vs, ts) = vertices_and_tokens(ty, tcx, proj.push(i));
                 vertices.extend(vs);
                 tokens.extend(ts);
             }
@@ -286,7 +280,7 @@ impl<'tcx> Analyzer<'tcx> {
                 AggregateKind::Array(ty) => {
                     for f in fs.iter() {
                         if let Some(r) = self.transfer_op(f, ctx) {
-                            self.transfer_assign(l.clone().push(0), r, *ty);
+                            self.transfer_assign(l.push(0), r, *ty);
                         }
                     }
                 }
@@ -297,7 +291,7 @@ impl<'tcx> Analyzer<'tcx> {
                         if let Some(r) = self.transfer_op(f, ctx) {
                             let ty = d.ty(self.tcx, generic_args);
                             let i = if let Some(idx) = idx { *idx } else { i };
-                            self.transfer_assign(l.clone().push(i.as_usize()), r, ty);
+                            self.transfer_assign(l.push(i.as_usize()), r, ty);
                         }
                     }
                 }
@@ -334,7 +328,7 @@ impl<'tcx> Analyzer<'tcx> {
                     for (i, f) in v.fields.iter_enumerated() {
                         let i = i.as_usize();
                         let ty = f.ty(self.tcx, generic_args);
-                        self.transfer_assign(l.clone().push(i), r.clone().push(i), ty);
+                        self.transfer_assign(l.push(i), r.push(i), ty);
                     }
                 }
             }
@@ -343,7 +337,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
             TyKind::Tuple(tys) => {
                 for (i, ty) in tys.iter().enumerate() {
-                    self.transfer_assign(l.clone().push(i), r.clone().push(i), ty);
+                    self.transfer_assign(l.push(i), r.push(i), ty);
                 }
             }
             _ => unreachable!("{:?}", ty),
@@ -359,7 +353,7 @@ impl<'tcx> Analyzer<'tcx> {
                 let l_root = l.loc.only_root();
                 if let Some(ts) = self.state.solutions.get(&l_root) {
                     for t in ts.clone() {
-                        self.add_edge(r.loc.clone(), t.extend(l.loc.projection.clone()));
+                        self.add_edge(r.loc, t.extend(l.loc.projection));
                     }
                 }
                 self.add_to(l_root, r.loc, l.loc.projection);
@@ -373,7 +367,7 @@ impl<'tcx> Analyzer<'tcx> {
                     let r_root = r.loc.only_root();
                     if let Some(ts) = self.state.solutions.get(&r_root) {
                         for t in ts.clone() {
-                            self.add_token(t.extend(r.loc.projection.clone()), l.loc.clone());
+                            self.add_token(t.extend(r.loc.projection), l.loc);
                         }
                     }
                     self.add_token_to(r_root, l.loc, r.loc.projection);
@@ -388,7 +382,7 @@ impl<'tcx> Analyzer<'tcx> {
                 let r_root = r.loc.only_root();
                 if let Some(ts) = self.state.solutions.get(&r_root) {
                     for t in ts.clone() {
-                        self.add_edge(t.extend(r.loc.projection.clone()), l.loc.clone());
+                        self.add_edge(t.extend(r.loc.projection), l.loc);
                     }
                 }
                 self.add_from(r_root, l.loc, r.loc.projection);
@@ -463,12 +457,7 @@ impl<'tcx> Analyzer<'tcx> {
                     for callee in callees.clone() {
                         if callee.projection.is_empty() {
                             if let LocRoot::Global(local_def_id) = callee.root {
-                                self.transfer_intra_call(
-                                    args.clone(),
-                                    dst.clone(),
-                                    output,
-                                    local_def_id,
-                                );
+                                self.transfer_intra_call(args.clone(), dst, output, local_def_id);
                             }
                         }
                     }
@@ -552,18 +541,18 @@ impl<'tcx> Analyzer<'tcx> {
         match callee {
             ("", "option" | "result", _, "unwrap") => {
                 if let Some(arg) = &args[0] {
-                    self.transfer_assign(dst, arg.clone().push(0), output);
+                    self.transfer_assign(dst, arg.push(0), output);
                 }
             }
             (_, "slice", _, "as_ptr" | "as_mut_ptr") => {
                 if let Some(arg) = &args[0] {
-                    let arg = arg.clone().with_ref(true).with_deref(true).push(0);
+                    let arg = arg.with_ref(true).with_deref(true).push(0);
                     self.transfer_assign(dst, arg, output);
                 }
             }
             ("ptr", _, _, "offset") => {
                 if let Some(arg) = &args[0] {
-                    self.transfer_assign(dst, arg.clone(), output);
+                    self.transfer_assign(dst, *arg, output);
                 }
             }
             ("", "vec", _, "leak" | "as_mut_ptr") => {
@@ -606,28 +595,15 @@ impl<'tcx> Analyzer<'tcx> {
         } else if !self.vertices.contains(&v) {
             return;
         }
-        if self
-            .state
-            .solutions
-            .entry(v.clone())
-            .or_default()
-            .insert(t.clone())
-        {
+        if self.state.solutions.entry(v).or_default().insert(t) {
             self.state.worklist.push((t, v));
         }
     }
 
     fn add_edge(&mut self, x: Loc, y: Loc) {
-        if x != y
-            && self
-                .state
-                .successors
-                .entry(x.clone())
-                .or_default()
-                .insert(y.clone())
-        {
+        if x != y && self.state.successors.entry(x).or_default().insert(y) {
             for t in some_or!(self.state.solutions.get(&x), return).clone() {
-                self.add_token(t, y.clone());
+                self.add_token(t, y);
             }
         }
     }
@@ -662,22 +638,22 @@ impl<'tcx> Analyzer<'tcx> {
             }
             if let Some(ys) = self.state.froms.get(&x) {
                 for (y, proj) in ys.clone() {
-                    self.add_edge(t.clone().extend(proj), y);
+                    self.add_edge(t.extend(proj), y);
                 }
             }
             if let Some(ys) = self.state.tos.get(&x) {
                 for (y, proj) in ys.clone() {
-                    self.add_edge(y, t.clone().extend(proj));
+                    self.add_edge(y, t.extend(proj));
                 }
             }
             if let Some(ys) = self.state.token_tos.get(&x) {
                 for (y, proj) in ys.clone() {
-                    self.add_token(t.clone().extend(proj), y);
+                    self.add_token(t.extend(proj), y);
                 }
             }
             if let Some(ys) = self.state.successors.get(&x) {
                 for y in ys.clone() {
-                    self.add_token(t.clone(), y);
+                    self.add_token(t, y);
                 }
             }
         }
@@ -746,9 +722,65 @@ impl LocRoot {
     }
 }
 
-type Proj = Vec<usize>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Proj {
+    v: u64,
+    len: u8,
+}
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+impl std::fmt::Debug for Proj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for i in self.v.to_be_bytes() {
+            if i != 0 {
+                write!(f, ".{}", i - 1)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FromIterator<usize> for Proj {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
+        let mut proj = Self::empty();
+        for i in iter {
+            proj = proj.push(i);
+        }
+        proj
+    }
+}
+
+impl Proj {
+    #[inline]
+    fn empty() -> Self {
+        Self { v: 0, len: 0 }
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.v == 0
+    }
+
+    #[inline]
+    fn push(self, i: usize) -> Self {
+        assert!(i < 255);
+        assert!(self.len < 8);
+        Self {
+            v: self.v << 8 | (i + 1) as u64,
+            len: self.len + 1,
+        }
+    }
+
+    #[inline]
+    fn extend(self, i: Self) -> Self {
+        assert!(self.len + i.len <= 8);
+        Self {
+            v: self.v << (i.len * 8) | i.v,
+            len: self.len + i.len,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Loc {
     root: LocRoot,
     projection: Proj,
@@ -757,33 +789,30 @@ pub struct Loc {
 impl std::fmt::Debug for Loc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.root)?;
-        for i in &self.projection {
-            write!(f, ".{}", i)?;
-        }
-        Ok(())
+        write!(f, "{:?}", self.projection)
     }
 }
 
 impl Loc {
     #[inline]
-    pub fn new(root: LocRoot, projection: Vec<usize>) -> Self {
+    pub fn new(root: LocRoot, projection: Proj) -> Self {
         Self { root, projection }
     }
 
     #[inline]
     pub fn new_root(root: LocRoot) -> Self {
-        Self::new(root, vec![])
+        Self::new(root, Proj::empty())
     }
 
     #[inline]
     pub fn push(mut self, proj: usize) -> Self {
-        self.projection.push(proj);
+        self.projection = self.projection.push(proj);
         self
     }
 
     #[inline]
-    fn extend<I: IntoIterator<Item = usize>>(mut self, proj: I) -> Self {
-        self.projection.extend(proj);
+    fn extend(mut self, proj: Proj) -> Self {
+        self.projection = self.projection.extend(proj);
         self
     }
 
@@ -798,7 +827,7 @@ impl Loc {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DLoc {
     r#ref: bool,
     deref: bool,
@@ -857,16 +886,15 @@ impl DLoc {
 
     fn from_place(place: Place<'_>, owner: LocalDefId) -> Self {
         let root = LocRoot::Local(owner, place.local);
-        let projection = place
-            .projection
-            .iter()
-            .filter_map(|proj| match proj {
-                PlaceElem::Deref => None,
-                PlaceElem::Field(f, _) => Some(f.as_usize()),
-                PlaceElem::Index(_) => Some(0),
+        let mut projection = Proj::empty();
+        for proj in place.projection {
+            match proj {
+                PlaceElem::Deref => {}
+                PlaceElem::Field(f, _) => projection = projection.push(f.as_usize()),
+                PlaceElem::Index(_) => projection = projection.push(0),
                 _ => unreachable!(),
-            })
-            .collect();
+            }
+        }
         let loc = Loc::new(root, projection);
         let deref = place.is_indirect_first_projection();
         Self::new(false, deref, loc)
