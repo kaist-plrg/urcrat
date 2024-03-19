@@ -56,6 +56,7 @@ pub mod andersen;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod graph;
+pub mod points_to;
 pub mod relational;
 pub mod steensgaard;
 pub mod ty_finder;

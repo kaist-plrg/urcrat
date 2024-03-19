@@ -30,7 +30,8 @@ fn main() {
     // };
     // analysis::analyze_path(&file, &conf);
     let start = std::time::Instant::now();
-    let res = andersen::analyze_path(&file);
+    // points_to::analyze_path(&file);
+    points_to::analyze_str("fn f() {}");
     let elapsed = start.elapsed();
-    println!("{:?} {:?}", res.len(), elapsed);
+    println!("{:?}", elapsed);
 }
