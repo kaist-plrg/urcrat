@@ -77,6 +77,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let mut alloc_ends: Vec<usize> = vec![];
     let mut allocs = vec![];
     let mut ty_infos = HashMap::new();
+    let mut index_to_loc = vec![];
     for (local_def_id, body) in &bodies {
         let fn_ptr = fn_ptrs.contains(local_def_id);
         let static_index = ends.len();
@@ -94,6 +95,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
             let ty = compute_ty_info(local_decl.ty, &mut ty_infos, prim, &arena, tcx);
             compute_ends(ty, &mut ends);
+
+            let root = LocRoot::Local(*local_def_id, local);
+            compute_locs(ty, ProjectedLoc::new_root(root), &mut index_to_loc);
 
             if fn_ptr && local.index() == body.arg_count {
                 ends[static_index] = ends.len() - 1;
@@ -113,6 +117,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             }
         }
 
+        let root = LocRoot::Static(*local_def_id);
+        index_to_loc[static_index].push(ProjectedLoc::new_root(root));
+
         for (bb, bbd) in body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else { continue };
             let def_id = operand_to_fn(func).unwrap();
@@ -122,11 +129,16 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
+    let mut alloc_id = 0;
     for alloc in allocs {
         let len = ends.len();
         vars.insert(alloc, len);
         for end in &alloc_ends {
             ends.push(len + *end);
+
+            let root = LocRoot::Alloc(alloc_id);
+            index_to_loc.push(vec![ProjectedLoc::new_root(root)]);
+            alloc_id += 1;
         }
     }
 
@@ -179,7 +191,10 @@ fn compute_ty_info<'a, 'tcx>(
                 compute_ty_info_iter(ts, tys, prim, arena, tcx)
             }
         }
-        TyKind::Array(ty, _) => compute_ty_info(*ty, tys, prim, arena, tcx),
+        TyKind::Array(ty, _) => {
+            let t = compute_ty_info(*ty, tys, prim, arena, tcx);
+            arena.alloc(TyInfo::Array(t))
+        }
         TyKind::Tuple(ts) => {
             if ts.is_empty() {
                 prim
@@ -209,18 +224,37 @@ fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
         fields.push((len, ty_info));
         len += ty_info.len();
     }
-    arena.alloc(TyInfo::Aggregate(len, fields))
+    arena.alloc(TyInfo::Struct(len, fields))
 }
 
 fn compute_ends(ty: &TyInfo<'_>, ends: &mut Vec<usize>) {
     match ty {
         TyInfo::Primitive => ends.push(ends.len()),
-        TyInfo::Aggregate(len, ts) => {
+        TyInfo::Array(t) => compute_ends(t, ends),
+        TyInfo::Struct(len, ts) => {
             let end = ends.len();
             for (_, t) in ts {
                 compute_ends(t, ends);
             }
             ends[end] = end + *len - 1;
+        }
+    }
+}
+
+fn compute_locs(ty: &TyInfo<'_>, loc: ProjectedLoc, index_to_loc: &mut Vec<Vec<ProjectedLoc>>) {
+    match ty {
+        TyInfo::Primitive => index_to_loc.push(vec![loc]),
+        TyInfo::Array(t) => {
+            let len = index_to_loc.len();
+            compute_locs(t, loc.index(), index_to_loc);
+            index_to_loc[len].push(loc);
+        }
+        TyInfo::Struct(_, ts) => {
+            let len = index_to_loc.len();
+            for (i, (_, t)) in ts.iter().enumerate() {
+                compute_locs(t, loc.field(i), index_to_loc);
+            }
+            index_to_loc[len].push(loc);
         }
     }
 }
@@ -259,7 +293,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::Repeat(r, _) => {
                 if let Some(r) = self.transfer_op(r, ctx) {
-                    self.transfer_assign(l, r, ty);
+                    let TyKind::Array(ty, _) = ty.kind() else { unreachable!() };
+                    self.transfer_assign(l, r, *ty);
                 }
             }
             Rvalue::Ref(_, _, r) => {
@@ -306,15 +341,15 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::Discriminant(_) => {}
             Rvalue::Aggregate(box kind, fs) => match kind {
-                AggregateKind::Array(_) => {
+                AggregateKind::Array(ty) => {
                     for f in fs.iter() {
                         if let Some(r) = self.transfer_op(f, ctx) {
-                            self.transfer_assign(l, r, ty);
+                            self.transfer_assign(l, r, *ty);
                         }
                     }
                 }
                 AggregateKind::Adt(_, v_idx, _, _, idx) => {
-                    let TyInfo::Aggregate(_, ts) = self.ty_infos[&ty] else { unreachable!() };
+                    let TyInfo::Struct(_, ts) = self.ty_infos[&ty] else { unreachable!() };
                     let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
                     let variant = adt_def.variant(*v_idx);
                     for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
@@ -399,7 +434,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             match proj {
                 PlaceElem::Deref | PlaceElem::Index(_) => {}
                 PlaceElem::Field(f, _) => {
-                    let TyInfo::Aggregate(_, fs) = ty else { unreachable!() };
+                    let TyInfo::Struct(_, fs) = ty else { unreachable!() };
                     let (i, nested_ty) = fs[f.index()];
                     index += i;
                     ty = nested_ty;
@@ -697,16 +732,19 @@ fn propagate_deref(
     }
 }
 
+#[allow(variant_size_differences)]
 enum TyInfo<'a> {
     Primitive,
-    Aggregate(usize, Vec<(usize, &'a TyInfo<'a>)>),
+    Array(&'a TyInfo<'a>),
+    Struct(usize, Vec<(usize, &'a TyInfo<'a>)>),
 }
 
 impl std::fmt::Debug for TyInfo<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Primitive => write!(f, "*"),
-            Self::Aggregate(len, fields) => {
+            Self::Array(t) => write!(f, "[{:?}]", t),
+            Self::Struct(len, fields) => {
                 write!(f, "[{}", len)?;
                 for (i, ty_info) in fields {
                     let sep = if *i == 0 { ";" } else { "," };
@@ -723,7 +761,8 @@ impl TyInfo<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Primitive => 1,
-            Self::Aggregate(len, _) => *len,
+            Self::Array(t) => t.len(),
+            Self::Struct(len, _) => *len,
         }
     }
 }
@@ -831,6 +870,72 @@ impl PrefixedLoc {
     #[inline]
     fn index(self) -> usize {
         self.var.index()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocRoot {
+    Static(LocalDefId),
+    Local(LocalDefId, Local),
+    Alloc(usize),
+}
+
+impl std::fmt::Debug for LocRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocRoot::Static(def_id) => write!(f, "{:?}", def_id),
+            LocRoot::Local(def_id, local) => write!(f, "{:?}:{:?}", def_id, local),
+            LocRoot::Alloc(id) => write!(f, "alloc{}", id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocProjection {
+    Field(usize),
+    Index,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ProjectedLoc {
+    root: LocRoot,
+    projection: Vec<LocProjection>,
+}
+
+impl ProjectedLoc {
+    #[inline]
+    fn new_root(root: LocRoot) -> Self {
+        Self {
+            root,
+            projection: vec![],
+        }
+    }
+
+    #[inline]
+    fn field(&self, i: usize) -> Self {
+        let mut this = self.clone();
+        this.projection.push(LocProjection::Field(i));
+        this
+    }
+
+    #[inline]
+    fn index(&self) -> Self {
+        let mut this = self.clone();
+        this.projection.push(LocProjection::Index);
+        this
+    }
+}
+
+impl std::fmt::Debug for ProjectedLoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.root)?;
+        for proj in &self.projection {
+            match proj {
+                LocProjection::Field(i) => write!(f, ".{}", i)?,
+                LocProjection::Index => write!(f, "[]")?,
+            }
+        }
+        Ok(())
     }
 }
 
