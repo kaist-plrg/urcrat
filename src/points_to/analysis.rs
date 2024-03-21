@@ -1,22 +1,29 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     path::Path,
 };
 
 use etrace::some_or;
-use rustc_abi::VariantIdx;
-use rustc_hir::ItemKind;
-use rustc_index::IndexVec;
+use rustc_data_structures::graph::{
+    scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
+};
+use rustc_hir::{ItemKind, LangItem};
+use rustc_index::{
+    bit_set::{ChunkedBitIter, ChunkedBitSet},
+    Idx, IndexVec,
+};
 use rustc_middle::{
-    hir::place::Place,
     mir::{
-        visit::Visitor, BasicBlock, ConstantKind, Local, LocalDecl, Location, Operand, PlaceElem,
-        Rvalue, Statement, StatementKind, TerminatorKind,
+        interpret::{ConstValue, GlobalAlloc, Scalar},
+        visit::Visitor,
+        AggregateKind, BasicBlock, BinOp, ConstantKind, Local, LocalDecl, Location, Operand, Place,
+        PlaceElem, Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
     },
-    ty::{IntTy, Ty, TyCtxt, TyKind, TypeAndMut, UintTy},
+    ty::{Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
 use rustc_span::def_id::{DefId, LocalDefId};
+use typed_arena::Arena;
 
 use crate::*;
 
@@ -62,27 +69,40 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     }
     let fn_ptrs = visitor.fn_ptrs;
 
-    let mut fns = HashMap::new();
+    let arena = Arena::new();
+    let prim = arena.alloc(TyInfo::Primitive);
+    let mut statics = HashMap::new();
     let mut vars = HashMap::new();
     let mut ends = vec![];
     let mut alloc_ends: Vec<usize> = vec![];
     let mut allocs = vec![];
+    let mut ty_infos = HashMap::new();
     for (local_def_id, body) in &bodies {
-        let ptr = fn_ptrs.contains(local_def_id);
-        let mut arg_end = 0;
-        let len = ends.len();
-        for (local, local_decl) in body.local_decls.iter_enumerated() {
-            let index = ends.len();
-            compute_ends(local_decl.ty, &mut ends, tcx);
-            if ptr && body.arg_count == local.index() {
-                arg_end = ends.len();
+        let fn_ptr = fn_ptrs.contains(local_def_id);
+        let static_index = ends.len();
+        statics.insert(*local_def_id, static_index);
+
+        let mut local_decls = body.local_decls.iter_enumerated();
+        let ret = local_decls.next().unwrap();
+        let mut params = vec![];
+        for _ in 0..body.arg_count {
+            params.push(local_decls.next().unwrap());
+        }
+        let local_decls = std::iter::once(ret).chain(params).chain(local_decls);
+
+        for (local, local_decl) in local_decls {
+            vars.insert(Var::Local(*local_def_id, local), ends.len());
+            let ty = compute_ty_info(local_decl.ty, &mut ty_infos, prim, &arena, tcx);
+            compute_ends(ty, &mut ends);
+
+            if fn_ptr && local.index() == body.arg_count {
+                ends[static_index] = ends.len() - 1;
             }
-            if ends.len() > index {
-                vars.insert(Var::Local(*local_def_id, local), index);
-            }
-            if let TyKind::RawPtr(TypeAndMut { ty, .. }) = local_decl.ty.kind() {
+
+            if let Some(ty) = unwrap_ptr(local_decl.ty) {
                 let mut ends = vec![];
-                compute_ends(*ty, &mut ends, tcx);
+                let ty = compute_ty_info(ty, &mut ty_infos, prim, &arena, tcx);
+                compute_ends(ty, &mut ends);
                 for (i, end) in ends.into_iter().enumerate() {
                     if alloc_ends.len() > i {
                         alloc_ends[i] = alloc_ends[i].max(end);
@@ -92,14 +112,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                 }
             }
         }
-        if ptr {
-            if len == ends.len() {
-                ends.push(len);
-            } else {
-                ends[len] = if arg_end > len { arg_end - 1 } else { arg_end };
-            }
-            fns.insert(*local_def_id, len);
-        }
+
         for (bb, bbd) in body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else { continue };
             let def_id = operand_to_fn(func).unwrap();
@@ -108,6 +121,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             }
         }
     }
+
     for alloc in allocs {
         let len = ends.len();
         vars.insert(alloc, len);
@@ -115,114 +129,99 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             ends.push(len + *end);
         }
     }
-}
 
-struct TyIndices {
-    len: usize,
-    fields: Vec<usize>,
-}
-
-fn foo<'tcx>(ty: Ty<'tcx>, tys: &mut HashMap<Ty<'tcx>, TyIndices>, tcx: TyCtxt<'tcx>) -> usize {
-    match ty.kind() {
-        TyKind::Bool
-        | TyKind::Char
-        | TyKind::Float(_)
-        | TyKind::Str
-        | TyKind::Slice(_)
-        | TyKind::Never
-        | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I128)
-        | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U128) => 0,
-        TyKind::Int(_)
-        | TyKind::Uint(_)
-        | TyKind::Foreign(_)
-        | TyKind::RawPtr(_)
-        | TyKind::Ref(_, _, _)
-        | TyKind::FnDef(_, _)
-        | TyKind::FnPtr(_) => 1,
-        TyKind::Adt(adt_def, generic_args) => {
-            if let Some(ty_indices) = tys.get(&ty) {
-                ty_indices.len
-            } else {
-                if adt_def.variants().len() > 1 {
-                    assert_eq!(adt_def.variants().len(), 2);
-                    assert!(adt_def.variant(VariantIdx::from(0usize)).fields.is_empty());
-                }
-                let mut len = 0;
-                let mut fields = vec![];
-                for variant in adt_def.variants() {
-                    for field in &variant.fields {
-                        fields.push(len);
-                        len += foo(field.ty(tcx, generic_args), tys, tcx);
-                    }
-                }
-                let ty_indices = TyIndices { len, fields };
-                tys.insert(ty, ty_indices);
-                len
+    let mut analyzer = Analyzer {
+        tcx,
+        ty_infos,
+        vars,
+        statics,
+        graph: Graph::new(ends.len()),
+    };
+    for (local_def_id, body) in &bodies {
+        for (_block, bbd) in body.basic_blocks.iter_enumerated() {
+            for stmt in bbd.statements.iter() {
+                let ctx = Context::new(&body.local_decls, *local_def_id);
+                analyzer.transfer_stmt(stmt, ctx);
             }
+            // let terminator = bbd.terminator();
+            // let ctx = Context::new(&body.local_decls, *local_def_id);
+            // analyzer.transfer_term(terminator, ctx);
         }
-        TyKind::Array(ty, _) => foo(*ty, tys, tcx),
-        TyKind::Tuple(ts) => {
-            if let Some(ty_indices) = tys.get(&ty) {
-                ty_indices.len
-            } else {
-                let mut len = 0;
-                let mut fields = vec![];
-                for ty in *ts {
-                    fields.push(len);
-                    len += foo(ty, tys, tcx);
-                }
-                let ty_indices = TyIndices { len, fields };
-                tys.insert(ty, ty_indices);
-                len
-            }
-        }
-        _ => unreachable!("{:?}", ty),
     }
+
+    analyzer.graph.solve(&ends);
 }
 
-fn compute_ends<'tcx>(ty: Ty<'tcx>, ends: &mut Vec<usize>, tcx: TyCtxt<'tcx>) {
-    match ty.kind() {
-        TyKind::Bool
-        | TyKind::Char
-        | TyKind::Float(_)
-        | TyKind::Str
-        | TyKind::Slice(_)
-        | TyKind::Never
-        | TyKind::Int(IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I128)
-        | TyKind::Uint(UintTy::U8 | UintTy::U16 | UintTy::U32 | UintTy::U128) => {}
-        TyKind::Int(_)
-        | TyKind::Uint(_)
-        | TyKind::Foreign(_)
-        | TyKind::RawPtr(_)
-        | TyKind::Ref(_, _, _)
-        | TyKind::FnDef(_, _)
-        | TyKind::FnPtr(_) => ends.push(ends.len()),
+fn compute_ty_info<'a, 'tcx>(
+    ty: Ty<'tcx>,
+    tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    prim: &'a TyInfo<'a>,
+    arena: &'a Arena<TyInfo<'a>>,
+    tcx: TyCtxt<'tcx>,
+) -> &'a TyInfo<'a> {
+    if let Some(ty_info) = tys.get(&ty) {
+        return ty_info;
+    }
+    let ty_info = match ty.kind() {
         TyKind::Adt(adt_def, generic_args) => {
-            if adt_def.variants().len() > 1 {
-                assert_eq!(adt_def.variants().len(), 2);
-                assert!(adt_def.variant(VariantIdx::from(0usize)).fields.is_empty());
-            }
-            let len = ends.len();
-            for variant in adt_def.variants() {
-                for field in &variant.fields {
-                    compute_ends(field.ty(tcx, generic_args), ends, tcx);
+            if ty.is_c_void(tcx) {
+                prim
+            } else {
+                if adt_def.is_enum() {
+                    assert_eq!(tcx.lang_items().get(LangItem::Option), Some(adt_def.did()));
                 }
-            }
-            if ends.len() > len {
-                ends[len] = ends.len() - 1;
-            }
-        }
-        TyKind::Array(ty, _) => compute_ends(*ty, ends, tcx),
-        TyKind::Tuple(tys) => {
-            let len = ends.len();
-            for ty in *tys {
-                compute_ends(ty, ends, tcx);
-            }
-            if ends.len() > len {
-                ends[len] = ends.len() - 1;
+                let ts = adt_def.variants().iter().flat_map(|variant| {
+                    variant
+                        .fields
+                        .iter()
+                        .map(|field| field.ty(tcx, generic_args))
+                });
+                compute_ty_info_iter(ts, tys, prim, arena, tcx)
             }
         }
-        _ => unreachable!("{:?}", ty),
+        TyKind::Array(ty, _) => compute_ty_info(*ty, tys, prim, arena, tcx),
+        TyKind::Tuple(ts) => {
+            if ts.is_empty() {
+                prim
+            } else {
+                compute_ty_info_iter(ts.iter(), tys, prim, arena, tcx)
+            }
+        }
+        _ => prim,
+    };
+    tys.insert(ty, ty_info);
+    assert_ne!(ty_info.len(), 0);
+    ty_info
+}
+
+#[inline]
+fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
+    ts: I,
+    tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    prim: &'a TyInfo<'a>,
+    arena: &'a Arena<TyInfo<'a>>,
+    tcx: TyCtxt<'tcx>,
+) -> &'a TyInfo<'a> {
+    let mut len = 0;
+    let mut fields = vec![];
+    for ty in ts {
+        let ty_info = compute_ty_info(ty, tys, prim, arena, tcx);
+        fields.push((len, ty_info));
+        len += ty_info.len();
+    }
+    arena.alloc(TyInfo::Aggregate(len, fields))
+}
+
+fn compute_ends(ty: &TyInfo<'_>, ends: &mut Vec<usize>) {
+    match ty {
+        TyInfo::Primitive => ends.push(ends.len()),
+        TyInfo::Aggregate(len, ts) => {
+            let end = ends.len();
+            for (_, t) in ts {
+                compute_ends(t, ends);
+            }
+            ends[end] = end + *len - 1;
+        }
     }
 }
 
@@ -230,47 +229,504 @@ fn compute_ends<'tcx>(ty: Ty<'tcx>, ends: &mut Vec<usize>, tcx: TyCtxt<'tcx>) {
 struct Context<'a, 'tcx> {
     locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
     owner: LocalDefId,
-    block: BasicBlock,
 }
 
 impl<'a, 'tcx> Context<'a, 'tcx> {
-    fn new(
-        locals: &'a IndexVec<Local, LocalDecl<'tcx>>,
-        owner: LocalDefId,
-        block: BasicBlock,
-    ) -> Self {
+    #[inline]
+    fn new(locals: &'a IndexVec<Local, LocalDecl<'tcx>>, owner: LocalDefId) -> Self {
+        Self { locals, owner }
+    }
+}
+
+struct Analyzer<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ty_infos: HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    vars: HashMap<Var, usize>,
+    statics: HashMap<LocalDefId, usize>,
+    graph: Graph,
+}
+
+impl<'tcx> Analyzer<'_, 'tcx> {
+    fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Context<'_, 'tcx>) {
+        let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
+        let ty = l.ty(ctx.locals, self.tcx).ty;
+        let l = self.prefixed_loc(*l, ctx);
+        match r {
+            Rvalue::Use(r) => {
+                if let Some(r) = self.transfer_op(r, ctx) {
+                    self.transfer_assign(l, r, ty);
+                }
+            }
+            Rvalue::Repeat(r, _) => {
+                if let Some(r) = self.transfer_op(r, ctx) {
+                    self.transfer_assign(l, r, ty);
+                }
+            }
+            Rvalue::Ref(_, _, r) => {
+                let r = self.prefixed_loc(*r, ctx).with_ref(true);
+                self.transfer_assign(l, r, ty);
+            }
+            Rvalue::ThreadLocalRef(r) => {
+                if let Some(r) = self.static_ref(*r) {
+                    self.transfer_assign(l, r, ty);
+                }
+            }
+            Rvalue::AddressOf(_, r) => {
+                assert!(r.is_indirect_first_projection());
+                let r = self.prefixed_loc(*r, ctx).with_deref(false);
+                self.transfer_assign(l, r, ty);
+            }
+            Rvalue::Len(_) => {}
+            Rvalue::Cast(_, r, _) => {
+                if let Some(r) = self.transfer_op(r, ctx) {
+                    self.transfer_assign(l, r, ty);
+                }
+            }
+            Rvalue::BinaryOp(op, box (r1, r2)) => {
+                if !matches!(
+                    op,
+                    BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
+                ) {
+                    if let Some(r) = self.transfer_op(r1, ctx) {
+                        self.transfer_assign(l, r, ty);
+                    }
+                    if let Some(r) = self.transfer_op(r2, ctx) {
+                        self.transfer_assign(l, r, ty);
+                    }
+                }
+            }
+            Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
+            Rvalue::NullaryOp(_, _) => unreachable!(),
+            Rvalue::UnaryOp(op, r) => {
+                if matches!(op, UnOp::Neg) {
+                    if let Some(r) = self.transfer_op(r, ctx) {
+                        self.transfer_assign(l, r, ty);
+                    }
+                }
+            }
+            Rvalue::Discriminant(_) => {}
+            Rvalue::Aggregate(box kind, fs) => match kind {
+                AggregateKind::Array(_) => {
+                    for f in fs.iter() {
+                        if let Some(r) = self.transfer_op(f, ctx) {
+                            self.transfer_assign(l, r, ty);
+                        }
+                    }
+                }
+                AggregateKind::Adt(_, v_idx, _, _, idx) => {
+                    let TyInfo::Aggregate(_, ts) = self.ty_infos[&ty] else { unreachable!() };
+                    let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
+                    let variant = adt_def.variant(*v_idx);
+                    for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
+                        if let Some(r) = self.transfer_op(f, ctx) {
+                            let i = if let Some(idx) = idx { *idx } else { i };
+                            let proj = ts[i.index()].0;
+                            let ty = d.ty(self.tcx, generic_args);
+                            self.transfer_assign(l.add(proj), r, ty);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            },
+            Rvalue::ShallowInitBox(_, _) => unreachable!(),
+            Rvalue::CopyForDeref(r) => {
+                let r = self.prefixed_loc(*r, ctx);
+                self.transfer_assign(l, r, ty);
+            }
+        }
+    }
+
+    fn transfer_assign(&mut self, l: PrefixedLoc, r: PrefixedLoc, ty: Ty<'tcx>) {
+        assert!(!l.r#ref);
+        let len = self.ty_infos[&ty].len();
+        for i in 0..len {
+            let l = l.add(i);
+            let r = r.add(i);
+            match (l.deref, r.r#ref, r.deref) {
+                (true, true, _) => unreachable!(),
+                (true, false, true) => unreachable!(),
+                (true, false, false) => self.graph.add_deref_eq(l.var.root, l.var.proj, r.index()),
+                (false, true, true) => self.graph.add_edge(l.index(), r.var.root, r.var.proj),
+                (false, true, false) => self.graph.add_solution(l.index(), r.index()),
+                (false, false, true) => self.graph.add_eq_deref(l.index(), r.var.root, r.var.proj),
+                (false, false, false) => self.graph.add_edge(l.index(), r.index(), 0),
+            }
+        }
+    }
+
+    fn transfer_op(&mut self, op: &Operand<'tcx>, ctx: Context<'_, 'tcx>) -> Option<PrefixedLoc> {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => Some(self.prefixed_loc(*place, ctx)),
+            Operand::Constant(box constant) => match constant.literal {
+                ConstantKind::Ty(_) => unreachable!(),
+                ConstantKind::Unevaluated(_, _) => None,
+                ConstantKind::Val(value, ty) => match value {
+                    ConstValue::Scalar(scalar) => match scalar {
+                        Scalar::Int(_) => None,
+                        Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
+                            GlobalAlloc::Static(def_id) => self.static_ref(def_id),
+                            GlobalAlloc::Memory(_) => None,
+                            _ => unreachable!(),
+                        },
+                    },
+                    ConstValue::ZeroSized => {
+                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let var = Loc::new_root(self.statics[&def_id.as_local()?]);
+                        Some(PrefixedLoc::new_ref(var))
+                    }
+                    ConstValue::Slice { .. } => None,
+                    _ => unreachable!(),
+                },
+            },
+        }
+    }
+
+    fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
+        let var = Var::Local(def_id.as_local()?, Local::new(0));
+        let loc = Loc::new_root(self.vars[&var]);
+        Some(PrefixedLoc::new_ref(loc))
+    }
+
+    fn prefixed_loc(&self, place: Place<'tcx>, ctx: Context<'_, 'tcx>) -> PrefixedLoc {
+        let mut index = 0;
+        let mut ty = ctx.locals[place.local].ty;
+        let deref = place.is_indirect_first_projection();
+        if deref {
+            ty = unwrap_ptr(ty).unwrap();
+        }
+        let mut ty = self.ty_infos[&ty];
+        for proj in place.projection {
+            match proj {
+                PlaceElem::Deref | PlaceElem::Index(_) => {}
+                PlaceElem::Field(f, _) => {
+                    let TyInfo::Aggregate(_, fs) = ty else { unreachable!() };
+                    let (i, nested_ty) = fs[f.index()];
+                    index += i;
+                    ty = nested_ty;
+                }
+                _ => unreachable!(),
+            }
+        }
+        let var = Var::Local(ctx.owner, place.local);
+        let loc = Loc::new(self.vars[&var], index);
+        PrefixedLoc::new(loc).with_deref(place.is_indirect_first_projection())
+    }
+}
+
+type WeightedGraph = HashMap<usize, HashMap<usize, HashSet<usize>>>;
+
+struct Graph {
+    solutions: Vec<ChunkedBitSet<usize>>,
+    zero_weight_edges: Vec<ChunkedBitSet<usize>>,
+    pos_weight_edges: WeightedGraph,
+    deref_eqs: WeightedGraph,
+    eq_derefs: WeightedGraph,
+}
+
+impl Graph {
+    fn new(size: usize) -> Self {
         Self {
-            locals,
-            owner,
-            block,
+            solutions: vec![ChunkedBitSet::new_empty(size); size],
+            zero_weight_edges: vec![ChunkedBitSet::new_empty(size); size],
+            pos_weight_edges: HashMap::new(),
+            deref_eqs: HashMap::new(),
+            eq_derefs: HashMap::new(),
+        }
+    }
+
+    fn add_solution(&mut self, v: usize, sol: usize) {
+        self.solutions[v.index()].insert(sol);
+    }
+
+    fn add_edge(&mut self, l: usize, r: usize, weight: usize) {
+        if weight == 0 {
+            self.zero_weight_edges[r].insert(l);
+        } else {
+            self.pos_weight_edges
+                .entry(r)
+                .or_default()
+                .entry(l)
+                .or_default()
+                .insert(weight);
+        }
+    }
+
+    fn add_deref_eq(&mut self, v: usize, proj: usize, i: usize) {
+        self.deref_eqs
+            .entry(v)
+            .or_default()
+            .entry(i)
+            .or_default()
+            .insert(proj);
+    }
+
+    fn add_eq_deref(&mut self, i: usize, v: usize, proj: usize) {
+        self.eq_derefs
+            .entry(v)
+            .or_default()
+            .entry(i)
+            .or_default()
+            .insert(proj);
+    }
+
+    fn solve(self, ends: &[usize]) -> Vec<ChunkedBitSet<usize>> {
+        let Self {
+            mut solutions,
+            mut zero_weight_edges,
+            mut pos_weight_edges,
+            mut deref_eqs,
+            mut eq_derefs,
+        } = self;
+        let len = solutions.len();
+
+        let mut deltas = solutions.clone();
+        let mut id_to_rep = Vec::from_iter(0..len);
+
+        while deltas.iter().any(|s| s.count() != 0) {
+            let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&zero_weight_edges));
+
+            let mut components = vec![ChunkedBitSet::new_empty(len); sccs.num_sccs()];
+            for i in 0..len {
+                let scc = sccs.scc(i);
+                components[scc.index()].insert(i);
+            }
+
+            let mut scc_to_rep = vec![];
+            let mut cycles = vec![];
+            let mut new_id_to_rep = HashMap::new();
+            for component in components.iter() {
+                let rep = component.iter().next().unwrap();
+                scc_to_rep.push(rep);
+                if component.count() != 1 {
+                    cycles.push((rep, component));
+                    for id in component.iter() {
+                        if id != rep {
+                            new_id_to_rep.insert(id, rep);
+                        }
+                    }
+                }
+            }
+
+            let mut po = vec![];
+            for scc in sccs.all_sccs() {
+                po.push(scc_to_rep[scc]);
+            }
+
+            if sccs.num_sccs() != len {
+                // update id_to_rep
+                for rep in &mut id_to_rep {
+                    if let Some(new_rep) = new_id_to_rep.get(rep) {
+                        *rep = *new_rep;
+                    }
+                }
+
+                // update deltas
+                for (rep, ids) in &cycles {
+                    for id in ids.iter() {
+                        if *rep != id {
+                            let set =
+                                std::mem::replace(&mut deltas[id], ChunkedBitSet::new_empty(len));
+                            deltas[*rep].union(&set);
+                        }
+                    }
+                }
+
+                // update solutions
+                for (rep, ids) in &cycles {
+                    let mut intersection = ChunkedBitSet::new_filled(len);
+                    for id in ids.iter() {
+                        intersection.intersect(&solutions[id]);
+                        if *rep != id {
+                            let set = std::mem::replace(
+                                &mut solutions[id],
+                                ChunkedBitSet::new_empty(len),
+                            );
+                            solutions[*rep].union(&set);
+                        }
+                    }
+                    let mut union = solutions[*rep].clone();
+                    union.subtract(&intersection);
+                    deltas[*rep].union(&union);
+                }
+
+                // update zero_weight_edges
+                zero_weight_edges = vec![ChunkedBitSet::new_empty(len); len];
+                for (scc, rep) in scc_to_rep.iter().enumerate() {
+                    let succs = &mut zero_weight_edges[*rep];
+                    for succ in sccs.successors(scc) {
+                        succs.insert(scc_to_rep[*succ]);
+                    }
+                }
+
+                // update pos_weight_edges
+                update_weighted_graph(&mut pos_weight_edges, &cycles);
+                // update deref_eqs
+                update_weighted_graph(&mut deref_eqs, &cycles);
+                // update eq_derefs
+                update_weighted_graph(&mut eq_derefs, &cycles);
+            }
+
+            for v in po.into_iter().rev() {
+                if deltas[v].count() == 0 {
+                    continue;
+                }
+                let delta = std::mem::replace(&mut deltas[v], ChunkedBitSet::new_empty(len));
+
+                propagate_deref(
+                    v,
+                    &deref_eqs,
+                    &delta,
+                    ends,
+                    &id_to_rep,
+                    &mut zero_weight_edges,
+                    &mut solutions,
+                    &mut deltas,
+                    true,
+                );
+                propagate_deref(
+                    v,
+                    &eq_derefs,
+                    &delta,
+                    ends,
+                    &id_to_rep,
+                    &mut zero_weight_edges,
+                    &mut solutions,
+                    &mut deltas,
+                    false,
+                );
+
+                if let Some(pos_weight_edges) = pos_weight_edges.get(&v) {
+                    for (l, projs) in pos_weight_edges {
+                        for proj in projs {
+                            for i in delta.iter() {
+                                let f = i + proj;
+                                if f > ends[i] {
+                                    continue;
+                                }
+                                if !solutions[*l].insert(f) {
+                                    continue;
+                                }
+                                deltas[*l].insert(f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (id, rep) in id_to_rep.iter().enumerate() {
+            if id != *rep {
+                solutions[id] = solutions[*rep].clone();
+            }
+        }
+
+        solutions
+    }
+}
+
+fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &ChunkedBitSet<usize>)]) {
+    for (rep, ids) in cycles {
+        let mut rep_edges = graph.remove(rep).unwrap_or_default();
+        for id in ids.iter() {
+            if let Some(edges) = graph.remove(&id) {
+                for (l, weights) in edges {
+                    match rep_edges.entry(l) {
+                        Entry::Occupied(mut entry) => {
+                            entry.get_mut().extend(weights);
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(weights);
+                        }
+                    }
+                }
+            }
+        }
+        if !rep_edges.is_empty() {
+            graph.insert(*rep, rep_edges);
+        }
+    }
+    for edges in graph.values_mut() {
+        for (rep, ids) in cycles {
+            let mut rep_weights = edges.remove(rep).unwrap_or_default();
+            for id in ids.iter() {
+                if let Some(weights) = edges.remove(&id) {
+                    rep_weights.extend(weights);
+                }
+            }
+            if !rep_weights.is_empty() {
+                edges.insert(*rep, rep_weights);
+            }
         }
     }
 }
 
-struct Analyzer<'tcx> {
-    tcx: TyCtxt<'tcx>,
-}
-
-impl<'tcx> Analyzer<'tcx> {
-    fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Context<'_, 'tcx>) {
-        let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
-        let ty = l.ty(ctx.locals, self.tcx).ty;
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn propagate_deref(
+    v: usize,
+    derefs: &WeightedGraph,
+    delta: &ChunkedBitSet<usize>,
+    ends: &[usize],
+    id_to_rep: &[usize],
+    zero_weight_edges: &mut [ChunkedBitSet<usize>],
+    solutions: &mut [ChunkedBitSet<usize>],
+    deltas: &mut [ChunkedBitSet<usize>],
+    deref_eq: bool,
+) {
+    let derefs = some_or!(derefs.get(&v), return);
+    for (w, projs) in derefs {
+        for proj in projs {
+            for i in delta.iter() {
+                let f = i + proj;
+                if f > ends[i] {
+                    continue;
+                }
+                let f = id_to_rep[f];
+                let (l, r) = if deref_eq { (f, *w) } else { (*w, f) };
+                if !zero_weight_edges[r].insert(l) {
+                    continue;
+                }
+                let mut diff = solutions[r].clone();
+                diff.subtract(&solutions[l]);
+                if diff.count() != 0 {
+                    solutions[l].union(&diff);
+                    deltas[l].union(&diff);
+                }
+            }
+        }
     }
 }
 
-// fn place_to_index(place: Place<'_>) -> usize {
-//     for proj in place.projection {
-//         match proj {
-//             PlaceElem::Deref => {}
-//             PlaceElem::Field(f, _) => projection = projection.push(f.as_usize()),
-//             PlaceElem::Index(_) => projection = projection.push(0),
-//             _ => unreachable!(),
-//         }
-//     }
-//     let loc = Loc::new(root, projection);
-//     let deref = place.is_indirect_first_projection();
-//     Self::new(false, deref, loc)
-// }
+enum TyInfo<'a> {
+    Primitive,
+    Aggregate(usize, Vec<(usize, &'a TyInfo<'a>)>),
+}
+
+impl std::fmt::Debug for TyInfo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primitive => write!(f, "*"),
+            Self::Aggregate(len, fields) => {
+                write!(f, "[{}", len)?;
+                for (i, ty_info) in fields {
+                    let sep = if *i == 0 { ";" } else { "," };
+                    write!(f, "{} {}: {:?}", sep, i, ty_info)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+impl TyInfo<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Primitive => 1,
+            Self::Aggregate(len, _) => *len,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Var {
@@ -288,14 +744,101 @@ impl std::fmt::Debug for Var {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct ProjVar {
-    var: Var,
+struct Loc {
+    root: usize,
     proj: usize,
 }
 
-impl std::fmt::Debug for ProjVar {
+impl std::fmt::Debug for Loc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}+{}", self.var, self.proj)
+        write!(f, "{}", self.root)?;
+        if self.proj != 0 {
+            write!(f, "+{}", self.proj)?;
+        }
+        Ok(())
+    }
+}
+
+impl Loc {
+    #[inline]
+    fn new(root: usize, proj: usize) -> Self {
+        Self { root, proj }
+    }
+
+    #[inline]
+    fn new_root(root: usize) -> Self {
+        Self { root, proj: 0 }
+    }
+
+    #[inline]
+    fn add(self, proj: usize) -> Self {
+        Self {
+            proj: self.proj + proj,
+            ..self
+        }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self.root + self.proj
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PrefixedLoc {
+    deref: bool,
+    r#ref: bool,
+    var: Loc,
+}
+
+impl PrefixedLoc {
+    #[inline]
+    fn new(var: Loc) -> Self {
+        Self {
+            deref: false,
+            r#ref: false,
+            var,
+        }
+    }
+
+    #[inline]
+    fn new_ref(var: Loc) -> Self {
+        Self {
+            deref: false,
+            r#ref: true,
+            var,
+        }
+    }
+
+    #[inline]
+    fn with_deref(self, deref: bool) -> Self {
+        Self { deref, ..self }
+    }
+
+    #[inline]
+    fn with_ref(self, r#ref: bool) -> Self {
+        Self { r#ref, ..self }
+    }
+
+    #[inline]
+    fn add(self, proj: usize) -> Self {
+        Self {
+            var: self.var.add(proj),
+            ..self
+        }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self.var.index()
+    }
+}
+
+#[inline]
+fn unwrap_ptr(ty: Ty<'_>) -> Option<Ty<'_>> {
+    match ty.kind() {
+        TyKind::Ref(_, ty, _) | TyKind::RawPtr(TypeAndMut { ty, .. }) => Some(*ty),
+        _ => None,
     }
 }
 
@@ -321,6 +864,7 @@ struct FnPtrVisitor<'tcx> {
 }
 
 impl<'tcx> FnPtrVisitor<'tcx> {
+    #[inline]
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
@@ -365,5 +909,29 @@ impl<'tcx> Visitor<'tcx> for FnPtrVisitor<'tcx> {
             _ => {}
         }
         self.super_rvalue(rvalue, location);
+    }
+}
+
+#[repr(transparent)]
+struct VecBitSet<'a, T: Idx>(&'a Vec<ChunkedBitSet<T>>);
+
+impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
+    type Node = T;
+}
+
+impl<T: Idx> WithNumNodes for VecBitSet<'_, T> {
+    fn num_nodes(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a, T: Idx> GraphSuccessors<'_> for VecBitSet<'a, T> {
+    type Item = T;
+    type Iter = ChunkedBitIter<'a, T>;
+}
+
+impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
+    fn successors(&self, node: Self::Node) -> <Self as GraphSuccessors<'_>>::Iter {
+        self.0[node.index()].iter()
     }
 }
