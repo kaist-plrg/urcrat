@@ -1704,3 +1704,241 @@ fn test_cycle_twice() {
         },
     );
 }
+
+#[test]
+fn test_call() {
+    // _2 = const 0_i32
+    // _4 = &mut _2
+    // _3 = &raw mut (*_4)
+    // _1 = move _3
+    // _0 = _1
+    //
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = g(_2)
+    // _5 = const 0_i32
+    // _7 = &mut _5
+    // _6 = &raw mut (*_7)
+    // _4 = move _6
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: *mut libc::c_int) -> *mut libc::c_int {
+            let mut y: libc::c_int = 0 as libc::c_int;
+            x = &mut y;
+            return x;
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: *mut libc::c_int = g(y);
+        let mut w: libc::c_int = 0 as libc::c_int;
+        z = &mut w;
+        ",
+        |res| {
+            assert_eq!(res.ends, v(12));
+            assert_eq!(sol(&res, 0), vec![2, 6]);
+            assert_eq!(sol(&res, 1), vec![2, 6]);
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![2]);
+            assert_eq!(sol(&res, 4), vec![2]);
+            assert_eq!(sol(&res, 5), e());
+            assert_eq!(sol(&res, 6), e());
+            assert_eq!(sol(&res, 7), vec![6]);
+            assert_eq!(sol(&res, 8), vec![6]);
+            assert_eq!(sol(&res, 9), vec![2, 6, 10]);
+            assert_eq!(sol(&res, 10), e());
+            assert_eq!(sol(&res, 11), vec![10]);
+            assert_eq!(sol(&res, 12), vec![10]);
+        },
+    );
+}
+
+#[test]
+fn test_call_struct() {
+    // _4 = (_1.0: *mut i32)
+    // _5 = (_1.1: *mut i32)
+    // _0 = t { x: move _4, y: move _5, z: _3 }
+    //
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _8 = &mut _2
+    // _7 = &raw mut (*_8)
+    // _4 = s { x: move _5, y: move _7 }
+    // _10 = const 0_i32
+    // _12 = &mut _3
+    // _11 = &raw mut (*_12)
+    // _9 = g(_4, move _10, move _11)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+            pub z: *mut libc::c_int,
+        }
+        pub unsafe extern \"C\" fn g(mut x: s, mut y: libc::c_int, mut z: *mut libc::c_int) -> t {
+            let mut w: t = {
+                let mut init = t { x: x.x, y: x.y, z: z };
+                init
+            };
+            return w;
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: s = {
+            let mut init = s { x: &mut x, y: &mut y };
+            init
+        };
+        let mut v: t = g(w, 0 as libc::c_int, &mut z);
+        ",
+        |res| {
+            assert_eq!(
+                res.ends,
+                vec![
+                    1, 1, 2, 3, 6, 5, 6, 7, 8, 9, 10, 11, 12, 14, 14, 15, 16, 17, 18, 21, 20, 21,
+                    22, 23, 24
+                ]
+            );
+            assert_eq!(sol(&res, 0), vec![10]);
+            assert_eq!(sol(&res, 1), vec![11]);
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![12]);
+            assert_eq!(sol(&res, 4), vec![10]);
+            assert_eq!(sol(&res, 5), vec![11]);
+            assert_eq!(sol(&res, 6), vec![12]);
+            assert_eq!(sol(&res, 7), vec![10]);
+            assert_eq!(sol(&res, 8), vec![11]);
+            assert_eq!(sol(&res, 9), e());
+            assert_eq!(sol(&res, 10), e());
+            assert_eq!(sol(&res, 11), e());
+            assert_eq!(sol(&res, 12), e());
+            assert_eq!(sol(&res, 13), vec![10]);
+            assert_eq!(sol(&res, 14), vec![11]);
+            assert_eq!(sol(&res, 15), vec![10]);
+            assert_eq!(sol(&res, 16), vec![10]);
+            assert_eq!(sol(&res, 17), vec![11]);
+            assert_eq!(sol(&res, 18), vec![11]);
+            assert_eq!(sol(&res, 19), vec![10]);
+            assert_eq!(sol(&res, 20), vec![11]);
+            assert_eq!(sol(&res, 21), vec![12]);
+            assert_eq!(sol(&res, 22), e());
+            assert_eq!(sol(&res, 23), vec![12]);
+            assert_eq!(sol(&res, 24), vec![12]);
+        },
+    );
+}
+
+#[test]
+fn test_call_fn_ptr() {
+    // _4 = (_1.0: *mut i32)
+    // _5 = (_1.1: *mut i32)
+    // _0 = t { x: move _4, y: move _5, z: _3 }
+    //
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // _6 = &mut _1
+    // _5 = &raw mut (*_6)
+    // _8 = &mut _2
+    // _7 = &raw mut (*_8)
+    // _4 = s { x: move _5, y: move _7 }
+    // _10 = g as unsafe extern "C" fn(s, i32, *mut i32) -> t (PointerCoercion(ReifyFnPointer))
+    // _9 = std::option::Option::<unsafe extern "C" fn(s, i32, *mut i32) -> t>::Some(move _10)
+    // _12 = std::option::Option::<unsafe extern "C" fn(s, i32, *mut i32) -> t>::unwrap(_9)
+    // _13 = const 0_i32
+    // _15 = &mut _3
+    // _14 = &raw mut (*_15)
+    // _11 = move _12(_4, move _13, move _14)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+            pub z: *mut libc::c_int,
+        }
+        pub unsafe extern \"C\" fn g(mut x: s, mut y: libc::c_int, mut z: *mut libc::c_int) -> t {
+            let mut w: t = {
+                let mut init = t { x: x.x, y: x.y, z: z };
+                init
+            };
+            return w;
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: s = {
+            let mut init = s { x: &mut x, y: &mut y };
+            init
+        };
+        let mut h: Option::<unsafe extern \"C\" fn(s, libc::c_int, *mut libc::c_int) -> t> = Some(
+            g as unsafe extern \"C\" fn(s, libc::c_int, *mut libc::c_int) -> t,
+        );
+        let mut v: t = h.unwrap()(w, 0 as libc::c_int, &mut z);
+        ",
+        |res| {
+            assert_eq!(
+                res.ends,
+                vec![
+                    6, 1, 2, 3, 6, 5, 6, 7, 8, 9, 10, 11, 12, 14, 14, 15, 16, 17, 18, 19, 20, 23,
+                    22, 23, 24, 25, 26, 27
+                ]
+            );
+            assert_eq!(sol(&res, 0), vec![10]);
+            assert_eq!(sol(&res, 1), vec![11]);
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![12]);
+            assert_eq!(sol(&res, 4), vec![10]);
+            assert_eq!(sol(&res, 5), vec![11]);
+            assert_eq!(sol(&res, 6), vec![12]);
+            assert_eq!(sol(&res, 7), vec![10]);
+            assert_eq!(sol(&res, 8), vec![11]);
+            assert_eq!(sol(&res, 9), e());
+            assert_eq!(sol(&res, 10), e());
+            assert_eq!(sol(&res, 11), e());
+            assert_eq!(sol(&res, 12), e());
+            assert_eq!(sol(&res, 13), vec![10]);
+            assert_eq!(sol(&res, 14), vec![11]);
+            assert_eq!(sol(&res, 15), vec![10]);
+            assert_eq!(sol(&res, 16), vec![10]);
+            assert_eq!(sol(&res, 17), vec![11]);
+            assert_eq!(sol(&res, 18), vec![11]);
+            assert_eq!(sol(&res, 19), vec![0]);
+            assert_eq!(sol(&res, 20), vec![0]);
+            assert_eq!(sol(&res, 21), vec![10]);
+            assert_eq!(sol(&res, 22), vec![11]);
+            assert_eq!(sol(&res, 23), vec![12]);
+            assert_eq!(sol(&res, 24), vec![0]);
+            assert_eq!(sol(&res, 25), e());
+            assert_eq!(sol(&res, 26), vec![12]);
+            assert_eq!(sol(&res, 27), vec![12]);
+        },
+    );
+}

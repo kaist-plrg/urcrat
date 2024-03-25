@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_data_structures::graph::{
     scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
 };
-use rustc_hir::{ItemKind, LangItem};
+use rustc_hir::{ItemKind, LangItem, Node};
 use rustc_index::{
     bit_set::{HybridBitSet, HybridIter},
     Idx, IndexVec,
@@ -17,7 +17,7 @@ use rustc_middle::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
         visit::Visitor,
         AggregateKind, BasicBlock, BinOp, ConstantKind, Local, LocalDecl, Location, Operand, Place,
-        PlaceElem, Rvalue, Statement, StatementKind, TerminatorKind, UnOp,
+        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
     },
     ty::{Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -105,7 +105,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         for _ in 0..body.arg_count {
             params.push(local_decls.next().unwrap());
         }
-        let local_decls = std::iter::once(ret).chain(params).chain(local_decls);
+        let local_decls = params
+            .into_iter()
+            .chain(std::iter::once(ret))
+            .chain(local_decls);
 
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
@@ -115,7 +118,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             let root = LocRoot::Local(*local_def_id, local);
             compute_locs(ty, ProjectedLoc::new_root(root), &mut index_to_loc);
 
-            if fn_ptr && local.index() == body.arg_count {
+            if fn_ptr && local.index() == 0 {
                 ends[static_index] = ends.len() - 1;
             }
 
@@ -138,7 +141,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
         for (bb, bbd) in body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else { continue };
-            let def_id = operand_to_fn(func).unwrap();
+            let def_id = some_or!(operand_to_fn(func), continue);
             if is_c_fn(def_id, tcx) {
                 allocs.push(Var::Alloc(*local_def_id, bb));
             }
@@ -172,13 +175,12 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                 let ctx = Context::new(&body.local_decls, *local_def_id);
                 analyzer.transfer_stmt(stmt, ctx);
             }
-            // let terminator = bbd.terminator();
-            // let ctx = Context::new(&body.local_decls, *local_def_id);
-            // analyzer.transfer_term(terminator, ctx);
+            let terminator = bbd.terminator();
+            let ctx = Context::new(&body.local_decls, *local_def_id);
+            analyzer.transfer_term(terminator, ctx);
         }
     }
 
-    println!("{:?}", analyzer.graph);
     let solutions = analyzer.graph.solve(&ends);
     AnalysisResults { solutions, ends }
 }
@@ -435,6 +437,88 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         }
     }
 
+    fn transfer_term(&mut self, term: &Terminator<'tcx>, ctx: Context<'_, 'tcx>) {
+        let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &term.kind
+        else {
+            return;
+        };
+        assert!(destination.projection.is_empty());
+
+        let arg_locs: Vec<_> = args.iter().map(|arg| self.transfer_op(arg, ctx)).collect();
+        let output = destination.ty(ctx.locals, self.tcx).ty;
+        let dst = self.prefixed_loc(*destination, ctx);
+
+        match func {
+            Operand::Copy(func) | Operand::Move(func) => {
+                assert!(func.projection.is_empty());
+                let mut func = self.prefixed_loc(*func, ctx).with_deref(true);
+                for (arg, arg_loc) in args.iter().zip(arg_locs) {
+                    let ty = arg.ty(ctx.locals, self.tcx);
+                    if let Some(arg) = arg_loc {
+                        self.transfer_assign(func, arg, ty);
+                    }
+                    func = func.add(self.ty_infos[&ty].len());
+                }
+                self.transfer_assign(dst, func, output);
+            }
+            Operand::Constant(box constant) => {
+                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                assert!(matches!(value, ConstValue::ZeroSized));
+                let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                let mut name: Vec<_> = self
+                    .tcx
+                    .def_path(*def_id)
+                    .data
+                    .into_iter()
+                    .map(|data| data.to_string())
+                    .collect();
+                while name.len() < 4 {
+                    name.push(String::new());
+                }
+                let seg = |i: usize| name.get(i).map(|s| s.as_str()).unwrap_or_default();
+                let name = (seg(0), seg(1), seg(2), seg(3));
+                if let Some(local_def_id) = def_id.as_local() {
+                    if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
+                        let span = self.tcx.span_of_impl(impl_def_id).unwrap();
+                        let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
+                        assert_eq!(code, "BitfieldStruct");
+                    } else if name.1.contains("{extern#") {
+                        // self.transfer_c_call(dst, output, ctx);
+                    } else {
+                        let inputs = self.get_input_tys(*def_id).unwrap();
+                        let mut index = self.statics[&local_def_id];
+                        for (ty, arg) in inputs.iter().zip(arg_locs) {
+                            if let Some(arg) = arg {
+                                let loc = Loc::new_root(index);
+                                self.transfer_assign(PrefixedLoc::new(loc), arg, *ty);
+                            }
+                            index += self.ty_infos[ty].len();
+                        }
+                        let loc = Loc::new_root(index);
+                        self.transfer_assign(dst, PrefixedLoc::new(loc), output);
+                    }
+                } else {
+                    match name {
+                        ("option" | "result", _, "unwrap", _) => {
+                            if let Some(arg) = &arg_locs[0] {
+                                self.transfer_assign(dst, *arg, output);
+                            }
+                        }
+                        ("slice", _, "as_ptr" | "as_mut_ptr", _) => todo!(),
+                        ("ptr", _, _, "offset") => todo!(),
+                        ("vec", _, "leak" | "as_mut_ptr", _) => todo!(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
         let var = Var::Local(def_id.as_local()?, Local::new(0));
         let loc = Loc::new_root(self.vars[&var]);
@@ -464,6 +548,16 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let var = Var::Local(ctx.owner, place.local);
         let loc = Loc::new(self.vars[&var], index);
         PrefixedLoc::new(loc).with_deref(place.is_indirect_first_projection())
+    }
+
+    fn get_input_tys(&self, func: DefId) -> Option<&'tcx [Ty<'tcx>]> {
+        if let Some(node) = self.tcx.hir().get_if_local(func) {
+            let Node::Item(item) = node else { return None };
+            if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                return None;
+            }
+        }
+        Some(self.tcx.fn_sig(func).skip_binder().inputs().skip_binder())
     }
 }
 
