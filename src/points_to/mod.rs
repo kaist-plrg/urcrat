@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_data_structures::graph::{
     scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
 };
-use rustc_hir::{ItemKind, LangItem, Node};
+use rustc_hir::ItemKind;
 use rustc_index::{
     bit_set::{HybridBitSet, HybridIter},
     Idx, IndexVec,
@@ -175,7 +175,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         graph: Graph::new(ends.len()),
     };
     for (local_def_id, body) in &bodies {
-        println!("{}", compile_util::body_to_str(body));
+        // println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
                 let ctx = Context::new(&body.local_decls, *local_def_id);
@@ -206,9 +206,6 @@ fn compute_ty_info<'a, 'tcx>(
             if ty.is_c_void(tcx) {
                 prim
             } else {
-                if adt_def.is_enum() {
-                    assert_eq!(tcx.lang_items().get(LangItem::Option), Some(adt_def.did()));
-                }
                 let ts = adt_def.variants().iter().flat_map(|variant| {
                     variant
                         .fields
@@ -222,13 +219,7 @@ fn compute_ty_info<'a, 'tcx>(
             let t = compute_ty_info(*ty, tys, prim, arena, tcx);
             arena.alloc(TyInfo::Array(t))
         }
-        TyKind::Tuple(ts) => {
-            if ts.is_empty() {
-                prim
-            } else {
-                compute_ty_info_iter(ts.iter(), tys, prim, arena, tcx)
-            }
-        }
+        TyKind::Tuple(ts) => compute_ty_info_iter(ts.iter(), tys, prim, arena, tcx),
         _ => prim,
     };
     tys.insert(ty, ty_info);
@@ -251,7 +242,11 @@ fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
         fields.push((len, ty_info));
         len += ty_info.len();
     }
-    arena.alloc(TyInfo::Struct(len, fields))
+    if len == 0 {
+        prim
+    } else {
+        arena.alloc(TyInfo::Struct(len, fields))
+    }
 }
 
 fn compute_ends(ty: &TyInfo<'_>, ends: &mut Vec<usize>) {
@@ -350,6 +345,23 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
                 ) {
                     if let Some(r) = self.transfer_op(r1, ctx) {
+                        if !r.deref {
+                            self.transfer_assign(l, r, ty);
+                        }
+                    }
+                    if let Some(r) = self.transfer_op(r2, ctx) {
+                        self.transfer_assign(l, r, ty);
+                    }
+                }
+            }
+            Rvalue::CheckedBinaryOp(op, box (r1, r2)) => {
+                if !matches!(
+                    op,
+                    BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
+                ) {
+                    let TyKind::Tuple(ts) = ty.kind() else { unreachable!() };
+                    let ty = ts[0];
+                    if let Some(r) = self.transfer_op(r1, ctx) {
                         self.transfer_assign(l, r, ty);
                     }
                     if let Some(r) = self.transfer_op(r2, ctx) {
@@ -357,7 +369,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }
                 }
             }
-            Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::NullaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
                 if matches!(op, UnOp::Neg) {
@@ -433,7 +444,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let var = Loc::new_root(self.statics[&def_id.as_local()?]);
+                        let var = Loc::new_root(self.statics.get(&def_id.as_local()?).copied()?);
                         Some(PrefixedLoc::new_ref(var))
                     }
                     ConstValue::Slice { .. } => None,
@@ -488,6 +499,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     .into_iter()
                     .map(|data| data.to_string())
                     .collect();
+                let is_extern = name.iter().any(|s| s.starts_with("{extern#"));
                 while name.len() < 4 {
                     name.push(String::new());
                 }
@@ -498,21 +510,21 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         let span = self.tcx.span_of_impl(impl_def_id).unwrap();
                         let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
                         assert_eq!(code, "BitfieldStruct");
-                    } else if name.0.contains("{extern#") {
+                    } else if is_extern {
                         if output.is_unsafe_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
                             let loc = Loc::new_root(self.vars[&var]);
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                         }
                     } else {
-                        let inputs = self.get_input_tys(*def_id).unwrap();
                         let mut index = self.statics[&local_def_id];
-                        for (ty, arg) in inputs.iter().zip(arg_locs) {
-                            if let Some(arg) = arg {
+                        for (arg, arg_loc) in args.iter().zip(arg_locs) {
+                            let ty = arg.ty(ctx.locals, self.tcx);
+                            if let Some(arg) = arg_loc {
                                 let loc = Loc::new_root(index);
-                                self.transfer_assign(PrefixedLoc::new(loc), arg, *ty);
+                                self.transfer_assign(PrefixedLoc::new(loc), arg, ty);
                             }
-                            index += self.ty_infos[ty].len();
+                            index += self.ty_infos[&ty].len();
                         }
                         let loc = Loc::new_root(index);
                         self.transfer_assign(dst, PrefixedLoc::new(loc), output);
@@ -535,7 +547,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
 
     fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
         let var = Var::Local(def_id.as_local()?, Local::new(0));
-        let loc = Loc::new_root(self.vars[&var]);
+        let loc = Loc::new_root(self.vars.get(&var).copied()?);
         Some(PrefixedLoc::new_ref(loc))
     }
 
@@ -549,7 +561,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let mut ty = self.ty_infos[&ty];
         for proj in place.projection {
             match proj {
-                PlaceElem::Deref | PlaceElem::Index(_) => {}
+                PlaceElem::Deref => {}
+                PlaceElem::Index(_) => {
+                    let TyInfo::Array(t) = ty else { unreachable!() };
+                    ty = t;
+                }
                 PlaceElem::Field(f, _) => {
                     let TyInfo::Struct(_, fs) = ty else { unreachable!() };
                     let (i, nested_ty) = fs[f.index()];
@@ -562,16 +578,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let var = Var::Local(ctx.owner, place.local);
         let loc = Loc::new(self.vars[&var], index);
         PrefixedLoc::new(loc).with_deref(place.is_indirect_first_projection())
-    }
-
-    fn get_input_tys(&self, func: DefId) -> Option<&'tcx [Ty<'tcx>]> {
-        if let Some(node) = self.tcx.hir().get_if_local(func) {
-            let Node::Item(item) = node else { return None };
-            if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
-                return None;
-            }
-        }
-        Some(self.tcx.fn_sig(func).skip_binder().inputs().skip_binder())
     }
 }
 

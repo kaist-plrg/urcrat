@@ -32,5 +32,5 @@ fn main() {
     let start = std::time::Instant::now();
     points_to::analyze_path(&file);
     let elapsed = start.elapsed();
-    println!("{:?}", elapsed);
+    println!("{}", elapsed.as_millis());
 }
