@@ -1942,3 +1942,181 @@ fn test_call_fn_ptr() {
         },
     );
 }
+
+#[test]
+fn test_array_offset() {
+    // _1 = [const 0_i32; 2]
+    // _7 = &mut _1
+    // _6 = move _7 as &mut [i32] (PointerCoercion(Unsize))
+    // _5 = core::slice::<impl [i32]>::as_mut_ptr(move _6)
+    // _9 = const 1_i32
+    // _8 = move _9 as isize (IntToInt)
+    // _4 = std::ptr::mut_ptr::<impl *mut i32>::offset(move _5, move _8)
+    // _3 = &mut (*_4)
+    // _2 = &raw mut (*_3)
+    analyze_fn(
+        "
+        let mut x: [libc::c_int; 2] = [0; 2];
+        let mut y: *mut libc::c_int = &mut *x.as_mut_ptr().offset(1 as libc::c_int as isize)
+            as *mut libc::c_int;
+        ",
+        |res| {
+            assert_eq!(res.ends, v(9));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), vec![1]);
+            assert_eq!(sol(&res, 3), vec![1]);
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), vec![1]);
+            assert_eq!(sol(&res, 6), vec![1]);
+            assert_eq!(sol(&res, 7), vec![1]);
+            assert_eq!(sol(&res, 8), e());
+            assert_eq!(sol(&res, 9), e());
+        },
+    );
+}
+
+#[test]
+fn test_malloc() {
+    // _4 = std::mem::size_of::<i32>()
+    // _3 = move _4 as u64 (IntToInt)
+    // _2 = malloc(move _3)
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    analyze_fn(
+        "
+        let mut x: *mut libc::c_int = malloc(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
+        ) as *mut libc::c_int;
+        ",
+        |res| {
+            assert_eq!(res.ends, v(5));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), vec![5]);
+            assert_eq!(sol(&res, 2), vec![5]);
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), e());
+            assert_eq!(sol(&res, 5), e());
+        },
+    );
+}
+
+#[test]
+fn test_malloc_struct() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // _4 = const 0_i32
+    // _8 = std::mem::size_of::<s>() -> [return: bb1, unwind continue]
+    // _7 = move _8 as u64 (IntToInt)
+    // _6 = malloc(move _7) -> [return: bb2, unwind continue]
+    // _5 = move _6 as *mut s (PtrToPtr)
+    // _10 = &mut _1
+    // _9 = &raw mut (*_10)
+    // ((*_5).0: *mut i32) = move _9
+    // _12 = &mut _2
+    // _11 = &raw mut (*_12)
+    // ((*_5).1: *mut i32) = move _11
+    // _14 = &mut _3
+    // _13 = &raw mut (*_14)
+    // ((*_5).2: *mut i32) = move _13
+    // _18 = std::mem::size_of::<r>() -> [return: bb3, unwind continue]
+    // _17 = move _18 as u64 (IntToInt)
+    // _16 = malloc(move _17) -> [return: bb4, unwind continue]
+    // _15 = move _16 as *mut r (PtrToPtr)
+    // _20 = &mut _1
+    // _19 = &raw mut (*_20)
+    // (((*_15).0: t).0: *mut i32) = move _19
+    // _22 = &mut _2
+    // _21 = &raw mut (*_22)
+    // (((*_15).0: t).1: *mut i32) = move _21
+    // _24 = &mut ((*_15).1: t)
+    // _23 = &raw mut (*_24)
+    // _26 = &mut _3
+    // _25 = &raw mut (*_26)
+    // ((*_23).0: *mut i32) = move _25
+    // _28 = &mut _4
+    // _27 = &raw mut (*_28)
+    // ((*_23).1: *mut i32) = move _27
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+            pub z: *mut libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct r {
+            pub x: t,
+            pub y: t,
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: libc::c_int = 0 as libc::c_int;
+        let mut s: *mut s = malloc(::std::mem::size_of::<s>() as libc::c_ulong) as *mut s;
+        (*s).x = &mut x;
+        (*s).y = &mut y;
+        (*s).z = &mut z;
+        let mut r: *mut r = malloc(::std::mem::size_of::<r>() as libc::c_ulong) as *mut r;
+        (*r).x.x = &mut x;
+        (*r).x.y = &mut y;
+        let mut t: *mut t = &mut (*r).y;
+        (*t).x = &mut z;
+        (*t).y = &mut w;
+        ",
+        |res| {
+            let mut v = v(28);
+            v.extend([32, 30, 32, 32, 36, 34, 36, 36]);
+            assert_eq!(res.ends, v);
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), e());
+            assert_eq!(sol(&res, 5), vec![29]);
+            assert_eq!(sol(&res, 6), vec![29]);
+            assert_eq!(sol(&res, 7), e());
+            assert_eq!(sol(&res, 8), e());
+            assert_eq!(sol(&res, 9), vec![1]);
+            assert_eq!(sol(&res, 10), vec![1]);
+            assert_eq!(sol(&res, 11), vec![2]);
+            assert_eq!(sol(&res, 12), vec![2]);
+            assert_eq!(sol(&res, 13), vec![3]);
+            assert_eq!(sol(&res, 14), vec![3]);
+            assert_eq!(sol(&res, 15), vec![33]);
+            assert_eq!(sol(&res, 16), vec![33]);
+            assert_eq!(sol(&res, 17), e());
+            assert_eq!(sol(&res, 18), e());
+            assert_eq!(sol(&res, 19), vec![1]);
+            assert_eq!(sol(&res, 20), vec![1]);
+            assert_eq!(sol(&res, 21), vec![2]);
+            assert_eq!(sol(&res, 22), vec![2]);
+            assert_eq!(sol(&res, 23), vec![35]);
+            assert_eq!(sol(&res, 24), vec![35]);
+            assert_eq!(sol(&res, 25), vec![3]);
+            assert_eq!(sol(&res, 26), vec![3]);
+            assert_eq!(sol(&res, 27), vec![4]);
+            assert_eq!(sol(&res, 28), vec![4]);
+            assert_eq!(sol(&res, 29), vec![1]);
+            assert_eq!(sol(&res, 30), vec![2]);
+            assert_eq!(sol(&res, 31), vec![3]);
+            assert_eq!(sol(&res, 32), e());
+            assert_eq!(sol(&res, 33), vec![1]);
+            assert_eq!(sol(&res, 34), vec![2]);
+            assert_eq!(sol(&res, 35), vec![3]);
+            assert_eq!(sol(&res, 36), vec![4]);
+        },
+    );
+}

@@ -140,9 +140,15 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         index_to_loc[static_index].push(ProjectedLoc::new_root(root));
 
         for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-            let TerminatorKind::Call { func, .. } = &bbd.terminator().kind else { continue };
+            let TerminatorKind::Call {
+                func, destination, ..
+            } = &bbd.terminator().kind
+            else {
+                continue;
+            };
             let def_id = some_or!(operand_to_fn(func), continue);
-            if is_c_fn(def_id, tcx) {
+            let ty = destination.ty(&body.local_decls, tcx).ty;
+            if ty.is_unsafe_ptr() && is_c_fn(def_id, tcx) {
                 allocs.push(Var::Alloc(*local_def_id, bb));
             }
         }
@@ -170,14 +176,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     };
     for (local_def_id, body) in &bodies {
         println!("{}", compile_util::body_to_str(body));
-        for (_block, bbd) in body.basic_blocks.iter_enumerated() {
+        for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
                 let ctx = Context::new(&body.local_decls, *local_def_id);
                 analyzer.transfer_stmt(stmt, ctx);
             }
             let terminator = bbd.terminator();
             let ctx = Context::new(&body.local_decls, *local_def_id);
-            analyzer.transfer_term(terminator, ctx);
+            analyzer.transfer_term(terminator, ctx, block);
         }
     }
 
@@ -437,7 +443,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         }
     }
 
-    fn transfer_term(&mut self, term: &Terminator<'tcx>, ctx: Context<'_, 'tcx>) {
+    fn transfer_term(
+        &mut self,
+        term: &Terminator<'tcx>,
+        ctx: Context<'_, 'tcx>,
+        block: BasicBlock,
+    ) {
         let TerminatorKind::Call {
             func,
             args,
@@ -487,8 +498,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         let span = self.tcx.span_of_impl(impl_def_id).unwrap();
                         let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
                         assert_eq!(code, "BitfieldStruct");
-                    } else if name.1.contains("{extern#") {
-                        // self.transfer_c_call(dst, output, ctx);
+                    } else if name.0.contains("{extern#") {
+                        if output.is_unsafe_ptr() {
+                            let var = Var::Alloc(ctx.owner, block);
+                            let loc = Loc::new_root(self.vars[&var]);
+                            self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
+                        }
                     } else {
                         let inputs = self.get_input_tys(*def_id).unwrap();
                         let mut index = self.statics[&local_def_id];
@@ -504,14 +519,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }
                 } else {
                     match name {
-                        ("option" | "result", _, "unwrap", _) => {
+                        ("option" | "result", _, "unwrap", _)
+                        | ("slice", _, "as_ptr" | "as_mut_ptr", _)
+                        | ("ptr", _, _, "offset") => {
                             if let Some(arg) = &arg_locs[0] {
                                 self.transfer_assign(dst, *arg, output);
                             }
                         }
-                        ("slice", _, "as_ptr" | "as_mut_ptr", _) => todo!(),
-                        ("ptr", _, _, "offset") => todo!(),
-                        ("vec", _, "leak" | "as_mut_ptr", _) => todo!(),
                         _ => {}
                     }
                 }
