@@ -10,7 +10,7 @@ fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
 }
 
 fn analyze_fn_with<F>(types: &str, params: &str, code: &str, f: F)
-where F: FnOnce(AnalysisResults) + Send {
+where F: FnOnce(AnalysisResults, LocalDefId) + Send {
     let name = "f";
     let code = format!(
         "
@@ -25,12 +25,25 @@ where F: FnOnce(AnalysisResults) + Send {
     ",
         types, name, params, code
     );
-    run_compiler(&code, |tcx| f(analyze(tcx)));
+    run_compiler(&code, |tcx| f(analyze(tcx), find(name, tcx)));
 }
 
 fn analyze_fn<F>(code: &str, f: F)
-where F: FnOnce(AnalysisResults) + Send {
+where F: FnOnce(AnalysisResults, LocalDefId) + Send {
     analyze_fn_with("", "", code, f);
+}
+
+fn find(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
+    let hir = tcx.hir();
+    hir.items()
+        .find_map(|item_id| {
+            let item = hir.item(item_id);
+            if item.ident.name.as_str() != name {
+                return None;
+            }
+            Some(item_id.owner_id.def_id)
+        })
+        .unwrap()
 }
 
 fn sol(res: &AnalysisResults, i: usize) -> Vec<usize> {
@@ -55,7 +68,7 @@ fn test_eq_ref() {
         let mut x: libc::c_int = 0 as libc::c_int;
         let mut y: *mut libc::c_int = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(3));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -79,7 +92,7 @@ fn test_eq() {
         let mut y: *mut libc::c_int = &mut x;
         z = y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(4));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -108,7 +121,7 @@ fn test_eq_two() {
         let mut w: *mut libc::c_int = z;
         z = &mut y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -141,7 +154,7 @@ fn test_eq_propagate() {
         w = z;
         y = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -169,7 +182,7 @@ fn test_eq_deref() {
         let mut z: *mut *mut libc::c_int = &mut y;
         let mut w: *mut libc::c_int = *z;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -203,7 +216,7 @@ fn test_eq_deref_subset() {
         let mut v: *mut libc::c_int = &mut y;
         v = *w;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(9));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -239,7 +252,7 @@ fn test_eq_deref_propagate() {
         let mut v: *mut libc::c_int = w;
         w = *z;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -270,7 +283,7 @@ fn test_deref_eq() {
         let mut z: *mut *mut libc::c_int = &mut y;
         *z = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -302,7 +315,7 @@ fn test_deref_eq_subset() {
         let mut w: *mut *mut libc::c_int = &mut z;
         *w = &mut y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -338,7 +351,7 @@ fn test_deref_eq_propagate() {
         w = y;
         *z = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -368,7 +381,7 @@ fn test_array_aggregate() {
         let mut y: libc::c_int = 0 as libc::c_int;
         let mut p: [*mut libc::c_int; 2] = [&mut x, &mut y];
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -410,7 +423,7 @@ fn test_array_eq_ref() {
         p[0 as libc::c_int as usize] = &mut x;
         p[1 as libc::c_int as usize] = &mut y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(16));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![3, 4]);
@@ -466,7 +479,7 @@ fn test_struct_aggregate() {
             init
         };
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, vec![0, 1, 2, 5, 4, 5, 6, 7, 8, 9, 10]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -571,7 +584,7 @@ fn test_struct_eq_ref() {
         };
         s0 = s1;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -688,7 +701,7 @@ fn test_struct_deref_eq() {
         (*w).y.x = &mut x2;
         (*w).y.y = &mut x3;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -791,7 +804,7 @@ fn test_struct_eq_deref() {
         let mut y2: *mut libc::c_int = (*w).y.x;
         let mut y3: *mut libc::c_int = (*w).y.y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -883,7 +896,7 @@ fn test_struct_field_ref() {
         let mut x2: *mut *mut libc::c_int = &mut s.y.x;
         let mut x3: *mut *mut libc::c_int = &mut s.y.y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![0, 4, 2, 4, 4, 6, 6, 7, 8, 10, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -968,7 +981,7 @@ fn test_struct_field_deref_ref() {
         let mut x2: *mut *mut libc::c_int = &mut (*t1).x;
         let mut x3: *mut *mut libc::c_int = &mut (*t1).y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -1039,7 +1052,7 @@ fn test_struct_deref_eq_ends() {
         (*v).x = &mut x;
         (*v).y = &mut y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1089,7 +1102,7 @@ fn test_struct_eq_deref_ends() {
         let mut u: *mut libc::c_int = (*v).x;
         let mut t: *mut libc::c_int = (*v).y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1133,7 +1146,7 @@ fn test_struct_ref_deref_ends() {
         let mut z: *mut *mut libc::c_int = &mut (*y).x;
         let mut w: *mut *mut libc::c_int = &mut (*y).y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1168,7 +1181,7 @@ fn test_union_aggregate() {
         let mut x: libc::c_int = 0 as libc::c_int;
         let mut y: u = u { y: &mut x };
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, vec![0, 1, 3, 3, 4, 5]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1208,7 +1221,7 @@ fn test_copy_for_deref() {
         let mut w: *mut *mut *mut libc::c_int = &mut z;
         **w = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(9));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1237,7 +1250,7 @@ fn test_static() {
         "
         let mut y: *mut libc::c_int = &mut x;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(4));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1286,7 +1299,7 @@ fn test_static_struct_field_eq() {
         z.x = &mut x;
         z.y = &mut y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
@@ -1335,7 +1348,7 @@ fn test_static_struct_field_ref() {
         let mut x: *mut libc::c_int = &mut s.x;
         let mut y: *mut libc::c_int = &mut s.y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, vec![1, 1, 2, 3, 4, 5, 6, 7, 8]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1366,7 +1379,7 @@ fn test_static_ref() {
         "",
         "
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(5));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![0]);
@@ -1413,7 +1426,7 @@ fn test_static_struct_ref() {
         "",
         "
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![0, 1, 3, 3, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
@@ -1458,7 +1471,7 @@ fn test_cycle() {
         z = w;
         w = z;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1499,7 +1512,7 @@ fn test_cycle_propagate_eq() {
         w = z;
         v = w;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(10));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1541,7 +1554,7 @@ fn test_cycle_propagate_eq_deref() {
         let mut v: *mut libc::c_int = *z;
         let mut u: *mut libc::c_int = *w;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(10));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1588,7 +1601,7 @@ fn test_cycle_propagate_deref_eq() {
         *z = &mut x0;
         *w = &mut x1;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(12));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1640,7 +1653,7 @@ fn test_cycle_propagate_ref_deref() {
         let mut z: *mut libc::c_int = &mut (*x).y;
         let mut w: *mut libc::c_int = &mut (*y).y;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, vec![0, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1687,7 +1700,7 @@ fn test_cycle_twice() {
         z = w;
         w = *v;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1737,7 +1750,7 @@ fn test_call() {
         let mut w: libc::c_int = 0 as libc::c_int;
         z = &mut w;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(12));
             assert_eq!(sol(&res, 0), vec![2, 6]);
             assert_eq!(sol(&res, 1), vec![2, 6]);
@@ -1808,7 +1821,7 @@ fn test_call_struct() {
         };
         let mut v: t = g(w, 0 as libc::c_int, &mut z);
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -1903,7 +1916,7 @@ fn test_call_fn_ptr() {
         );
         let mut v: t = h.unwrap()(w, 0 as libc::c_int, &mut z);
         ",
-        |res| {
+        |res, _| {
             assert_eq!(
                 res.ends,
                 vec![
@@ -1960,7 +1973,7 @@ fn test_array_offset() {
         let mut y: *mut libc::c_int = &mut *x.as_mut_ptr().offset(1 as libc::c_int as isize)
             as *mut libc::c_int;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(9));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -1988,7 +2001,7 @@ fn test_malloc() {
             ::std::mem::size_of::<libc::c_int>() as libc::c_ulong,
         ) as *mut libc::c_int;
         ",
-        |res| {
+        |res, _| {
             assert_eq!(res.ends, v(5));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![5]);
@@ -2076,7 +2089,7 @@ fn test_malloc_struct() {
         (*t).x = &mut z;
         (*t).y = &mut w;
         ",
-        |res| {
+        |res, _| {
             let mut v = v(28);
             v.extend([32, 30, 32, 32, 36, 34, 36, 36]);
             assert_eq!(res.ends, v);
@@ -2117,6 +2130,496 @@ fn test_malloc_struct() {
             assert_eq!(sol(&res, 34), vec![2]);
             assert_eq!(sol(&res, 35), vec![3]);
             assert_eq!(sol(&res, 36), vec![4]);
+        },
+    );
+}
+
+fn l(block: usize, statement_index: usize) -> Location {
+    Location {
+        block: BasicBlock::new(block),
+        statement_index,
+    }
+}
+
+fn wg(
+    writes: &HashMap<Location, HybridBitSet<usize>>,
+    block: usize,
+    statement_index: usize,
+) -> Vec<usize> {
+    writes
+        .get(&l(block, statement_index))
+        .unwrap()
+        .iter()
+        .collect()
+}
+
+fn ig(
+    ip: &mut HashMap<(LocalDefId, Local), HashSet<Vec<LocProjection>>>,
+    def_id: LocalDefId,
+    local: usize,
+) -> Vec<Vec<LocProjection>> {
+    let mut v: Vec<_> = ip
+        .remove(&(def_id, Local::from(local)))
+        .unwrap()
+        .into_iter()
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn test_writes_compound() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // _7 = &mut _1
+    // _6 = &raw mut (*_7)
+    // _9 = &mut _2
+    // _8 = &raw mut (*_9)
+    // _5 = s { x: move _6, y: move _8 }
+    // _12 = &mut _3
+    // _11 = &raw mut (*_12)
+    // _13 = const 0_usize as *mut i32 (PointerFromExposedAddress)
+    // _10 = [move _11, move _13]
+    // _4 = t { x: _5, y: move _10 }
+    // _14 = const 1_i32
+    // _1 = move _14
+    // _15 = const 1_i32
+    // _2 = move _15
+    // _16 = const 1_i32
+    // _3 = move _16
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+            pub y: *mut libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: s,
+            pub y: [*mut libc::c_int; 2],
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: t = {
+            let mut init = t {
+                x: {
+                    let mut init = s { x: &mut x, y: &mut y };
+                    init
+                },
+                y: [&mut z, 0 as *mut libc::c_int],
+            };
+            init
+        };
+        x = 1 as libc::c_int;
+        y = 1 as libc::c_int;
+        z = 1 as libc::c_int;
+        ",
+        |mut res, def_id| {
+            assert_eq!(
+                res.ends,
+                vec![0, 1, 2, 3, 6, 5, 6, 8, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+            );
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), vec![2]);
+            assert_eq!(sol(&res, 6), vec![3]);
+            assert_eq!(sol(&res, 7), vec![1]);
+            assert_eq!(sol(&res, 8), vec![2]);
+            assert_eq!(sol(&res, 9), vec![1]);
+            assert_eq!(sol(&res, 10), vec![1]);
+            assert_eq!(sol(&res, 11), vec![2]);
+            assert_eq!(sol(&res, 12), vec![2]);
+            assert_eq!(sol(&res, 13), vec![3]);
+            assert_eq!(sol(&res, 14), vec![3]);
+            assert_eq!(sol(&res, 15), vec![3]);
+            assert_eq!(sol(&res, 16), e());
+            assert_eq!(sol(&res, 17), e());
+            assert_eq!(sol(&res, 18), e());
+            assert_eq!(sol(&res, 19), e());
+
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1]);
+            assert_eq!(wg(&w, 0, 1), vec![2]);
+            assert_eq!(wg(&w, 0, 2), vec![3]);
+            assert_eq!(wg(&w, 0, 3), vec![10]);
+            assert_eq!(wg(&w, 0, 4), vec![9]);
+            assert_eq!(wg(&w, 0, 5), vec![12]);
+            assert_eq!(wg(&w, 0, 6), vec![11]);
+            assert_eq!(wg(&w, 0, 7), vec![7, 8]);
+            assert_eq!(wg(&w, 0, 8), vec![15]);
+            assert_eq!(wg(&w, 0, 9), vec![14]);
+            assert_eq!(wg(&w, 0, 10), vec![16]);
+            assert_eq!(wg(&w, 0, 11), vec![13]);
+            assert_eq!(wg(&w, 0, 12), vec![4, 5, 6]);
+            assert_eq!(wg(&w, 0, 13), vec![17]);
+            assert_eq!(wg(&w, 0, 14), vec![1]);
+            assert_eq!(wg(&w, 0, 15), vec![18]);
+            assert_eq!(wg(&w, 0, 16), vec![2]);
+            assert_eq!(wg(&w, 0, 17), vec![19]);
+            assert_eq!(wg(&w, 0, 18), vec![3]);
+
+            use LocProjection::*;
+            let mut ip = res.index_paths;
+
+            let mut ip1 = ip.remove(&1).unwrap();
+            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(
+                ig(&mut ip1, def_id, 4),
+                vec![vec![Field(0), Field(0), Deref]]
+            );
+            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Field(0), Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 6), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 7), vec![vec![Deref]]);
+            assert!(ip1.is_empty());
+
+            let mut ip2 = ip.remove(&2).unwrap();
+            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
+            assert_eq!(
+                ig(&mut ip2, def_id, 4),
+                vec![vec![Field(0), Field(1), Deref]]
+            );
+            assert_eq!(ig(&mut ip2, def_id, 5), vec![vec![Field(1), Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 8), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 9), vec![vec![Deref]]);
+            assert!(ip2.is_empty());
+
+            let mut ip3 = ip.remove(&3).unwrap();
+            assert_eq!(ig(&mut ip3, def_id, 3), vec![vec![]]);
+            assert_eq!(ig(&mut ip3, def_id, 4), vec![vec![Field(1), Index, Deref]]);
+            assert_eq!(ig(&mut ip3, def_id, 10), vec![vec![Index, Deref]]);
+            assert_eq!(ig(&mut ip3, def_id, 11), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip3, def_id, 12), vec![vec![Deref]]);
+            assert!(ip3.is_empty());
+
+            assert!(ip.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_writes_multiple() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _5 = &mut _1
+    // _4 = &raw mut (*_5)
+    // _7 = &mut _2
+    // _6 = &raw mut (*_7)
+    // _10 = &mut _6
+    // _9 = &raw mut (*_10)
+    // _8 = move _9 as *mut libc::c_void (PtrToPtr)
+    // _12 = &mut _4
+    // _11 = &raw mut (*_12)
+    // _8 = move _11 as *mut libc::c_void (PtrToPtr)
+    // _13 = const 1_i32
+    // _1 = move _13
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: *mut libc::c_int = &mut x;
+        let mut w: *mut *mut libc::c_int = &mut y;
+        let mut v: *mut libc::c_void = &mut w as *mut *mut *mut libc::c_int
+            as *mut libc::c_void;
+        v = &mut z as *mut *mut libc::c_int as *mut libc::c_void;
+        x = 1 as libc::c_int;
+        ",
+        |mut res, def_id| {
+            assert_eq!(res.ends, v(13));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), vec![1]);
+            assert_eq!(sol(&res, 3), vec![1]);
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), vec![1]);
+            assert_eq!(sol(&res, 6), vec![2]);
+            assert_eq!(sol(&res, 7), vec![2]);
+            assert_eq!(sol(&res, 8), vec![4, 6]);
+            assert_eq!(sol(&res, 9), vec![6]);
+            assert_eq!(sol(&res, 10), vec![6]);
+            assert_eq!(sol(&res, 11), vec![4]);
+            assert_eq!(sol(&res, 12), vec![4]);
+            assert_eq!(sol(&res, 13), e());
+
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1]);
+            assert_eq!(wg(&w, 0, 1), vec![3]);
+            assert_eq!(wg(&w, 0, 2), vec![2]);
+            assert_eq!(wg(&w, 0, 3), vec![5]);
+            assert_eq!(wg(&w, 0, 4), vec![4]);
+            assert_eq!(wg(&w, 0, 5), vec![7]);
+            assert_eq!(wg(&w, 0, 6), vec![6]);
+            assert_eq!(wg(&w, 0, 7), vec![10]);
+            assert_eq!(wg(&w, 0, 8), vec![9]);
+            assert_eq!(wg(&w, 0, 9), vec![8]);
+            assert_eq!(wg(&w, 0, 10), vec![12]);
+            assert_eq!(wg(&w, 0, 11), vec![11]);
+            assert_eq!(wg(&w, 0, 12), vec![8]);
+            assert_eq!(wg(&w, 0, 13), vec![13]);
+            assert_eq!(wg(&w, 0, 14), vec![1]);
+
+            use LocProjection::*;
+            let mut ip = res.index_paths;
+
+            let mut ip1 = ip.remove(&1).unwrap();
+            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 6), vec![vec![Deref, Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 7), vec![vec![Deref, Deref]]);
+            assert_eq!(
+                ig(&mut ip1, def_id, 8),
+                vec![vec![Deref, Deref], vec![Deref, Deref, Deref]]
+            );
+            assert_eq!(ig(&mut ip1, def_id, 9), vec![vec![Deref, Deref, Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 10), vec![vec![Deref, Deref, Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 11), vec![vec![Deref, Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 12), vec![vec![Deref, Deref]]);
+            assert!(ip1.is_empty());
+
+            let mut ip2 = ip.remove(&2).unwrap();
+            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
+            assert_eq!(ig(&mut ip2, def_id, 6), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 7), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 8), vec![vec![Deref, Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 9), vec![vec![Deref, Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 10), vec![vec![Deref, Deref]]);
+            assert!(ip2.is_empty());
+
+            let mut ip4 = ip.remove(&4).unwrap();
+            assert_eq!(ig(&mut ip4, def_id, 4), vec![vec![]]);
+            assert_eq!(ig(&mut ip4, def_id, 8), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip4, def_id, 11), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip4, def_id, 12), vec![vec![Deref]]);
+            assert!(ip4.is_empty());
+
+            let mut ip6 = ip.remove(&6).unwrap();
+            assert_eq!(ig(&mut ip6, def_id, 6), vec![vec![]]);
+            assert_eq!(ig(&mut ip6, def_id, 8), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip6, def_id, 9), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip6, def_id, 10), vec![vec![Deref]]);
+            assert!(ip6.is_empty());
+
+            assert!(ip.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_writes_ambiguous() {
+    // _1 = const 0_i32
+    // _5 = &mut _1
+    // _4 = &raw mut (*_5)
+    // _3 = s { x: move _4 }
+    // _2 = _3
+    // _7 = &mut (_2.0: *mut i32)
+    // _6 = &raw mut (*_7)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: *mut libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: s = {
+            let mut init = s { x: &mut x };
+            init
+        };
+        let mut z: *mut *mut libc::c_int = &mut y.x;
+        ",
+        |mut res, def_id| {
+            assert_eq!(res.ends, v(7));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), vec![1]);
+            assert_eq!(sol(&res, 3), vec![1]);
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), vec![1]);
+            assert_eq!(sol(&res, 6), vec![2]);
+            assert_eq!(sol(&res, 7), vec![2]);
+
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1]);
+            assert_eq!(wg(&w, 0, 1), vec![5]);
+            assert_eq!(wg(&w, 0, 2), vec![4]);
+            assert_eq!(wg(&w, 0, 3), vec![3]);
+            assert_eq!(wg(&w, 0, 4), vec![2]);
+            assert_eq!(wg(&w, 0, 5), vec![7]);
+            assert_eq!(wg(&w, 0, 6), vec![6]);
+
+            use LocProjection::*;
+            let mut ip = res.index_paths;
+
+            let mut ip1 = ip.remove(&1).unwrap();
+            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Field(0), Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Field(0), Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref]]);
+            assert_eq!(
+                ig(&mut ip1, def_id, 6),
+                vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
+            );
+            assert_eq!(
+                ig(&mut ip1, def_id, 7),
+                vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
+            );
+            assert!(ip1.is_empty());
+
+            let mut ip2 = ip.remove(&2).unwrap();
+            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![Field(0)]]);
+            assert_eq!(
+                ig(&mut ip2, def_id, 6),
+                vec![vec![Deref], vec![Deref, Field(0)]]
+            );
+            assert_eq!(
+                ig(&mut ip2, def_id, 7),
+                vec![vec![Deref], vec![Deref, Field(0)]]
+            );
+            assert!(ip2.is_empty());
+
+            assert!(ip.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_writes_double() {
+    // _1 = const 0_i32
+    // _2 = const 0_i32
+    // _4 = &mut _1
+    // _3 = &raw mut (*_4)
+    // _6 = &mut _2
+    // _5 = &raw mut (*_6)
+    // _3 = move _5
+    // _7 = const 1_i32
+    // (*_3) = move _7
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: *mut libc::c_int = &mut x;
+        z = &mut y;
+        *z = 1 as libc::c_int;
+        ",
+        |mut res, def_id| {
+            assert_eq!(res.ends, v(7));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![1, 2]);
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), vec![2]);
+            assert_eq!(sol(&res, 6), vec![2]);
+            assert_eq!(sol(&res, 7), e());
+
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1]);
+            assert_eq!(wg(&w, 0, 1), vec![2]);
+            assert_eq!(wg(&w, 0, 2), vec![4]);
+            assert_eq!(wg(&w, 0, 3), vec![3]);
+            assert_eq!(wg(&w, 0, 4), vec![6]);
+            assert_eq!(wg(&w, 0, 5), vec![5]);
+            assert_eq!(wg(&w, 0, 6), vec![3]);
+            assert_eq!(wg(&w, 0, 7), vec![7]);
+            assert_eq!(wg(&w, 0, 8), vec![1, 2]);
+
+            use LocProjection::*;
+            let mut ip = res.index_paths;
+
+            let mut ip1 = ip.remove(&1).unwrap();
+            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
+            assert!(ip1.is_empty());
+
+            let mut ip2 = ip.remove(&2).unwrap();
+            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
+            assert_eq!(ig(&mut ip2, def_id, 3), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 5), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip2, def_id, 6), vec![vec![Deref]]);
+            assert!(ip2.is_empty());
+
+            assert!(ip.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_writes_malloc() {
+    // _1 = const 0_i32
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _7 = std::mem::size_of::<*mut i32>() -> [return: bb1, unwind continue]
+    // _6 = move _7 as u64 (IntToInt)
+    // _5 = malloc(move _6) -> [return: bb2, unwind continue]
+    // _4 = move _5 as *mut *mut i32 (PtrToPtr)
+    // (*_4) = _2
+    analyze_fn(
+        "
+        let mut x: libc::c_int = 0 as libc::c_int;
+        let mut y: *mut libc::c_int = &mut x;
+        let mut z: *mut *mut libc::c_int = malloc(
+            ::std::mem::size_of::<*mut libc::c_int>() as libc::c_ulong,
+        ) as *mut *mut libc::c_int;
+        *z = y;
+        ",
+        |mut res, def_id| {
+            assert_eq!(res.ends, v(8));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), vec![1]);
+            assert_eq!(sol(&res, 3), vec![1]);
+            assert_eq!(sol(&res, 4), vec![8]);
+            assert_eq!(sol(&res, 5), vec![8]);
+            assert_eq!(sol(&res, 6), e());
+            assert_eq!(sol(&res, 7), e());
+            assert_eq!(sol(&res, 8), vec![1]);
+
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1]);
+            assert_eq!(wg(&w, 0, 1), vec![3]);
+            assert_eq!(wg(&w, 0, 2), vec![2]);
+            assert_eq!(wg(&w, 0, 3), vec![7]);
+            assert_eq!(wg(&w, 1, 0), vec![6]);
+            assert_eq!(wg(&w, 1, 1), vec![5]);
+            assert_eq!(wg(&w, 2, 0), vec![4]);
+            assert_eq!(wg(&w, 2, 1), vec![8]);
+
+            use LocProjection::*;
+            let mut ip = res.index_paths;
+
+            let mut ip1 = ip.remove(&1).unwrap();
+            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref, Deref]]);
+            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref, Deref]]);
+            assert!(ip1.is_empty());
+
+            let mut ip8 = ip.remove(&8).unwrap();
+            assert_eq!(ig(&mut ip8, def_id, 4), vec![vec![Deref]]);
+            assert_eq!(ig(&mut ip8, def_id, 5), vec![vec![Deref]]);
+            assert!(ip8.is_empty());
+
+            assert!(ip.is_empty());
         },
     );
 }
