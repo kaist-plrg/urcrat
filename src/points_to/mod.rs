@@ -46,10 +46,8 @@ fn analyze_input(input: Input) {
 pub struct AnalysisResults {
     pub solutions: Vec<HybridBitSet<usize>>,
     pub ends: Vec<usize>,
-    pub index_to_loc: Vec<Vec<ProjectedLoc>>,
     pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub loc_graph: HashMap<ProjectedLoc, HashMap<ProjectedLoc, LocProjection>>,
-    pub loc_reachability: HashMap<ProjectedLoc, HashSet<ProjectedLoc>>,
+    pub graph: LocGraph,
 }
 
 impl std::fmt::Debug for AnalysisResults {
@@ -59,51 +57,6 @@ impl std::fmt::Debug for AnalysisResults {
             writeln!(f, "{}: {:?}", i, sol)?;
         }
         write!(f, "{:?}", self.ends)
-    }
-}
-
-impl AnalysisResults {
-    pub fn compute_paths(
-        &self,
-        owner: LocalDefId,
-        local: Local,
-        written: usize,
-    ) -> HashSet<Vec<LocProjection>> {
-        let node = ProjectedLoc::new_root(LocRoot::Local(owner, local));
-        let dst = &self.index_to_loc[written][0];
-        let mut paths = HashSet::new();
-        self.compute_paths_rec(&node, dst, &mut vec![], &mut HashSet::new(), &mut paths);
-        paths
-    }
-
-    fn compute_paths_rec<'g>(
-        &'g self,
-        node: &ProjectedLoc,
-        dst: &ProjectedLoc,
-        path: &mut Vec<LocProjection>,
-        visited: &mut HashSet<&'g ProjectedLoc>,
-        paths: &mut HashSet<Vec<LocProjection>>,
-    ) {
-        if node == dst {
-            paths.insert(path.clone());
-            return;
-        }
-
-        if !self.loc_reachability[node].contains(dst) {
-            return;
-        }
-
-        for (succ, proj) in &self.loc_graph[node] {
-            if visited.contains(succ) {
-                continue;
-            }
-
-            path.push(*proj);
-            visited.insert(succ);
-            self.compute_paths_rec(succ, dst, path, visited, paths);
-            path.pop();
-            visited.remove(succ);
-        }
     }
 }
 
@@ -142,8 +95,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let mut alloc_ends: Vec<usize> = vec![];
     let mut allocs = vec![];
     let mut ty_infos = HashMap::new();
-    let mut index_to_loc = vec![];
-    let mut loc_graph = HashMap::new();
+    let mut graph = HashMap::new();
+    let mut index_prefixes = HashMap::new();
     for (local_def_id, body) in &bodies {
         let fn_ptr = fn_ptrs.contains(local_def_id);
         let static_index = ends.len();
@@ -163,15 +116,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
             let ty = compute_ty_info(local_decl.ty, &mut ty_infos, prim, &arena, tcx);
+            add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
             compute_ends(ty, &mut ends);
-
-            let root = LocRoot::Local(*local_def_id, local);
-            compute_locs(
-                ty,
-                ProjectedLoc::new_root(root),
-                &mut index_to_loc,
-                &mut loc_graph,
-            );
 
             if fn_ptr && local.index() == 0 {
                 ends[static_index] = ends.len() - 1;
@@ -206,16 +152,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
-    let mut alloc_id = 0;
     for alloc in allocs {
         let len = ends.len();
         vars.insert(alloc, len);
         for end in &alloc_ends {
             ends.push(len + *end);
-
-            let root = LocRoot::Alloc(alloc_id);
-            index_to_loc.push(vec![ProjectedLoc::new_root(root)]);
-            alloc_id += 1;
         }
     }
 
@@ -240,15 +181,14 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     }
 
     let solutions = analyzer.graph.solve(&ends);
-
-    for (i, sol) in solutions.iter().enumerate() {
-        let loc = index_to_loc[i][0].clone();
-        let edges = loc_graph.entry(loc).or_default();
-        for j in sol.iter() {
-            for loc in &index_to_loc[j] {
-                edges.insert(loc.clone(), LocProjection::Deref);
-            }
+    for (index, sols) in solutions.iter().enumerate() {
+        let node = Node::new(0, index);
+        let mut succs = vec![];
+        for succ in sols.iter() {
+            let max = index_prefixes.get(&succ).cloned().unwrap_or(0);
+            succs.extend((0..=max).map(|p| Node::new(p, succ)));
         }
+        graph.insert(node, Edges::Deref(succs));
     }
 
     analyzer.graph = Graph::new(0);
@@ -283,19 +223,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
-    let unlabeled_loc_graph = loc_graph
-        .iter()
-        .map(|(loc, edges)| (loc.clone(), edges.keys().cloned().collect()))
-        .collect();
-    let loc_reachability = graph::transitive_closure(&unlabeled_loc_graph);
-
     AnalysisResults {
         solutions,
         ends,
-        index_to_loc,
         writes,
-        loc_graph,
-        loc_reachability,
+        graph,
     }
 }
 
@@ -371,37 +303,6 @@ fn compute_ends(ty: &TyInfo<'_>, ends: &mut Vec<usize>) {
     }
 }
 
-fn compute_locs(
-    ty: &TyInfo<'_>,
-    loc: ProjectedLoc,
-    index_to_loc: &mut Vec<Vec<ProjectedLoc>>,
-    graph: &mut HashMap<ProjectedLoc, HashMap<ProjectedLoc, LocProjection>>,
-) {
-    match ty {
-        TyInfo::Primitive => index_to_loc.push(vec![loc]),
-        TyInfo::Array(t) => {
-            let len = index_to_loc.len();
-            compute_locs(t, loc.index(), index_to_loc, graph);
-            graph
-                .entry(loc.clone())
-                .or_default()
-                .insert(loc.index(), LocProjection::Index);
-            index_to_loc[len].push(loc);
-        }
-        TyInfo::Struct(_, ts) => {
-            let len = index_to_loc.len();
-            for (i, (_, t)) in ts.iter().enumerate() {
-                compute_locs(t, loc.field(i), index_to_loc, graph);
-            }
-            let edges = graph.entry(loc.clone()).or_default();
-            for i in 0..ts.len() {
-                edges.insert(loc.field(i), LocProjection::Field(i));
-            }
-            index_to_loc[len].push(loc);
-        }
-    }
-}
-
 #[inline]
 fn compute_writes<'tcx>(
     l: Place<'tcx>,
@@ -433,6 +334,99 @@ fn compute_writes<'tcx>(
         let loc = l.var.root + l.var.proj;
         for i in 0..len {
             writes.insert(loc + i);
+        }
+    }
+}
+
+fn add_edges(
+    ty: &TyInfo<'_>,
+    index: usize,
+    graph: &mut LocGraph,
+    index_prefixes: &mut HashMap<usize, u8>,
+) -> Node {
+    let node = match ty {
+        TyInfo::Primitive => return Node::new(0, index),
+        TyInfo::Array(t) => {
+            let succ = add_edges(t, index, graph, index_prefixes);
+            let node = succ.parent();
+            graph.insert(node, Edges::Index(succ));
+            node
+        }
+        TyInfo::Struct(_, ts) => {
+            let succs: Vec<_> = ts
+                .iter()
+                .map(|(offset, t)| add_edges(t, index + offset, graph, index_prefixes))
+                .collect();
+            let node = succs[0].parent();
+            graph.insert(node, Edges::Fields(succs));
+            node
+        }
+    };
+    index_prefixes.insert(index, node.prefix);
+    node
+}
+
+pub type LocGraph = HashMap<Node, Edges>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Node {
+    pub prefix: u8,
+    pub index: usize,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.index)?;
+        if self.prefix != 0 {
+            write!(f, ":{}", self.prefix)?;
+        }
+        Ok(())
+    }
+}
+
+impl Node {
+    fn new(prefix: u8, index: usize) -> Self {
+        Self { prefix, index }
+    }
+
+    fn parent(self) -> Self {
+        Self {
+            prefix: self.prefix + 1,
+            index: self.index,
+        }
+    }
+}
+
+pub enum Edges {
+    Fields(Vec<Node>),
+    Index(Node),
+    Deref(Vec<Node>),
+}
+
+impl std::fmt::Debug for Edges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Edges::Fields(succs) => {
+                write!(f, "[")?;
+                for (i, succ) in succs.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", i, succ)?;
+                }
+                write!(f, "]")
+            }
+            Edges::Index(succ) => write!(f, "[_: {:?}]", succ),
+            Edges::Deref(succs) => {
+                write!(f, "[")?;
+                for (i, field) in succs.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "*: {:?}", field)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -1188,70 +1182,11 @@ impl PrefixedLoc {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LocRoot {
-    Local(LocalDefId, Local),
-    Alloc(usize),
-}
-
-impl std::fmt::Debug for LocRoot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LocRoot::Local(def_id, local) => write!(f, "{:?}:{:?}", def_id, local),
-            LocRoot::Alloc(id) => write!(f, "alloc{}", id),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocProjection {
     Field(usize),
     Index,
     Deref,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ProjectedLoc {
-    root: LocRoot,
-    projection: Vec<LocProjection>,
-}
-
-impl ProjectedLoc {
-    #[inline]
-    fn new_root(root: LocRoot) -> Self {
-        Self {
-            root,
-            projection: vec![],
-        }
-    }
-
-    #[inline]
-    fn field(&self, i: usize) -> Self {
-        let mut this = self.clone();
-        this.projection.push(LocProjection::Field(i));
-        this
-    }
-
-    #[inline]
-    fn index(&self) -> Self {
-        let mut this = self.clone();
-        this.projection.push(LocProjection::Index);
-        this
-    }
-}
-
-impl std::fmt::Debug for ProjectedLoc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.root)?;
-        for proj in &self.projection {
-            match proj {
-                LocProjection::Field(i) => write!(f, ".{}", i)?,
-                LocProjection::Index => write!(f, "[]")?,
-                LocProjection::Deref => write!(f, "*")?,
-            }
-        }
-        Ok(())
-    }
 }
 
 #[inline]

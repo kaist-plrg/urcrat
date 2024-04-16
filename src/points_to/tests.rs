@@ -2153,20 +2153,6 @@ fn wg(
         .collect()
 }
 
-fn cp(
-    res: &AnalysisResults,
-    def_id: LocalDefId,
-    local: usize,
-    written: usize,
-) -> Vec<Vec<LocProjection>> {
-    let mut v: Vec<_> = res
-        .compute_paths(def_id, Local::from(local), written)
-        .into_iter()
-        .collect();
-    v.sort();
-    v
-}
-
 #[test]
 fn test_writes_compound() {
     // _1 = const 0_i32
@@ -2268,29 +2254,6 @@ fn test_writes_compound() {
             assert_eq!(wg(&w, 0, 16), vec![2]);
             assert_eq!(wg(&w, 0, 17), vec![19]);
             assert_eq!(wg(&w, 0, 18), vec![3]);
-
-            use LocProjection::*;
-            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
-            assert_eq!(
-                cp(&res, def_id, 4, 1),
-                vec![vec![Field(0), Field(0), Deref]]
-            );
-            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Field(0), Deref]]);
-            assert_eq!(cp(&res, def_id, 6, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 7, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
-            assert_eq!(
-                cp(&res, def_id, 4, 2),
-                vec![vec![Field(0), Field(1), Deref]]
-            );
-            assert_eq!(cp(&res, def_id, 5, 2), vec![vec![Field(1), Deref]]);
-            assert_eq!(cp(&res, def_id, 8, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 9, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 3, 3), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 4, 3), vec![vec![Field(1), Index, Deref]]);
-            assert_eq!(cp(&res, def_id, 10, 3), vec![vec![Index, Deref]]);
-            assert_eq!(cp(&res, def_id, 11, 3), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 12, 3), vec![vec![Deref]]);
         },
     );
 }
@@ -2356,37 +2319,6 @@ fn test_writes_multiple() {
             assert_eq!(wg(&w, 0, 12), vec![8]);
             assert_eq!(wg(&w, 0, 13), vec![13]);
             assert_eq!(wg(&w, 0, 14), vec![1]);
-
-            use LocProjection::*;
-            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 6, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 7, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(
-                cp(&res, def_id, 8, 1),
-                vec![vec![Deref, Deref], vec![Deref, Deref, Deref]]
-            );
-            assert_eq!(cp(&res, def_id, 9, 1), vec![vec![Deref, Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 10, 1), vec![vec![Deref, Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 11, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 12, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 6, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 7, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 8, 2), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 9, 2), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 10, 2), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 4), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 8, 4), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 11, 4), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 12, 4), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 6, 6), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 8, 6), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 9, 6), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 10, 6), vec![vec![Deref]]);
         },
     );
 }
@@ -2436,30 +2368,6 @@ fn test_writes_ambiguous() {
             assert_eq!(wg(&w, 0, 4), vec![2]);
             assert_eq!(wg(&w, 0, 5), vec![7]);
             assert_eq!(wg(&w, 0, 6), vec![6]);
-
-            use LocProjection::*;
-            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Field(0), Deref]]);
-            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Field(0), Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref]]);
-            assert_eq!(
-                cp(&res, def_id, 6, 1),
-                vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
-            );
-            assert_eq!(
-                cp(&res, def_id, 7, 1),
-                vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
-            );
-            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![Field(0)]]);
-            assert_eq!(
-                cp(&res, def_id, 6, 2),
-                vec![vec![Deref], vec![Deref, Field(0)]]
-            );
-            assert_eq!(
-                cp(&res, def_id, 7, 2),
-                vec![vec![Deref], vec![Deref, Field(0)]]
-            );
         },
     );
 }
@@ -2504,15 +2412,6 @@ fn test_writes_double() {
             assert_eq!(wg(&w, 0, 6), vec![3]);
             assert_eq!(wg(&w, 0, 7), vec![7]);
             assert_eq!(wg(&w, 0, 8), vec![1, 2]);
-
-            use LocProjection::*;
-            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 3, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 5, 2), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 6, 2), vec![vec![Deref]]);
         },
     );
 }
@@ -2557,15 +2456,6 @@ fn test_writes_malloc() {
             assert_eq!(wg(&w, 1, 1), vec![5]);
             assert_eq!(wg(&w, 2, 0), vec![4]);
             assert_eq!(wg(&w, 2, 1), vec![8]);
-
-            use LocProjection::*;
-            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
-            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref, Deref]]);
-            assert_eq!(cp(&res, def_id, 4, 8), vec![vec![Deref]]);
-            assert_eq!(cp(&res, def_id, 5, 8), vec![vec![Deref]]);
         },
     );
 }

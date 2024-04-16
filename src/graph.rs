@@ -7,6 +7,11 @@ use rustc_index::Idx;
 pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
     graph: &HashMap<T, HashSet<T>>,
 ) -> HashMap<T, HashSet<T>> {
+    for succs in graph.values() {
+        for succ in succs {
+            assert!(graph.contains_key(succ));
+        }
+    }
     let id_to_v: Vec<_> = graph.keys().cloned().collect();
     let v_to_id: HashMap<_, _> = id_to_v
         .iter()
