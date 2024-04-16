@@ -2153,14 +2153,14 @@ fn wg(
         .collect()
 }
 
-fn ig(
-    ip: &mut HashMap<(LocalDefId, Local), HashSet<Vec<LocProjection>>>,
+fn cp(
+    res: &AnalysisResults,
     def_id: LocalDefId,
     local: usize,
+    written: usize,
 ) -> Vec<Vec<LocProjection>> {
-    let mut v: Vec<_> = ip
-        .remove(&(def_id, Local::from(local)))
-        .unwrap()
+    let mut v: Vec<_> = res
+        .compute_paths(def_id, Local::from(local), written)
         .into_iter()
         .collect();
     v.sort();
@@ -2270,39 +2270,27 @@ fn test_writes_compound() {
             assert_eq!(wg(&w, 0, 18), vec![3]);
 
             use LocProjection::*;
-            let mut ip = res.index_paths;
-
-            let mut ip1 = ip.remove(&1).unwrap();
-            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
             assert_eq!(
-                ig(&mut ip1, def_id, 4),
+                cp(&res, def_id, 4, 1),
                 vec![vec![Field(0), Field(0), Deref]]
             );
-            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Field(0), Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 6), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 7), vec![vec![Deref]]);
-            assert!(ip1.is_empty());
-
-            let mut ip2 = ip.remove(&2).unwrap();
-            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Field(0), Deref]]);
+            assert_eq!(cp(&res, def_id, 6, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 7, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
             assert_eq!(
-                ig(&mut ip2, def_id, 4),
+                cp(&res, def_id, 4, 2),
                 vec![vec![Field(0), Field(1), Deref]]
             );
-            assert_eq!(ig(&mut ip2, def_id, 5), vec![vec![Field(1), Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 8), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 9), vec![vec![Deref]]);
-            assert!(ip2.is_empty());
-
-            let mut ip3 = ip.remove(&3).unwrap();
-            assert_eq!(ig(&mut ip3, def_id, 3), vec![vec![]]);
-            assert_eq!(ig(&mut ip3, def_id, 4), vec![vec![Field(1), Index, Deref]]);
-            assert_eq!(ig(&mut ip3, def_id, 10), vec![vec![Index, Deref]]);
-            assert_eq!(ig(&mut ip3, def_id, 11), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip3, def_id, 12), vec![vec![Deref]]);
-            assert!(ip3.is_empty());
-
-            assert!(ip.is_empty());
+            assert_eq!(cp(&res, def_id, 5, 2), vec![vec![Field(1), Deref]]);
+            assert_eq!(cp(&res, def_id, 8, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 9, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 3, 3), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 4, 3), vec![vec![Field(1), Index, Deref]]);
+            assert_eq!(cp(&res, def_id, 10, 3), vec![vec![Index, Deref]]);
+            assert_eq!(cp(&res, def_id, 11, 3), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 12, 3), vec![vec![Deref]]);
         },
     );
 }
@@ -2370,50 +2358,35 @@ fn test_writes_multiple() {
             assert_eq!(wg(&w, 0, 14), vec![1]);
 
             use LocProjection::*;
-            let mut ip = res.index_paths;
-
-            let mut ip1 = ip.remove(&1).unwrap();
-            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
-            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 6), vec![vec![Deref, Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 7), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 6, 1), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 7, 1), vec![vec![Deref, Deref]]);
             assert_eq!(
-                ig(&mut ip1, def_id, 8),
+                cp(&res, def_id, 8, 1),
                 vec![vec![Deref, Deref], vec![Deref, Deref, Deref]]
             );
-            assert_eq!(ig(&mut ip1, def_id, 9), vec![vec![Deref, Deref, Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 10), vec![vec![Deref, Deref, Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 11), vec![vec![Deref, Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 12), vec![vec![Deref, Deref]]);
-            assert!(ip1.is_empty());
-
-            let mut ip2 = ip.remove(&2).unwrap();
-            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
-            assert_eq!(ig(&mut ip2, def_id, 6), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 7), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 8), vec![vec![Deref, Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 9), vec![vec![Deref, Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 10), vec![vec![Deref, Deref]]);
-            assert!(ip2.is_empty());
-
-            let mut ip4 = ip.remove(&4).unwrap();
-            assert_eq!(ig(&mut ip4, def_id, 4), vec![vec![]]);
-            assert_eq!(ig(&mut ip4, def_id, 8), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip4, def_id, 11), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip4, def_id, 12), vec![vec![Deref]]);
-            assert!(ip4.is_empty());
-
-            let mut ip6 = ip.remove(&6).unwrap();
-            assert_eq!(ig(&mut ip6, def_id, 6), vec![vec![]]);
-            assert_eq!(ig(&mut ip6, def_id, 8), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip6, def_id, 9), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip6, def_id, 10), vec![vec![Deref]]);
-            assert!(ip6.is_empty());
-
-            assert!(ip.is_empty());
+            assert_eq!(cp(&res, def_id, 9, 1), vec![vec![Deref, Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 10, 1), vec![vec![Deref, Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 11, 1), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 12, 1), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 6, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 7, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 8, 2), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 9, 2), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 10, 2), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 4), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 8, 4), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 11, 4), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 12, 4), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 6, 6), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 8, 6), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 9, 6), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 10, 6), vec![vec![Deref]]);
         },
     );
 }
@@ -2465,37 +2438,28 @@ fn test_writes_ambiguous() {
             assert_eq!(wg(&w, 0, 6), vec![6]);
 
             use LocProjection::*;
-            let mut ip = res.index_paths;
-
-            let mut ip1 = ip.remove(&1).unwrap();
-            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
-            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Field(0), Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Field(0), Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Field(0), Deref]]);
+            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Field(0), Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref]]);
             assert_eq!(
-                ig(&mut ip1, def_id, 6),
+                cp(&res, def_id, 6, 1),
                 vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
             );
             assert_eq!(
-                ig(&mut ip1, def_id, 7),
+                cp(&res, def_id, 7, 1),
                 vec![vec![Deref, Field(0), Deref], vec![Deref, Deref]]
             );
-            assert!(ip1.is_empty());
-
-            let mut ip2 = ip.remove(&2).unwrap();
-            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![Field(0)]]);
+            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![Field(0)]]);
             assert_eq!(
-                ig(&mut ip2, def_id, 6),
+                cp(&res, def_id, 6, 2),
                 vec![vec![Deref], vec![Deref, Field(0)]]
             );
             assert_eq!(
-                ig(&mut ip2, def_id, 7),
+                cp(&res, def_id, 7, 2),
                 vec![vec![Deref], vec![Deref, Field(0)]]
             );
-            assert!(ip2.is_empty());
-
-            assert!(ip.is_empty());
         },
     );
 }
@@ -2542,22 +2506,13 @@ fn test_writes_double() {
             assert_eq!(wg(&w, 0, 8), vec![1, 2]);
 
             use LocProjection::*;
-            let mut ip = res.index_paths;
-
-            let mut ip1 = ip.remove(&1).unwrap();
-            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
-            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref]]);
-            assert!(ip1.is_empty());
-
-            let mut ip2 = ip.remove(&2).unwrap();
-            assert_eq!(ig(&mut ip2, def_id, 2), vec![vec![]]);
-            assert_eq!(ig(&mut ip2, def_id, 3), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 5), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip2, def_id, 6), vec![vec![Deref]]);
-            assert!(ip2.is_empty());
-
-            assert!(ip.is_empty());
+            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 2, 2), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 3, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 5, 2), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 6, 2), vec![vec![Deref]]);
         },
     );
 }
@@ -2604,22 +2559,13 @@ fn test_writes_malloc() {
             assert_eq!(wg(&w, 2, 1), vec![8]);
 
             use LocProjection::*;
-            let mut ip = res.index_paths;
-
-            let mut ip1 = ip.remove(&1).unwrap();
-            assert_eq!(ig(&mut ip1, def_id, 1), vec![vec![]]);
-            assert_eq!(ig(&mut ip1, def_id, 2), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 3), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 4), vec![vec![Deref, Deref]]);
-            assert_eq!(ig(&mut ip1, def_id, 5), vec![vec![Deref, Deref]]);
-            assert!(ip1.is_empty());
-
-            let mut ip8 = ip.remove(&8).unwrap();
-            assert_eq!(ig(&mut ip8, def_id, 4), vec![vec![Deref]]);
-            assert_eq!(ig(&mut ip8, def_id, 5), vec![vec![Deref]]);
-            assert!(ip8.is_empty());
-
-            assert!(ip.is_empty());
+            assert_eq!(cp(&res, def_id, 1, 1), vec![vec![]]);
+            assert_eq!(cp(&res, def_id, 2, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 3, 1), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 1), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 5, 1), vec![vec![Deref, Deref]]);
+            assert_eq!(cp(&res, def_id, 4, 8), vec![vec![Deref]]);
+            assert_eq!(cp(&res, def_id, 5, 8), vec![vec![Deref]]);
         },
     );
 }

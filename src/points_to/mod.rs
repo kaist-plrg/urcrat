@@ -46,9 +46,10 @@ fn analyze_input(input: Input) {
 pub struct AnalysisResults {
     pub solutions: Vec<HybridBitSet<usize>>,
     pub ends: Vec<usize>,
+    pub index_to_loc: Vec<Vec<ProjectedLoc>>,
     pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    #[allow(clippy::type_complexity)]
-    pub index_paths: HashMap<usize, HashMap<(LocalDefId, Local), HashSet<Vec<LocProjection>>>>,
+    pub loc_graph: HashMap<ProjectedLoc, HashMap<ProjectedLoc, LocProjection>>,
+    pub loc_reachability: HashMap<ProjectedLoc, HashSet<ProjectedLoc>>,
 }
 
 impl std::fmt::Debug for AnalysisResults {
@@ -58,6 +59,51 @@ impl std::fmt::Debug for AnalysisResults {
             writeln!(f, "{}: {:?}", i, sol)?;
         }
         write!(f, "{:?}", self.ends)
+    }
+}
+
+impl AnalysisResults {
+    pub fn compute_paths(
+        &self,
+        owner: LocalDefId,
+        local: Local,
+        written: usize,
+    ) -> HashSet<Vec<LocProjection>> {
+        let node = ProjectedLoc::new_root(LocRoot::Local(owner, local));
+        let dst = &self.index_to_loc[written][0];
+        let mut paths = HashSet::new();
+        self.compute_paths_rec(&node, dst, &mut vec![], &mut HashSet::new(), &mut paths);
+        paths
+    }
+
+    fn compute_paths_rec<'g>(
+        &'g self,
+        node: &ProjectedLoc,
+        dst: &ProjectedLoc,
+        path: &mut Vec<LocProjection>,
+        visited: &mut HashSet<&'g ProjectedLoc>,
+        paths: &mut HashSet<Vec<LocProjection>>,
+    ) {
+        if node == dst {
+            paths.insert(path.clone());
+            return;
+        }
+
+        if !self.loc_reachability[node].contains(dst) {
+            return;
+        }
+
+        for (succ, proj) in &self.loc_graph[node] {
+            if visited.contains(succ) {
+                continue;
+            }
+
+            path.push(*proj);
+            visited.insert(succ);
+            self.compute_paths_rec(succ, dst, path, visited, paths);
+            path.pop();
+            visited.remove(succ);
+        }
     }
 }
 
@@ -205,16 +251,6 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
-    let mut inv_loc_graph: HashMap<_, HashMap<_, _>> = HashMap::new();
-    for (from, tos) in loc_graph {
-        for (to, label) in tos {
-            inv_loc_graph
-                .entry(to)
-                .or_default()
-                .insert(from.clone(), label);
-        }
-    }
-
     analyzer.graph = Graph::new(0);
     let mut writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> = HashMap::new();
     for (local_def_id, body) in &bodies {
@@ -246,34 +282,20 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             }
         }
     }
-    let mut write_indices = HybridBitSet::new_empty(ends.len());
-    for writes in writes.values() {
-        for indices in writes.values() {
-            write_indices.union(indices);
-        }
-    }
 
-    let mut index_paths = HashMap::new();
-    for write in write_indices.iter() {
-        let loc = &index_to_loc[write][0];
-        let mut paths = HashMap::new();
-        compute_paths(
-            loc,
-            &mut vec![],
-            &mut HashSet::new(),
-            &mut paths,
-            &inv_loc_graph,
-        );
-        if paths.len() > 1 {
-            index_paths.insert(write, paths);
-        }
-    }
+    let unlabeled_loc_graph = loc_graph
+        .iter()
+        .map(|(loc, edges)| (loc.clone(), edges.keys().cloned().collect()))
+        .collect();
+    let loc_reachability = graph::transitive_closure(&unlabeled_loc_graph);
 
     AnalysisResults {
         solutions,
         ends,
+        index_to_loc,
         writes,
-        index_paths,
+        loc_graph,
+        loc_reachability,
     }
 }
 
@@ -412,37 +434,6 @@ fn compute_writes<'tcx>(
         for i in 0..len {
             writes.insert(loc + i);
         }
-    }
-}
-
-fn compute_paths<'g>(
-    node: &ProjectedLoc,
-    path: &mut Vec<LocProjection>,
-    visited: &mut HashSet<&'g ProjectedLoc>,
-    paths: &mut HashMap<(LocalDefId, Local), HashSet<Vec<LocProjection>>>,
-    graph: &'g HashMap<ProjectedLoc, HashMap<ProjectedLoc, LocProjection>>,
-) {
-    if node.projection.is_empty() {
-        if let LocRoot::Local(def_id, local) = node.root {
-            let mut p = vec![];
-            for proj in path.iter().rev() {
-                p.push(*proj);
-            }
-            paths.entry((def_id, local)).or_default().insert(p);
-        }
-    }
-
-    let succs = some_or!(graph.get(node), return);
-    for (succ, label) in succs {
-        if visited.contains(succ) {
-            continue;
-        }
-
-        path.push(*label);
-        visited.insert(succ);
-        compute_paths(succ, path, visited, paths, graph);
-        path.pop();
-        visited.remove(succ);
     }
 }
 
