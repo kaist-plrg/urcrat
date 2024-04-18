@@ -10,7 +10,7 @@ fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
 }
 
 fn analyze_fn_with<F>(types: &str, params: &str, code: &str, f: F)
-where F: FnOnce(AnalysisResults, LocalDefId) + Send {
+where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
     let name = "f";
     let code = format!(
         "
@@ -25,11 +25,11 @@ where F: FnOnce(AnalysisResults, LocalDefId) + Send {
     ",
         types, name, params, code
     );
-    run_compiler(&code, |tcx| f(analyze(tcx), find(name, tcx)));
+    run_compiler(&code, |tcx| f(analyze(tcx), tcx));
 }
 
 fn analyze_fn<F>(code: &str, f: F)
-where F: FnOnce(AnalysisResults, LocalDefId) + Send {
+where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
     analyze_fn_with("", "", code, f);
 }
 
@@ -2208,7 +2208,7 @@ fn test_writes_compound() {
         y = 1 as libc::c_int;
         z = 1 as libc::c_int;
         ",
-        |mut res, def_id| {
+        |mut res, tcx| {
             assert_eq!(
                 res.ends,
                 vec![0, 1, 2, 3, 6, 5, 6, 8, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
@@ -2234,6 +2234,7 @@ fn test_writes_compound() {
             assert_eq!(sol(&res, 18), e());
             assert_eq!(sol(&res, 19), e());
 
+            let def_id = find("f", tcx);
             let w = res.writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 0), vec![1]);
             assert_eq!(wg(&w, 0, 1), vec![2]);
@@ -2286,7 +2287,7 @@ fn test_writes_multiple() {
         v = &mut z as *mut *mut libc::c_int as *mut libc::c_void;
         x = 1 as libc::c_int;
         ",
-        |mut res, def_id| {
+        |mut res, tcx| {
             assert_eq!(res.ends, v(13));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -2303,6 +2304,7 @@ fn test_writes_multiple() {
             assert_eq!(sol(&res, 12), vec![4]);
             assert_eq!(sol(&res, 13), e());
 
+            let def_id = find("f", tcx);
             let w = res.writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 0), vec![1]);
             assert_eq!(wg(&w, 0, 1), vec![3]);
@@ -2349,7 +2351,7 @@ fn test_writes_ambiguous() {
         };
         let mut z: *mut *mut libc::c_int = &mut y.x;
         ",
-        |mut res, def_id| {
+        |mut res, tcx| {
             assert_eq!(res.ends, v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -2360,6 +2362,7 @@ fn test_writes_ambiguous() {
             assert_eq!(sol(&res, 6), vec![2]);
             assert_eq!(sol(&res, 7), vec![2]);
 
+            let def_id = find("f", tcx);
             let w = res.writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 0), vec![1]);
             assert_eq!(wg(&w, 0, 1), vec![5]);
@@ -2391,7 +2394,7 @@ fn test_writes_double() {
         z = &mut y;
         *z = 1 as libc::c_int;
         ",
-        |mut res, def_id| {
+        |mut res, tcx| {
             assert_eq!(res.ends, v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -2402,6 +2405,7 @@ fn test_writes_double() {
             assert_eq!(sol(&res, 6), vec![2]);
             assert_eq!(sol(&res, 7), e());
 
+            let def_id = find("f", tcx);
             let w = res.writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 0), vec![1]);
             assert_eq!(wg(&w, 0, 1), vec![2]);
@@ -2435,7 +2439,7 @@ fn test_writes_malloc() {
         ) as *mut *mut libc::c_int;
         *z = y;
         ",
-        |mut res, def_id| {
+        |mut res, tcx| {
             assert_eq!(res.ends, v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
@@ -2447,6 +2451,7 @@ fn test_writes_malloc() {
             assert_eq!(sol(&res, 7), e());
             assert_eq!(sol(&res, 8), vec![1]);
 
+            let def_id = find("f", tcx);
             let w = res.writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 0), vec![1]);
             assert_eq!(wg(&w, 0, 1), vec![3]);
@@ -2456,6 +2461,66 @@ fn test_writes_malloc() {
             assert_eq!(wg(&w, 1, 1), vec![5]);
             assert_eq!(wg(&w, 2, 0), vec![4]);
             assert_eq!(wg(&w, 2, 1), vec![8]);
+        },
+    );
+}
+
+#[test]
+fn test_call_graph() {
+    // _1 = g() -> [return: bb1, unwind continue]
+    // _3 = _1
+    // switchInt(move _3) -> [0: bb3, otherwise: bb2]
+    // _4 = h as unsafe extern "C" fn() (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<unsafe extern "C" fn()>::Some(move _4)
+    // goto -> bb4
+    // _5 = i as unsafe extern "C" fn() (PointerCoercion(ReifyFnPointer))
+    // _2 = std::option::Option::<unsafe extern "C" fn()>::Some(move _5)
+    // goto -> bb4
+    // _9 = _2
+    // _8 = std::option::Option::<unsafe extern "C" fn()>::unwrap(move _9) -> [return: bb5, unwind continue]
+    // _7 = move _8 as fn() (Transmute)
+    // _6 = move _7() -> [return: bb6, unwind continue]
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g() -> libc::c_int {
+            return 0 as libc::c_int;
+        }
+        pub unsafe extern \"C\" fn h() {}
+        pub unsafe extern \"C\" fn i() {}
+        ",
+        "",
+        "
+            let mut x: libc::c_int = g();
+            let mut y: Option::<unsafe extern \"C\" fn() -> ()> = if x != 0 {
+                Some(
+                    ::std::mem::transmute::<
+                        unsafe extern \"C\" fn() -> (),
+                        unsafe extern \"C\" fn() -> (),
+                    >(h),
+                )
+            } else {
+                Some(
+                    ::std::mem::transmute::<
+                        unsafe extern \"C\" fn() -> (),
+                        unsafe extern \"C\" fn() -> (),
+                    >(i),
+                )
+            };
+            ::std::mem::transmute::<_, fn()>(y.unwrap())();
+        ",
+        |res, tcx| {
+            let def_id = find("f", tcx);
+            let callees = &res.call_graph[&def_id];
+            assert_eq!(callees.len(), 3);
+            assert!(callees.contains(&find("g", tcx)));
+            assert!(callees.contains(&find("h", tcx)));
+            assert!(callees.contains(&find("i", tcx)));
+            let indirect_calls = &res.indirect_calls[&def_id];
+            assert_eq!(indirect_calls.len(), 1);
+            let callees = &indirect_calls[&BasicBlock::new(5)];
+            assert_eq!(callees.len(), 2);
+            assert!(callees.contains(&find("h", tcx)));
+            assert!(callees.contains(&find("i", tcx)));
         },
     );
 }

@@ -43,21 +43,14 @@ fn analyze_input(input: Input) {
     .unwrap();
 }
 
+#[derive(Debug)]
 pub struct AnalysisResults {
     pub solutions: Vec<HybridBitSet<usize>>,
     pub ends: Vec<usize>,
     pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
     pub graph: LocGraph,
-}
-
-impl std::fmt::Debug for AnalysisResults {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, sol) in self.solutions.iter().enumerate() {
-            let sol: Vec<_> = sol.iter().collect();
-            writeln!(f, "{}: {:?}", i, sol)?;
-        }
-        write!(f, "{:?}", self.ends)
-    }
+    pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
+    pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
@@ -72,24 +65,30 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             }
             let local_def_id = item.owner_id.def_id;
             let def_id = local_def_id.to_def_id();
-            let body = match item.kind {
-                ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
-                ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+            let (is_fn, body) = match item.kind {
+                ItemKind::Fn(_, _, _) => (true, tcx.optimized_mir(def_id)),
+                ItemKind::Static(_, _, _) => (false, tcx.mir_for_ctfe(def_id)),
                 _ => return None,
             };
-            Some((local_def_id, body))
+            Some((local_def_id, body, is_fn))
         })
         .collect();
+    let fn_def_ids: HashSet<_> = bodies
+        .iter()
+        .filter_map(|(def_id, _, is_fn)| if *is_fn { Some(*def_id) } else { None })
+        .collect();
+    let mut call_graph: HashMap<_, _> = fn_def_ids.iter().map(|f| (*f, HashSet::new())).collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
-    for (_, body) in &bodies {
+    for (_, body, _) in &bodies {
         visitor.visit_body(body);
     }
     let fn_ptrs = visitor.fn_ptrs;
 
     let arena = Arena::new();
     let prim = arena.alloc(TyInfo::Primitive);
-    let mut statics = HashMap::new();
+    let mut globals = HashMap::new();
+    let mut inv_fns = HashMap::new();
     let mut vars = HashMap::new();
     let mut ends = vec![];
     let mut alloc_ends: Vec<usize> = vec![];
@@ -97,10 +96,15 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let mut ty_infos = HashMap::new();
     let mut graph = HashMap::new();
     let mut index_prefixes = HashMap::new();
-    for (local_def_id, body) in &bodies {
+    let mut indirect_calls: HashMap<_, HashMap<_, _>> = HashMap::new();
+    for (local_def_id, body, is_fn) in &bodies {
         let fn_ptr = fn_ptrs.contains(local_def_id);
-        let static_index = ends.len();
-        statics.insert(*local_def_id, static_index);
+        let global_index = ends.len();
+        globals.insert(*local_def_id, global_index);
+
+        if *is_fn {
+            inv_fns.insert(global_index, *local_def_id);
+        }
 
         let mut local_decls = body.local_decls.iter_enumerated();
         let ret = local_decls.next().unwrap();
@@ -120,7 +124,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             compute_ends(ty, &mut ends);
 
             if fn_ptr && local.index() == 0 {
-                ends[static_index] = ends.len() - 1;
+                ends[global_index] = ends.len() - 1;
             }
 
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
@@ -144,10 +148,28 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             else {
                 continue;
             };
-            let def_id = some_or!(operand_to_fn(func), continue);
-            let ty = destination.ty(&body.local_decls, tcx).ty;
-            if ty.is_unsafe_ptr() && is_c_fn(def_id, tcx) {
-                allocs.push(Var::Alloc(*local_def_id, bb));
+            match func {
+                Operand::Copy(func) | Operand::Move(func) => {
+                    assert!(func.projection.is_empty());
+                    let var = Var::Local(*local_def_id, func.local);
+                    let index = vars[&var];
+                    indirect_calls
+                        .entry(*local_def_id)
+                        .or_default()
+                        .insert(bb, index);
+                }
+                _ => {
+                    let def_id = some_or!(operand_to_fn(func), continue);
+                    let ty = destination.ty(&body.local_decls, tcx).ty;
+                    if ty.is_unsafe_ptr() && is_c_fn(def_id, tcx) {
+                        allocs.push(Var::Alloc(*local_def_id, bb));
+                    }
+                    if let Some(callee) = def_id.as_local() {
+                        if fn_def_ids.contains(&callee) {
+                            call_graph.get_mut(local_def_id).unwrap().insert(callee);
+                        }
+                    }
+                }
             }
         }
     }
@@ -164,10 +186,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         tcx,
         ty_infos,
         vars,
-        statics,
+        globals,
         graph: Graph::new(ends.len()),
     };
-    for (local_def_id, body) in &bodies {
+    for (local_def_id, body, _) in &bodies {
         // println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
@@ -193,7 +215,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
     analyzer.graph = Graph::new(0);
     let mut writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> = HashMap::new();
-    for (local_def_id, body) in &bodies {
+    for (local_def_id, body, _) in &bodies {
         let writes = writes.entry(*local_def_id).or_default();
         let ctx = Context::new(&body.local_decls, *local_def_id);
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
@@ -223,11 +245,34 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
     }
 
+    let indirect_calls: HashMap<_, HashMap<_, Vec<_>>> = indirect_calls
+        .into_iter()
+        .map(|(def_id, calls)| {
+            let calls = calls
+                .into_iter()
+                .map(|(bb, index)| {
+                    let callees = solutions[index]
+                        .iter()
+                        .filter_map(|index| inv_fns.get(&index).copied())
+                        .collect();
+                    (bb, callees)
+                })
+                .collect();
+            (def_id, calls)
+        })
+        .collect();
+    for (caller, calls) in &indirect_calls {
+        let callees = call_graph.get_mut(caller).unwrap();
+        callees.extend(calls.values().flatten());
+    }
+
     AnalysisResults {
         solutions,
         ends,
         writes,
         graph,
+        indirect_calls,
+        call_graph,
     }
 }
 
@@ -448,7 +493,7 @@ struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     ty_infos: HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
     vars: HashMap<Var, usize>,
-    statics: HashMap<LocalDefId, usize>,
+    globals: HashMap<LocalDefId, usize>,
     graph: Graph,
 }
 
@@ -594,7 +639,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let var = Loc::new_root(self.statics.get(&def_id.as_local()?).copied()?);
+                        let var = Loc::new_root(self.globals.get(&def_id.as_local()?).copied()?);
                         Some(PrefixedLoc::new_ref(var))
                     }
                     ConstValue::Slice { .. } => None,
@@ -667,7 +712,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                         }
                     } else {
-                        let mut index = self.statics[&local_def_id];
+                        let mut index = self.globals[&local_def_id];
                         for (arg, arg_loc) in args.iter().zip(arg_locs) {
                             let ty = arg.ty(ctx.locals, self.tcx);
                             if let Some(arg) = arg_loc {
