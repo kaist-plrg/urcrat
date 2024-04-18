@@ -51,6 +51,8 @@ pub struct AnalysisResults {
     pub graph: LocGraph,
     pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
     pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
+    pub call_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+    pub var_nodes: HashMap<(LocalDefId, Local), Node>,
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
@@ -97,6 +99,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let mut graph = HashMap::new();
     let mut index_prefixes = HashMap::new();
     let mut indirect_calls: HashMap<_, HashMap<_, _>> = HashMap::new();
+    let mut var_nodes = HashMap::new();
     for (local_def_id, body, is_fn) in &bodies {
         let fn_ptr = fn_ptrs.contains(local_def_id);
         let global_index = ends.len();
@@ -120,7 +123,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
             let ty = compute_ty_info(local_decl.ty, &mut ty_infos, prim, &arena, tcx);
-            add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
+            let node = add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
+            var_nodes.insert((*local_def_id, local), node);
             compute_ends(ty, &mut ends);
 
             if fn_ptr && local.index() == 0 {
@@ -212,6 +216,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         }
         graph.insert(node, Edges::Deref(succs));
     }
+    let mut address_taken_indices = HybridBitSet::new_empty(ends.len());
+    for indices in &solutions {
+        address_taken_indices.union(indices);
+    }
 
     analyzer.graph = Graph::new(0);
     let mut writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> = HashMap::new();
@@ -244,6 +252,21 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             }
         }
     }
+    for writes in writes.values_mut() {
+        for writes in writes.values_mut() {
+            writes.intersect(&address_taken_indices);
+        }
+    }
+    let fn_writes: HashMap<_, _> = writes
+        .iter()
+        .map(|(f, writes)| {
+            let mut ws = HybridBitSet::new_empty(ends.len());
+            for w in writes.values() {
+                ws.union(w);
+            }
+            (*f, ws)
+        })
+        .collect();
 
     let indirect_calls: HashMap<_, HashMap<_, Vec<_>>> = indirect_calls
         .into_iter()
@@ -265,6 +288,20 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         let callees = call_graph.get_mut(caller).unwrap();
         callees.extend(calls.values().flatten());
     }
+    let mut reachability = graph::transitive_closure(&call_graph);
+    for (func, reachables) in &mut reachability {
+        reachables.insert(*func);
+    }
+    let call_writes: HashMap<_, _> = reachability
+        .iter()
+        .map(|(func, reachables)| {
+            let mut writes = HybridBitSet::new_empty(ends.len());
+            for reachable in reachables {
+                writes.union(&fn_writes[reachable]);
+            }
+            (*func, writes)
+        })
+        .collect();
 
     AnalysisResults {
         solutions,
@@ -273,6 +310,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         graph,
         indirect_calls,
         call_graph,
+        call_writes,
+        var_nodes,
     }
 }
 

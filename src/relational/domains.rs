@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use etrace::some_or;
-use rustc_index::bit_set::BitSet;
+use rustc_hir::def_id::LocalDefId;
+use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
 
 use super::*;
+use crate::points_to;
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -162,6 +164,29 @@ impl AbsLoc {
     pub fn projection(&self) -> &[AccElem] {
         &self.projection
     }
+
+    #[inline]
+    fn extend_elem(mut self, elem: AccElem) -> Self {
+        self.projection.push(elem);
+        self
+    }
+
+    #[inline]
+    fn extend_int(mut self, i: u128) -> Self {
+        self.projection.push(AccElem::Int(i));
+        self
+    }
+
+    #[inline]
+    fn is_prefix_of(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.projection.len() <= other.projection.len()
+            && self
+                .projection
+                .iter()
+                .zip(&other.projection)
+                .all(|(e1, e2)| e1 == e2)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -317,17 +342,6 @@ impl Obj {
                     obj.invalidate_symbolic(local);
                 }
             }
-        }
-    }
-
-    fn pointing_locations(&self) -> Vec<AbsLoc> {
-        match self {
-            Self::AtAddr(_) => vec![],
-            Self::Ptr(loc) => vec![loc.clone()],
-            Self::Compound(fs) => fs
-                .values()
-                .flat_map(|obj| obj.pointing_locations())
-                .collect(),
         }
     }
 
@@ -774,33 +788,6 @@ impl Graph {
         self.nodes[loc.root].project_mut(&loc.projection, write)
     }
 
-    pub fn invalidate_deref(&mut self, local: Local, mut depth: usize, opt_id: Option<usize>) {
-        let id = *some_or!(self.locals.get(&local), return);
-        let mut locs = vec![AbsLoc::new_root(id)];
-        while !locs.is_empty() {
-            if depth == 0 {
-                for l in locs {
-                    if let Some(id) = opt_id {
-                        if id == l.root {
-                            continue;
-                        }
-                    }
-                    let obj = self.obj_at_location_mut(&l, false);
-                    *obj = Obj::default();
-                }
-                return;
-            }
-            locs = locs
-                .into_iter()
-                .flat_map(|loc| {
-                    let obj = some_or!(self.obj_at_location(&loc), return vec![]);
-                    obj.pointing_locations()
-                })
-                .collect();
-            depth -= 1;
-        }
-    }
-
     pub fn get_local_id(&self, local: usize) -> usize {
         *self.locals.get(&Local::from_usize(local)).unwrap()
     }
@@ -814,6 +801,111 @@ impl Graph {
         self.locals
             .retain(|local, _| !dead_locals.contains(*local) || locals.contains(local));
     }
+
+    pub fn path_to_loc(&self, path: AccPath) -> Option<AbsLoc> {
+        let root = self.locals.get(&path.local)?;
+        Some(AbsLoc::new(*root, path.projection))
+    }
+
+    pub fn invalidate(
+        &mut self,
+        func: LocalDefId,
+        strong_update: Option<&AbsLoc>,
+        may_points_to: &points_to::AnalysisResults,
+        writes: &HybridBitSet<usize>,
+    ) {
+        let mut worklist: Vec<_> = self
+            .locals
+            .iter()
+            .map(|(local, node_id)| {
+                let loc = AbsLoc::new_root(*node_id);
+                let node = &may_points_to.var_nodes[&(func, *local)];
+                (loc, node)
+            })
+            .collect();
+        let mut visited = HashSet::new();
+        while let Some((loc, node)) = worklist.pop() {
+            let obj = self.obj_at_location_mut(&loc, false);
+            invalidate_rec(
+                loc,
+                obj,
+                *node,
+                strong_update,
+                may_points_to,
+                writes,
+                &mut visited,
+            );
+        }
+    }
+}
+
+fn invalidate_rec(
+    loc: AbsLoc,
+    obj: &mut Obj,
+    node: points_to::Node,
+    strong_update: Option<&AbsLoc>,
+    may_points_to: &points_to::AnalysisResults,
+    writes: &HybridBitSet<usize>,
+    visited: &mut HashSet<(AbsLoc, points_to::Node)>,
+) -> Vec<(AbsLoc, points_to::Node)> {
+    if !visited.insert((loc.clone(), node)) {
+        return vec![];
+    }
+    let edges = &may_points_to.graph[&node];
+    let v = match obj {
+        Obj::AtAddr(_) => vec![],
+        Obj::Ptr(loc) => {
+            if let points_to::Edges::Deref(nodes) = edges {
+                nodes.iter().map(|node| (loc.clone(), *node)).collect()
+            } else {
+                vec![]
+            }
+        }
+        Obj::Compound(fs) => {
+            let mut v = vec![];
+            match edges {
+                points_to::Edges::Fields(fs2) => {
+                    for (index, node) in fs2.iter().enumerate() {
+                        let index = index as u128;
+                        let obj = some_or!(fs.get_mut(&AccElem::Int(index)), continue);
+                        let loc = loc.clone().extend_int(index);
+                        v.extend(invalidate_rec(
+                            loc,
+                            obj,
+                            *node,
+                            strong_update,
+                            may_points_to,
+                            writes,
+                            visited,
+                        ));
+                    }
+                }
+                points_to::Edges::Index(node) => {
+                    for (elem, obj) in fs {
+                        let loc = loc.clone().extend_elem(elem.clone());
+                        v.extend(invalidate_rec(
+                            loc,
+                            obj,
+                            *node,
+                            strong_update,
+                            may_points_to,
+                            writes,
+                            visited,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            v
+        }
+    };
+    if node.prefix == 0
+        && writes.contains(node.index)
+        && strong_update.map(|s| !s.is_prefix_of(&loc)).unwrap_or(true)
+    {
+        *obj = Obj::default();
+    }
+    v
 }
 
 fn join_objs(

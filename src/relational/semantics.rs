@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{
@@ -15,19 +13,34 @@ use super::*;
 use crate::*;
 
 impl<'tcx> Analyzer<'tcx, '_> {
-    pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, state: &mut AbsMem) {
+    pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, stmt_loc: Location, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         if l.projection.is_empty() {
             state.gm().invalidate_symbolic(l.local);
         }
-        if l.is_indirect_first_projection() {
-            let graph = state.gm();
-            let l_id = graph.deref_local_id(l.local);
-            for (local, depth) in self.find_may_aliases(l.local) {
-                graph.invalidate_deref(local, depth, l_id);
-            }
-        }
         let (l, l_deref) = AccPath::from_place(*l, state);
+        let writes = self.get_assign_writes(stmt_loc);
+        if !writes.is_empty() {
+            let loc = state.g().path_to_loc(l.clone());
+            let strong_update = if l_deref {
+                loc.and_then(|loc| state.g().obj_at_location(&loc))
+                    .and_then(|obj| {
+                        if let Obj::Ptr(loc) = obj {
+                            Some(loc.clone())
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                loc
+            };
+            state.gm().invalidate(
+                self.local_def_id,
+                strong_update.as_ref(),
+                &self.may_points_to,
+                writes,
+            );
+        }
         let suffixes = self.get_path_suffixes(&l, l_deref);
         let empty_suffix = || suffixes.iter().all(|s| s.is_empty());
         match r {
@@ -263,6 +276,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         &self,
         term: &Terminator<'tcx>,
         dv: Option<&DiscrVal>,
+        term_loc: Location,
         state: &AbsMem,
     ) -> Vec<(Location, AbsMem)> {
         match &term.kind {
@@ -374,8 +388,8 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 let need_update = match func {
                     Operand::Copy(func) | Operand::Move(func) => {
                         assert!(func.projection.is_empty());
-                        let callees = self.resolve_indirect_calls(func.local);
-                        self.transfer_intra_call(&callees, &mut state);
+                        let callees = self.resolve_indirect_call(term_loc);
+                        self.transfer_intra_call(callees, &mut state);
                         true
                     }
                     Operand::Constant(box constant) => {
@@ -401,10 +415,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 self.transfer_c_call(seg0, inputs, args, &mut state);
                                 true
                             } else {
-                                self.transfer_intra_call(
-                                    &HashSet::from_iter([local_def_id]),
-                                    &mut state,
-                                );
+                                self.transfer_intra_call(&[local_def_id], &mut state);
                                 true
                             }
                         } else {
@@ -431,12 +442,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
         }
     }
 
-    fn transfer_intra_call(&self, callees: &HashSet<LocalDefId>, state: &mut AbsMem) {
+    fn transfer_intra_call(&self, callees: &[LocalDefId], state: &mut AbsMem) {
         let graph = state.gm();
         for callee in callees {
-            for (local, depth) in self.locals_invalidated_by_call(*callee) {
-                graph.invalidate_deref(local, depth, None);
-            }
+            // for (local, depth) in self.locals_invalidated_by_call(*callee) {
+            //     graph.invalidate_deref(local, depth, None);
+            // }
+            todo!()
         }
     }
 
@@ -454,9 +466,11 @@ impl<'tcx> Analyzer<'tcx, '_> {
         for (ty, arg) in inputs.iter().zip(args) {
             if ty.is_mutable_ptr() {
                 if let Some(arg) = arg.place() {
-                    for (local, depth) in self.find_may_aliases(arg.local) {
-                        graph.invalidate_deref(local, depth, None);
-                    }
+                    assert!(arg.projection.is_empty());
+                    // for (local, depth) in self.find_may_aliases(arg.local) {
+                    //     graph.invalidate_deref(local, depth, None);
+                    // }
+                    todo!()
                 }
             }
         }
@@ -524,9 +538,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             (_, "unix", _, "memcpy") => {
                 if let Some(arg) = args[0].place() {
-                    for (local, depth) in self.find_may_aliases(arg.local) {
-                        state.gm().invalidate_deref(local, depth, None);
-                    }
+                    // for (local, depth) in self.find_may_aliases(arg.local) {
+                    //     state.gm().invalidate_deref(local, depth, None);
+                    // }
+                    todo!()
                 }
                 true
             }

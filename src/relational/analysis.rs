@@ -5,12 +5,11 @@ use std::{
 
 use rustc_abi::VariantIdx;
 use rustc_data_structures::graph::WithSuccessors;
-use rustc_hir::{def_id::DefId, ItemKind};
-use rustc_index::bit_set::BitSet;
+use rustc_hir::def_id::DefId;
+use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::{
     mir::{
-        interpret::ConstValue, visit::Visitor, BasicBlock, BinOp, Body, ConstantKind, Local,
-        Location, Operand, Place, Rvalue, StatementKind, Terminator, TerminatorKind,
+        BasicBlock, BinOp, Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind,
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -35,65 +34,18 @@ fn analyze_input(input: Input, gc: bool) -> AnalysisResults {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
-    let prog_info = relational::ProgInfo::new(tcx);
-    let functions = prog_info
-        .reachability
+    let may_points_to = points_to::analyze(tcx);
+    let functions = may_points_to
+        .call_graph
         .keys()
-        .map(|def_id| (*def_id, analyze_fn(tcx, &prog_info, *def_id, gc)))
+        .map(|def_id| (*def_id, analyze_fn(tcx, &may_points_to, *def_id, gc)))
         .collect();
     AnalysisResults { functions }
 }
 
-#[derive(Debug)]
-pub struct ProgInfo {
-    indirect_assigns: HashMap<LocalDefId, HashSet<Local>>,
-    reachability: HashMap<LocalDefId, HashSet<LocalDefId>>,
-    alias_graph: steensgaard::AliasGraph,
-}
-
-impl ProgInfo {
-    pub fn new(tcx: TyCtxt<'_>) -> Self {
-        let hir = tcx.hir();
-
-        let may_aliases = steensgaard::analyze(tcx);
-        let alias_graph = may_aliases.get_alias_graph();
-
-        let func_ids: Vec<_> = hir
-            .items()
-            .filter_map(|item_id| {
-                let item = hir.item(item_id);
-                if item.ident.name.as_str() == "main" || !matches!(item.kind, ItemKind::Fn(_, _, _))
-                {
-                    return None;
-                }
-                Some(item_id.owner_id.def_id)
-            })
-            .collect();
-
-        let (indirect_assigns, call_graph): (HashMap<_, _>, HashMap<_, _>) = func_ids
-            .iter()
-            .map(|def_id| {
-                let body = tcx.optimized_mir(def_id.to_def_id());
-                let (indirect_assigns, callees) = visit_body(*def_id, body, &alias_graph, tcx);
-                ((*def_id, indirect_assigns), (*def_id, callees))
-            })
-            .unzip();
-        let mut reachability = graph::transitive_closure(&call_graph);
-        for (caller, callees) in &mut reachability {
-            callees.insert(*caller);
-        }
-
-        Self {
-            indirect_assigns,
-            reachability,
-            alias_graph,
-        }
-    }
-}
-
 pub fn analyze_fn(
     tcx: TyCtxt<'_>,
-    prog_info: &ProgInfo,
+    may_points_to: &points_to::AnalysisResults,
     local_def_id: LocalDefId,
     gc: bool,
 ) -> HashMap<Location, AbsMem> {
@@ -131,7 +83,7 @@ pub fn analyze_fn(
         local_ptr_tys,
         local_def_id,
         discriminant_values,
-        prog_info,
+        may_points_to,
         gc,
     };
     analyzer.analyze()
@@ -150,9 +102,9 @@ pub struct Analyzer<'tcx, 'a> {
     dead_locals: Vec<BitSet<Local>>,
     local_tys: Vec<TyStructure>,
     local_ptr_tys: HashMap<Local, TyStructure>,
-    local_def_id: LocalDefId,
+    pub local_def_id: LocalDefId,
     discriminant_values: HashMap<BasicBlock, DiscrVal>,
-    prog_info: &'a ProgInfo,
+    pub may_points_to: &'a points_to::AnalysisResults,
     gc: bool,
 }
 
@@ -171,12 +123,12 @@ impl<'tcx> Analyzer<'tcx, '_> {
             let nexts = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
-                    self.transfer_stmt(stmt, &mut next_state);
+                    self.transfer_stmt(stmt, location, &mut next_state);
                     vec![(location.successor_within_block(), next_state)]
                 },
                 |terminator| {
                     let v = self.discriminant_values.get(&location.block);
-                    self.transfer_term(terminator, v, state)
+                    self.transfer_term(terminator, v, location, state)
                 },
             );
             // println!("{:?}", state);
@@ -217,30 +169,21 @@ impl<'tcx> Analyzer<'tcx, '_> {
         operand.ty(&self.body.local_decls, self.tcx)
     }
 
-    pub fn resolve_indirect_calls(&self, local: Local) -> HashSet<LocalDefId> {
-        self.prog_info
-            .alias_graph
-            .find_fn_may_aliases(self.local_def_id, local, self.tcx)
+    pub fn resolve_indirect_call(&self, loc: Location) -> &[LocalDefId] {
+        &self.may_points_to.indirect_calls[&self.local_def_id][&loc.block]
     }
 
-    pub fn locals_invalidated_by_call(&self, callee: LocalDefId) -> HashSet<(Local, usize)> {
-        let fls: Vec<_> = self.prog_info.reachability[&callee]
-            .iter()
-            .flat_map(|func| {
-                self.prog_info.indirect_assigns[func]
-                    .iter()
-                    .map(|local| (*func, *local))
-            })
-            .collect();
-        self.prog_info
-            .alias_graph
-            .find_may_aliases(&fls, self.local_def_id)
+    pub fn get_assign_writes(&self, loc: Location) -> &HybridBitSet<usize> {
+        &self.may_points_to.writes[&self.local_def_id][&loc]
     }
 
-    pub fn find_may_aliases(&self, local: Local) -> HashSet<(Local, usize)> {
-        self.prog_info
-            .alias_graph
-            .find_may_aliases(&[(self.local_def_id, local)], self.local_def_id)
+    pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<HybridBitSet<usize>> {
+        let c0 = callees.get(0)?;
+        let mut writes = self.may_points_to.call_writes[c0].clone();
+        for c in &callees[1..] {
+            writes.union(&self.may_points_to.call_writes[c]);
+        }
+        Some(writes)
     }
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
@@ -499,78 +442,4 @@ fn find_discriminant_values(body: &Body<'_>) -> HashMap<BasicBlock, DiscrVal> {
             Some((bb, v))
         })
         .collect()
-}
-
-struct BodyVisitor<'tcx, 'a> {
-    tcx: TyCtxt<'tcx>,
-    current_fn: LocalDefId,
-    var_graph: &'a steensgaard::AliasGraph,
-
-    indirect_assigns: HashSet<Local>,
-    callees: HashSet<LocalDefId>,
-}
-
-impl BodyVisitor<'_, '_> {
-    fn def_id_to_string(&self, def_id: DefId) -> String {
-        self.tcx.def_path(def_id).to_string_no_crate_verbose()
-    }
-}
-
-impl<'tcx> Visitor<'tcx> for BodyVisitor<'tcx, '_> {
-    fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
-        if place.is_indirect_first_projection() {
-            self.indirect_assigns.insert(place.local);
-        }
-        self.super_assign(place, rvalue, location);
-    }
-
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
-        if let TerminatorKind::Call {
-            func, destination, ..
-        } = &terminator.kind
-        {
-            assert!(destination.projection.is_empty());
-            match func {
-                Operand::Copy(f) | Operand::Move(f) => {
-                    assert!(f.projection.is_empty());
-                    let callees =
-                        self.var_graph
-                            .find_fn_may_aliases(self.current_fn, f.local, self.tcx);
-                    self.callees.extend(callees);
-                }
-                Operand::Constant(box constant) => {
-                    if let ConstantKind::Val(value, ty) = constant.literal {
-                        assert_eq!(value, ConstValue::ZeroSized);
-                        let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        if self.tcx.impl_of_method(*def_id).is_none() {
-                            let name = self.def_id_to_string(*def_id);
-                            if let Some(def_id) = def_id.as_local() {
-                                if !name.contains("{extern#") {
-                                    self.callees.insert(def_id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.super_terminator(terminator, location);
-    }
-}
-
-fn visit_body<'tcx>(
-    current_fn: LocalDefId,
-    body: &Body<'tcx>,
-    alias_graph: &steensgaard::AliasGraph,
-    tcx: TyCtxt<'tcx>,
-) -> (HashSet<Local>, HashSet<LocalDefId>) {
-    let mut visitor = BodyVisitor {
-        tcx,
-        current_fn,
-        var_graph: alias_graph,
-        indirect_assigns: HashSet::new(),
-        callees: HashSet::new(),
-    };
-    visitor.visit_body(body);
-    (visitor.indirect_assigns, visitor.callees)
 }

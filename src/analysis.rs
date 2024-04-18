@@ -15,7 +15,7 @@ use rustc_middle::{
 use rustc_session::config::Input;
 use rustc_span::def_id::LocalDefId;
 
-use crate::{compile_util, relational, ty_finder};
+use crate::*;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -38,7 +38,7 @@ fn analyze_input(input: Input, conf: &Config) {
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let visitor = ty_finder::TyVisitor::new(tcx);
     let foreign_tys = visitor.find_foreign_tys(tcx);
-    let prog_info = relational::ProgInfo::new(tcx);
+    let may_points_to = points_to::analyze(tcx);
 
     for item_id in tcx.hir().items() {
         let item = tcx.hir().item(item_id);
@@ -52,7 +52,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         visitor.visit_body(body);
         if !visitor.accesses.is_empty() {
             println!("{:?}", local_def_id);
-            let states = relational::analyze_fn(tcx, &prog_info, local_def_id, true);
+            let states = relational::analyze_fn(tcx, &may_points_to, local_def_id, true);
             for access in &visitor.accesses {
                 let state = &states[&access.location];
                 let (path, is_deref) = access.get_path(state);
