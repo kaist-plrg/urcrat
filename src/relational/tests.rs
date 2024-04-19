@@ -863,6 +863,38 @@ fn test_deref_eq_invalidate() {
 }
 
 #[test]
+fn test_eq_invalidate() {
+    // _2 = const 0_i32
+    // _3 = const 0_i32
+    // switchInt(move _1) -> [0: bb2, otherwise: bb1]
+    // _5 = &mut _2
+    // _4 = &raw mut (*_5)
+    // goto -> bb3
+    // _6 = &mut _3
+    // _4 = &raw mut (*_6)
+    // goto -> bb3
+    // _7 = const 1_i32
+    // _2 = move _7
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        let mut z: libc::c_int = 0 as libc::c_int;
+        let mut w: *mut libc::c_int = if x != 0 { &mut y } else { &mut z };
+        y = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 4..=4);
+            let dn4 = g.obj_at_location(n[&4].as_ptr()).unwrap();
+            assert_eq!(dn4, &Obj::default());
+            assert_eq!(g.get_local_as_int(2), Some(1));
+            assert_eq!(g.get_local_as_int(3), Some(0));
+        },
+    );
+}
+
+#[test]
 fn test_call_invalidate() {
     // _2 = const 0_i32
     // (*_1) = move _2

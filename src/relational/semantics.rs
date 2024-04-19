@@ -19,25 +19,14 @@ impl<'tcx> Analyzer<'tcx, '_> {
             state.gm().invalidate_symbolic(l.local);
         }
         let (l, l_deref) = AccPath::from_place(*l, state);
-        let writes = self.get_assign_writes(stmt_loc);
-        if !writes.is_empty() {
-            let loc = state.g().path_to_loc(l.clone());
-            let strong_update = if l_deref {
-                loc.and_then(|loc| state.g().obj_at_location(&loc))
-                    .and_then(|obj| {
-                        if let Obj::Ptr(loc) = obj {
-                            Some(loc.clone())
-                        } else {
-                            None
-                        }
-                    })
-            } else {
-                loc
-            };
+        if let Some(writes) = self.get_assign_writes(stmt_loc) {
+            let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
+            let strong_local = if l_deref { None } else { Some(l.local) };
             state.gm().invalidate(
                 self.local_def_id,
                 strong_update.as_ref(),
-                &self.may_points_to,
+                strong_local,
+                self.may_points_to,
                 writes,
             );
         }
@@ -431,6 +420,17 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 };
                 if need_update {
                     let (l, l_deref) = AccPath::from_place(*destination, &state);
+                    if let Some(writes) = self.get_assign_writes(term_loc) {
+                        let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
+                        let strong_local = if l_deref { None } else { Some(l.local) };
+                        state.gm().invalidate(
+                            self.local_def_id,
+                            strong_update.as_ref(),
+                            strong_local,
+                            self.may_points_to,
+                            writes,
+                        );
+                    }
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state
                         .gm()
@@ -443,12 +443,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
     }
 
     fn transfer_intra_call(&self, callees: &[LocalDefId], state: &mut AbsMem) {
-        let graph = state.gm();
-        for callee in callees {
-            // for (local, depth) in self.locals_invalidated_by_call(*callee) {
-            //     graph.invalidate_deref(local, depth, None);
-            // }
-            todo!()
+        if let Some(writes) = self.get_call_writes(callees) {
+            state
+                .gm()
+                .invalidate(self.local_def_id, None, None, self.may_points_to, &writes);
         }
     }
 
@@ -462,17 +460,19 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if name == "realloc" || name == "free" {
             return;
         }
-        let graph = state.gm();
-        for (ty, arg) in inputs.iter().zip(args) {
+        let args = inputs.iter().zip(args).filter_map(|(ty, arg)| {
             if ty.is_mutable_ptr() {
                 if let Some(arg) = arg.place() {
                     assert!(arg.projection.is_empty());
-                    // for (local, depth) in self.find_may_aliases(arg.local) {
-                    //     graph.invalidate_deref(local, depth, None);
-                    // }
-                    todo!()
+                    return Some(arg.local);
                 }
             }
+            None
+        });
+        if let Some(writes) = self.get_arg_writes(args) {
+            state
+                .gm()
+                .invalidate(self.local_def_id, None, None, self.may_points_to, &writes);
         }
     }
 
@@ -538,10 +538,16 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             (_, "unix", _, "memcpy") => {
                 if let Some(arg) = args[0].place() {
-                    // for (local, depth) in self.find_may_aliases(arg.local) {
-                    //     state.gm().invalidate_deref(local, depth, None);
-                    // }
-                    todo!()
+                    assert!(arg.projection.is_empty());
+                    if let Some(writes) = self.get_arg_writes(std::iter::once(arg.local)) {
+                        state.gm().invalidate(
+                            self.local_def_id,
+                            None,
+                            None,
+                            self.may_points_to,
+                            &writes,
+                        );
+                    }
                 }
                 true
             }

@@ -802,56 +802,86 @@ impl Graph {
             .retain(|local, _| !dead_locals.contains(*local) || locals.contains(local));
     }
 
-    pub fn path_to_loc(&self, path: AccPath) -> Option<AbsLoc> {
+    fn path_to_loc(&self, path: AccPath) -> Option<AbsLoc> {
         let root = self.locals.get(&path.local)?;
         Some(AbsLoc::new(*root, path.projection))
+    }
+
+    pub fn strong_update_loc(&self, path: AccPath, deref: bool) -> Option<AbsLoc> {
+        let loc = self.path_to_loc(path);
+        if deref {
+            loc.and_then(|loc| self.obj_at_location(&loc))
+                .and_then(|obj| {
+                    if let Obj::Ptr(loc) = obj {
+                        Some(loc.clone())
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            loc
+        }
     }
 
     pub fn invalidate(
         &mut self,
         func: LocalDefId,
         strong_update: Option<&AbsLoc>,
+        strong_local: Option<Local>,
         may_points_to: &points_to::AnalysisResults,
         writes: &HybridBitSet<usize>,
     ) {
+        let mut no_update_locals = HashSet::new();
+        if let Some(strong_local) = strong_local {
+            for (local, node_id) in &self.locals {
+                if *local != strong_local {
+                    no_update_locals.insert(*node_id);
+                }
+            }
+        }
         let mut worklist: Vec<_> = self
             .locals
             .iter()
             .map(|(local, node_id)| {
                 let loc = AbsLoc::new_root(*node_id);
-                let node = &may_points_to.var_nodes[&(func, *local)];
+                let node = may_points_to.var_nodes[&(func, *local)];
                 (loc, node)
             })
             .collect();
         let mut visited = HashSet::new();
+        let ctx = InvalidateCtx {
+            strong_update,
+            no_update_locals: &no_update_locals,
+            may_points_to,
+            writes,
+        };
         while let Some((loc, node)) = worklist.pop() {
             let obj = self.obj_at_location_mut(&loc, false);
-            invalidate_rec(
-                loc,
-                obj,
-                *node,
-                strong_update,
-                may_points_to,
-                writes,
-                &mut visited,
-            );
+            let v = invalidate_rec(loc, obj, node, &mut visited, ctx);
+            worklist.extend(v);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct InvalidateCtx<'a> {
+    strong_update: Option<&'a AbsLoc>,
+    no_update_locals: &'a HashSet<NodeId>,
+    may_points_to: &'a points_to::AnalysisResults,
+    writes: &'a HybridBitSet<usize>,
 }
 
 fn invalidate_rec(
     loc: AbsLoc,
     obj: &mut Obj,
     node: points_to::Node,
-    strong_update: Option<&AbsLoc>,
-    may_points_to: &points_to::AnalysisResults,
-    writes: &HybridBitSet<usize>,
     visited: &mut HashSet<(AbsLoc, points_to::Node)>,
+    ctx: InvalidateCtx<'_>,
 ) -> Vec<(AbsLoc, points_to::Node)> {
     if !visited.insert((loc.clone(), node)) {
         return vec![];
     }
-    let edges = &may_points_to.graph[&node];
+    let edges = &ctx.may_points_to.graph[&node];
     let v = match obj {
         Obj::AtAddr(_) => vec![],
         Obj::Ptr(loc) => {
@@ -869,29 +899,13 @@ fn invalidate_rec(
                         let index = index as u128;
                         let obj = some_or!(fs.get_mut(&AccElem::Int(index)), continue);
                         let loc = loc.clone().extend_int(index);
-                        v.extend(invalidate_rec(
-                            loc,
-                            obj,
-                            *node,
-                            strong_update,
-                            may_points_to,
-                            writes,
-                            visited,
-                        ));
+                        v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                     }
                 }
                 points_to::Edges::Index(node) => {
                     for (elem, obj) in fs {
                         let loc = loc.clone().extend_elem(elem.clone());
-                        v.extend(invalidate_rec(
-                            loc,
-                            obj,
-                            *node,
-                            strong_update,
-                            may_points_to,
-                            writes,
-                            visited,
-                        ));
+                        v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                     }
                 }
                 _ => {}
@@ -900,8 +914,12 @@ fn invalidate_rec(
         }
     };
     if node.prefix == 0
-        && writes.contains(node.index)
-        && strong_update.map(|s| !s.is_prefix_of(&loc)).unwrap_or(true)
+        && ctx.writes.contains(node.index)
+        && !ctx.no_update_locals.contains(&loc.root)
+        && ctx
+            .strong_update
+            .map(|s| !s.is_prefix_of(&loc))
+            .unwrap_or(true)
     {
         *obj = Obj::default();
     }

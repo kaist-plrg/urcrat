@@ -51,8 +51,8 @@ pub fn analyze_fn(
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    // println!("{}", compile_util::body_to_str(&body));
-    // println!("{}", compile_util::body_size(&body));
+    // println!("{}", compile_util::body_to_str(body));
+    // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let rpo_map = compute_rpo_map(body, &loop_blocks);
@@ -173,8 +173,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
         &self.may_points_to.indirect_calls[&self.local_def_id][&loc.block]
     }
 
-    pub fn get_assign_writes(&self, loc: Location) -> &HybridBitSet<usize> {
-        &self.may_points_to.writes[&self.local_def_id][&loc]
+    pub fn get_assign_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
+        let w = &self.may_points_to.writes[&self.local_def_id][&loc];
+        if w.is_empty() {
+            None
+        } else {
+            Some(w)
+        }
     }
 
     pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<HybridBitSet<usize>> {
@@ -183,7 +188,33 @@ impl<'tcx> Analyzer<'tcx, '_> {
         for c in &callees[1..] {
             writes.union(&self.may_points_to.call_writes[c]);
         }
-        Some(writes)
+        if writes.is_empty() {
+            None
+        } else {
+            Some(writes)
+        }
+    }
+
+    pub fn get_arg_writes<I: Iterator<Item = Local>>(
+        &self,
+        locals: I,
+    ) -> Option<HybridBitSet<usize>> {
+        let mut writes = locals
+            .flat_map(|local| {
+                let start = self.may_points_to.var_nodes[&(self.local_def_id, local)].index;
+                let end = self.may_points_to.ends[start];
+                start..=end
+            })
+            .map(|index| &self.may_points_to.solutions[index]);
+        let mut w = writes.next()?.clone();
+        for write in writes {
+            w.union(write);
+        }
+        if w.is_empty() {
+            None
+        } else {
+            Some(w)
+        }
     }
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
