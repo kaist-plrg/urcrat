@@ -21,11 +21,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (l, l_deref) = AccPath::from_place(*l, state);
         if let Some(writes) = self.get_assign_writes(stmt_loc) {
             let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
-            let strong_local = if l_deref { None } else { Some(l.local) };
             state.gm().invalidate(
                 self.local_def_id,
                 strong_update.as_ref(),
-                strong_local,
+                !l_deref,
                 self.may_points_to,
                 writes,
             );
@@ -422,11 +421,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     let (l, l_deref) = AccPath::from_place(*destination, &state);
                     if let Some(writes) = self.get_assign_writes(term_loc) {
                         let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
-                        let strong_local = if l_deref { None } else { Some(l.local) };
                         state.gm().invalidate(
                             self.local_def_id,
                             strong_update.as_ref(),
-                            strong_local,
+                            !l_deref,
                             self.may_points_to,
                             writes,
                         );
@@ -446,7 +444,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if let Some(writes) = self.get_call_writes(callees) {
             state
                 .gm()
-                .invalidate(self.local_def_id, None, None, self.may_points_to, &writes);
+                .invalidate(self.local_def_id, None, false, self.may_points_to, &writes);
         }
     }
 
@@ -472,7 +470,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if let Some(writes) = self.get_arg_writes(args) {
             state
                 .gm()
-                .invalidate(self.local_def_id, None, None, self.may_points_to, &writes);
+                .invalidate(self.local_def_id, None, false, self.may_points_to, &writes);
         }
     }
 
@@ -543,7 +541,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         state.gm().invalidate(
                             self.local_def_id,
                             None,
-                            None,
+                            false,
                             self.may_points_to,
                             &writes,
                         );

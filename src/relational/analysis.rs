@@ -51,7 +51,7 @@ pub fn analyze_fn(
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    // println!("{}", compile_util::body_to_str(body));
+    println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
@@ -131,10 +131,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     self.transfer_term(terminator, v, location, state)
                 },
             );
-            // println!("{:?}", state);
-            // println!("{:?} {:?}", location, self.body.stmt_at(location));
-            // println!("{:?}", nexts);
-            // println!("-----------------");
+            println!("{:?}", state);
+            println!("{:?} {:?}", location, self.body.stmt_at(location));
+            println!("{:?}", nexts);
+            println!("-----------------");
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
                 let mut joined = next_state.join(&new_next_state);

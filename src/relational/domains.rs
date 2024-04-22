@@ -374,6 +374,11 @@ impl Obj {
         fs.get(&AccElem::Int(i)).unwrap()
     }
 
+    pub fn as_at_addr(&self) -> u128 {
+        let Obj::AtAddr(n) = self else { panic!() };
+        *n
+    }
+
     pub fn symbolic(&self, index: &[usize]) -> Option<&Obj> {
         let Obj::Compound(fs) = self else { panic!() };
         let index = index.iter().copied().map(Local::from_usize).collect();
@@ -808,35 +813,32 @@ impl Graph {
     }
 
     pub fn strong_update_loc(&self, path: AccPath, deref: bool) -> Option<AbsLoc> {
-        let loc = self.path_to_loc(path);
-        if deref {
-            loc.and_then(|loc| self.obj_at_location(&loc))
-                .and_then(|obj| {
-                    if let Obj::Ptr(loc) = obj {
-                        Some(loc.clone())
-                    } else {
-                        None
-                    }
-                })
+        let mut loc = self.path_to_loc(path)?;
+        let loc = if deref {
+            let projection = std::mem::take(&mut loc.projection);
+            let obj = self.obj_at_location(&loc)?;
+            let Obj::Ptr(loc) = obj else { return None };
+            let mut loc = loc.clone();
+            loc.projection.extend(projection);
+            loc
         } else {
             loc
-        }
+        };
+        Some(loc)
     }
 
     pub fn invalidate(
         &mut self,
         func: LocalDefId,
         strong_update: Option<&AbsLoc>,
-        strong_local: Option<Local>,
+        strong_local: bool,
         may_points_to: &points_to::AnalysisResults,
         writes: &HybridBitSet<usize>,
     ) {
         let mut no_update_locals = HashSet::new();
-        if let Some(strong_local) = strong_local {
-            for (local, node_id) in &self.locals {
-                if *local != strong_local {
-                    no_update_locals.insert(*node_id);
-                }
+        if strong_local {
+            for node_id in self.locals.values() {
+                no_update_locals.insert(*node_id);
             }
         }
         let mut worklist: Vec<_> = self
@@ -884,12 +886,25 @@ fn invalidate_rec(
     let edges = &ctx.may_points_to.graph[&node];
     let v = match obj {
         Obj::AtAddr(_) => vec![],
-        Obj::Ptr(loc) => {
-            if let points_to::Edges::Deref(nodes) = edges {
-                nodes.iter().map(|node| (loc.clone(), *node)).collect()
+        Obj::Ptr(ptr_loc) => {
+            let v = if let points_to::Edges::Deref(nodes) = edges {
+                nodes.iter().map(|node| (ptr_loc.clone(), *node)).collect()
             } else {
                 vec![]
+            };
+
+            if node.prefix == 0
+                && ctx.writes.contains(node.index)
+                && !ctx.no_update_locals.contains(&loc.root)
+                && ctx
+                    .strong_update
+                    .map(|s| !s.is_prefix_of(&loc))
+                    .unwrap_or(true)
+            {
+                *obj = Obj::default();
             }
+
+            v
         }
         Obj::Compound(fs) => {
             let mut v = vec![];
@@ -913,16 +928,6 @@ fn invalidate_rec(
             v
         }
     };
-    if node.prefix == 0
-        && ctx.writes.contains(node.index)
-        && !ctx.no_update_locals.contains(&loc.root)
-        && ctx
-            .strong_update
-            .map(|s| !s.is_prefix_of(&loc))
-            .unwrap_or(true)
-    {
-        *obj = Obj::default();
-    }
     v
 }
 
