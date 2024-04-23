@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+};
 
 use etrace::some_or;
 use relational::{AbsMem, AccPath, Obj};
@@ -13,7 +16,7 @@ use rustc_middle::{
     ty::{TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{def_id::LocalDefId, Span};
 
 use crate::*;
 
@@ -40,6 +43,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let foreign_tys = visitor.find_foreign_tys(tcx);
     let may_points_to = points_to::analyze(tcx);
 
+    let mut accesses: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();
     for item_id in tcx.hir().items() {
         let item = tcx.hir().item(item_id);
         if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
@@ -54,43 +58,62 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             println!("{:?}", local_def_id);
             let states = relational::analyze_fn(tcx, &may_points_to, local_def_id, true);
             for access in &visitor.accesses {
-                println!(
-                    "{:?} {:?}",
-                    body.source_info(access.location).span,
-                    access.ctx
-                );
-                let Some(state) = states.get(&access.location) else {
-                    println!("No state");
-                    continue;
+                let span = body.source_info(access.location).span;
+                let tags = compute_tags(*access, &states);
+                let aa = AnalyzedAccess {
+                    span,
+                    ctx: access.ctx,
+                    tags,
                 };
-                let (path, is_deref) = access.get_path(state);
-                let g = state.g();
-                let obj = g.get_obj(&path, is_deref);
-                println!("{:?} {:?}", access.location, body.stmt_at(access.location));
-                // println!("{:?}", state);
-                if let Some(obj) = obj {
-                    let Obj::Struct(fields) = obj else { continue };
-                    for (i, obj) in fields {
-                        if let Obj::Ptr(loc) = obj {
-                            if let Some(obj) = g.obj_at_location(loc) {
-                                if let Obj::AtAddr(n) = obj {
-                                    println!("{:?}: {}", i, n);
-                                } else {
-                                    println!("{:?}: loc<{:?}>", i, obj);
-                                }
-                            } else {
-                                println!("{:?}: loc<{:?}>", i, obj);
-                            }
-                        } else {
-                            println!("{:?}: {:?}", i, obj);
-                        }
-                    }
-                } else {
-                    println!("None");
-                }
+                accesses
+                    .entry(access.ty)
+                    .or_default()
+                    .entry(access.field)
+                    .or_default()
+                    .push(aa);
             }
         }
     }
+
+    let source_map = tcx.sess.source_map();
+    for (ty, accesses) in accesses {
+        println!("[[Type {:?}]]", ty);
+        for (f, accesses) in accesses {
+            println!("[Field {:?}]", f);
+            for aa in accesses {
+                let fname = source_map.span_to_filename(aa.span);
+                let file_name = fname.prefer_remapped().to_string();
+                let file = source_map.get_source_file(&fname).unwrap();
+                let (line, _, _) = file.lookup_file_pos_with_col_display(aa.span.lo());
+                let tags: String = aa
+                    .tags
+                    .iter()
+                    .map(|(f, t)| format!("{}: {}", f, t))
+                    .intersperse(", ".to_string())
+                    .collect();
+                println!("{}, {:?}, {}:{:?}", tags, aa.ctx, file_name, line);
+            }
+        }
+    }
+}
+
+fn compute_tags(access: FieldAccess<'_>, states: &HashMap<Location, AbsMem>) -> Vec<(u32, u128)> {
+    let state = some_or!(states.get(&access.location), return vec![]);
+    let (path, is_deref) = access.get_path(state);
+    let g = state.g();
+    let obj = some_or!(g.get_obj(&path, is_deref), return vec![]);
+    let Obj::Struct(fields) = obj else { return vec![] };
+    let mut v: Vec<_> = fields
+        .iter()
+        .filter_map(|(f, obj)| {
+            let Obj::Ptr(loc) = obj else { return None };
+            let obj = g.obj_at_location(loc)?;
+            let Obj::AtAddr(n) = obj else { return None };
+            Some((*f, *n))
+        })
+        .collect();
+    v.sort_by_key(|(f, _)| *f);
+    v
 }
 
 struct PlaceVisitor<'tcx, 'a> {
@@ -186,4 +209,10 @@ impl FieldAccess<'_> {
             state,
         )
     }
+}
+
+struct AnalyzedAccess {
+    span: Span,
+    ctx: PlaceContext,
+    tags: Vec<(u32, u128)>,
 }

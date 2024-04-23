@@ -120,6 +120,9 @@ impl<'tcx> Analyzer<'tcx, '_> {
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
+            // println!("{:?}", state);
+            // println!("{:?}", self.body.source_info(location).span);
+            // println!("{:?} {:?}", location, self.body.stmt_at(location));
             let nexts = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
@@ -131,8 +134,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     self.transfer_term(terminator, v, location, state)
                 },
             );
-            // println!("{:?}", state);
-            // println!("{:?} {:?}", location, self.body.stmt_at(location));
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
@@ -306,9 +307,7 @@ fn get_path_suffixes(ty: &TyStructure, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
         }
         TyStructure::Array(box ty, len) => {
             if let Some(elem) = proj.get(0) {
-                if let AccElem::Index(Index::Num(n)) = elem {
-                    assert!(*n < *len as u128, "{} {}", n, len);
-                }
+                assert!(matches!(elem, AccElem::Index(_)));
                 get_path_suffixes(ty, &proj[1..])
             } else {
                 (0..*len)
