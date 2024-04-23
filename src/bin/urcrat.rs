@@ -25,12 +25,12 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    // let conf = analysis::Config {
-    //     unions: args.include_union.into_iter().collect(),
-    // };
-    // analysis::analyze_path(&file, &conf);
     let start = std::time::Instant::now();
-    points_to::analyze_path(&file);
+    let conf = analysis::Config {
+        unions: args.include_union.into_iter().collect(),
+    };
+    analysis::analyze_path(&file, &conf);
+    // points_to::analyze_path(&file);
     let elapsed = start.elapsed();
     println!("{}", elapsed.as_millis());
 }

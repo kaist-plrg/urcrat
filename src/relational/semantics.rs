@@ -90,7 +90,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 let r = self.transfer_op(r, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 for i in 0..len.min(10) {
-                    let l = l.extended(&[AccElem::Int(i as _)]);
+                    let l = l.extended(&[AccElem::num_index(i as _)]);
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
                 }
@@ -174,13 +174,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
-                    let l = l.extended(&[AccElem::Int(field.index() as _)]);
+                    let l = l.extended(&[AccElem::Field(field.as_u32())]);
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
                         let v = self.transfer_op(op, state);
-                        let l = l.extended(&[AccElem::Int(field.index() as _)]);
+                        let l = l.extended(&[AccElem::Field(field.as_u32())]);
                         let suffixes = self.get_path_suffixes(&l, l_deref);
                         state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
@@ -504,7 +504,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 let ptr = args[0].place().unwrap();
                 let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);
                 assert!(!ptr_deref);
-                ptr.projection.push(AccElem::Int(0));
+                ptr.projection.push(AccElem::num_index(0));
                 state.gm().x_eq_ref_y(&d, &ptr, true);
                 false
             }
@@ -626,13 +626,13 @@ impl AccElem {
     fn from_elem(proj: PlaceElem<'_>, state: &AbsMem) -> Option<Self> {
         match proj {
             ProjectionElem::Deref => None,
-            ProjectionElem::Field(i, _) => Some(AccElem::Int(i.index() as _)),
+            ProjectionElem::Field(i, _) => Some(AccElem::Field(i.as_u32())),
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
                 if let Some(i) = state.g().get_x_as_int(&path, false) {
-                    Some(AccElem::Int(i))
+                    Some(AccElem::num_index(i))
                 } else {
-                    Some(AccElem::Symbolic(state.g().find_aliases(local)))
+                    Some(AccElem::sym_index(state.g().find_aliases(local)))
                 }
             }
             ProjectionElem::ConstantIndex { .. } => unreachable!(),

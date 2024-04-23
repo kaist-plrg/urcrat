@@ -74,51 +74,83 @@ impl AbsMem {
 type NodeId = usize;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AccElem {
-    Int(u128),
-    Symbolic(BTreeSet<Local>),
+pub enum Index {
+    Num(u128),
+    Sym(BTreeSet<Local>),
 }
 
-impl std::fmt::Debug for AccElem {
+impl std::fmt::Debug for Index {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AccElem::Int(i) => write!(f, "{}", i),
-            AccElem::Symbolic(s) => write!(f, "{:?}", s),
+            Index::Num(i) => write!(f, "{}", i),
+            Index::Sym(s) => write!(f, "{:?}", s),
         }
     }
 }
 
-impl AccElem {
-    fn equiv(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Int(n1), Self::Int(n2)) => n1 == n2,
-            (Self::Symbolic(l1), Self::Symbolic(l2)) => !l1.is_disjoint(l2),
-            _ => false,
-        }
-    }
-
+impl Index {
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
-            (Self::Int(n1), Self::Int(n2)) if n1 == n2 => Self::Int(*n1),
-            (Self::Symbolic(l1), Self::Symbolic(l2)) => {
-                Self::Symbolic(l1.intersection(l2).cloned().collect())
-            }
-            _ => Self::Symbolic(BTreeSet::new()),
+            (Self::Num(n1), Self::Num(n2)) if n1 == n2 => Self::Num(*n1),
+            (Self::Sym(l1), Self::Sym(l2)) => Self::Sym(l1.intersection(l2).cloned().collect()),
+            _ => Self::Sym(BTreeSet::new()),
         }
     }
 
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Int(n1), Self::Int(n2)) => n1 == n2,
-            (Self::Symbolic(l1), Self::Symbolic(l2)) => l2.is_subset(l1),
+            (Self::Num(n1), Self::Num(n2)) => n1 == n2,
+            (Self::Sym(l1), Self::Sym(l2)) => l2.is_subset(l1),
             _ => false,
         }
     }
 
-    fn locals(&self) -> HashSet<Local> {
+    fn equiv(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Num(n1), Self::Num(n2)) => n1 == n2,
+            (Self::Sym(l1), Self::Sym(l2)) => !l1.is_disjoint(l2),
+            _ => false,
+        }
+    }
+
+    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+        if let Self::Sym(ls) = self {
+            for local in ls {
+                locals.insert(*local);
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccElem {
+    Field(u32),
+    Index(Index),
+}
+
+impl std::fmt::Debug for AccElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Int(_) => HashSet::new(),
-            Self::Symbolic(l) => l.iter().cloned().collect(),
+            AccElem::Field(i) => write!(f, ".{}", i),
+            AccElem::Index(i) => write!(f, "[{:?}]", i),
+        }
+    }
+}
+
+impl AccElem {
+    #[inline]
+    pub fn num_index(i: u128) -> Self {
+        Self::Index(Index::Num(i))
+    }
+
+    #[inline]
+    pub fn sym_index(ls: BTreeSet<Local>) -> Self {
+        Self::Index(Index::Sym(ls))
+    }
+
+    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+        if let Self::Index(i) = self {
+            i.collect_locals(locals);
         }
     }
 }
@@ -134,7 +166,7 @@ impl std::fmt::Debug for AbsLoc {
         write!(f, "{}", self.root)?;
         if !self.projection.is_empty() {
             for elem in self.projection.iter() {
-                write!(f, ".{:?}", elem)?;
+                write!(f, "{:?}", elem)?;
             }
         }
         Ok(())
@@ -166,14 +198,14 @@ impl AbsLoc {
     }
 
     #[inline]
-    fn extend_elem(mut self, elem: AccElem) -> Self {
-        self.projection.push(elem);
+    fn push_field(mut self, i: u32) -> Self {
+        self.projection.push(AccElem::Field(i));
         self
     }
 
     #[inline]
-    fn extend_int(mut self, i: u128) -> Self {
-        self.projection.push(AccElem::Int(i));
+    fn push_index(mut self, i: Index) -> Self {
+        self.projection.push(AccElem::Index(i));
         self
     }
 
@@ -191,17 +223,20 @@ impl AbsLoc {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum Obj {
+    Top,
     AtAddr(u128),
     Ptr(AbsLoc),
-    Compound(HashMap<AccElem, Obj>),
+    Struct(HashMap<u32, Obj>),
+    Array(HashMap<Index, Obj>),
 }
 
 impl std::fmt::Debug for Obj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Top => write!(f, "T"),
             Self::AtAddr(n) => write!(f, "@{}", n),
             Self::Ptr(l) => write!(f, "{:?}", l),
-            Self::Compound(fs) => {
+            Self::Struct(fs) => {
                 write!(f, "[")?;
                 let mut v = fs.keys().cloned().collect::<Vec<_>>();
                 v.sort();
@@ -209,7 +244,19 @@ impl std::fmt::Debug for Obj {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{:?}: {:?}", k, fs[k])?;
+                    write!(f, "{}: {:?}", k, fs[k])?;
+                }
+                write!(f, "]")
+            }
+            Self::Array(vs) => {
+                write!(f, "[")?;
+                let mut v = vs.keys().cloned().collect::<Vec<_>>();
+                v.sort();
+                for (i, k) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {:?}", k, vs[k])?;
                 }
                 write!(f, "]")
             }
@@ -217,32 +264,18 @@ impl std::fmt::Debug for Obj {
     }
 }
 
-impl Default for Obj {
-    #[inline]
-    fn default() -> Self {
-        Obj::Compound(HashMap::new())
-    }
-}
-
 impl Obj {
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
         if let Some(elem) = proj.get(0) {
-            let Obj::Compound(fields) = self else { return None };
-            let inner = match elem {
-                AccElem::Int(n) => fields.get(&AccElem::Int(*n))?,
-                AccElem::Symbolic(_) => {
-                    fields.iter().find_map(
-                        |(field, obj)| {
-                            if field.equiv(elem) {
-                                Some(obj)
-                            } else {
-                                None
-                            }
-                        },
-                    )?
+            let inner = match (self, elem) {
+                (Self::Struct(fs), AccElem::Field(f)) => fs.get(f),
+                (Self::Array(vs), AccElem::Index(i)) => {
+                    vs.iter()
+                        .find_map(|(idx, obj)| if idx.equiv(i) { Some(obj) } else { None })
                 }
+                _ => None,
             };
-            inner.project(&proj[1..])
+            inner?.project(&proj[1..])
         } else {
             Some(self)
         }
@@ -250,39 +283,50 @@ impl Obj {
 
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
         if let Some(elem) = proj.get(0) {
-            let fields = match self {
-                Obj::Compound(field) => std::mem::take(field),
-                _ => HashMap::new(),
-            };
-            let mut new_fields = HashMap::new();
-            let mut exists = false;
-            let mut elem = elem.clone();
-            for (field, obj) in fields {
-                match (&field, &mut elem) {
-                    (AccElem::Int(n1), AccElem::Int(n2)) => {
-                        if n1 == n2 {
-                            exists = true;
-                        }
-                        new_fields.insert(field, obj);
+            let inner = match elem {
+                AccElem::Field(f) => {
+                    if !matches!(self, Self::Struct(_)) {
+                        *self = Self::Struct(HashMap::new());
                     }
-                    (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) if !l1.is_disjoint(l2) => {
-                        exists = true;
-                        l2.extend(l1);
-                        new_fields.insert(elem.clone(), obj);
-                    }
-                    _ => {
-                        if !write {
-                            new_fields.insert(field, obj);
-                        }
-                    }
+                    let Self::Struct(fs) = self else { unreachable!() };
+                    fs.entry(*f).or_insert(Obj::Top)
                 }
-            }
-            if !exists {
-                new_fields.insert(elem.clone(), Obj::default());
-            }
-            *self = Obj::Compound(new_fields);
-            let Obj::Compound(fields) = self else { unreachable!() };
-            let inner = fields.get_mut(&elem).unwrap();
+                AccElem::Index(i) => {
+                    let vs = match self {
+                        Self::Array(vs) => std::mem::take(vs),
+                        _ => HashMap::new(),
+                    };
+                    let mut new_vs = HashMap::new();
+                    let mut exists = false;
+                    let mut i = i.clone();
+                    for (idx, obj) in vs {
+                        match (&idx, &mut i) {
+                            (Index::Num(n1), Index::Num(n2)) => {
+                                if n1 == n2 {
+                                    exists = true;
+                                }
+                                new_vs.insert(idx, obj);
+                            }
+                            (Index::Sym(l1), Index::Sym(l2)) if !l1.is_disjoint(l2) => {
+                                exists = true;
+                                l2.extend(l1);
+                                new_vs.insert(i.clone(), obj);
+                            }
+                            _ => {
+                                if !write {
+                                    new_vs.insert(idx, obj);
+                                }
+                            }
+                        }
+                    }
+                    if !exists {
+                        new_vs.insert(i.clone(), Obj::Top);
+                    }
+                    *self = Obj::Array(new_vs);
+                    let Obj::Array(vs) = self else { unreachable!() };
+                    vs.get_mut(&i).unwrap()
+                }
+            };
             inner.project_mut(&proj[1..], write)
         } else {
             self
@@ -291,14 +335,19 @@ impl Obj {
 
     fn substitute(&mut self, old_loc: &AbsLoc, new_loc: &AbsLoc) {
         match self {
-            Self::AtAddr(_) => {}
+            Self::Top | Self::AtAddr(_) => {}
             Self::Ptr(loc) => {
                 if loc == old_loc {
                     *loc = new_loc.clone();
                 }
             }
-            Self::Compound(fs) => {
+            Self::Struct(fs) => {
                 for obj in fs.values_mut() {
+                    obj.substitute(old_loc, new_loc);
+                }
+            }
+            Self::Array(vs) => {
+                for obj in vs.values_mut() {
                     obj.substitute(old_loc, new_loc);
                 }
             }
@@ -307,14 +356,19 @@ impl Obj {
 
     fn extend_loc(&mut self, loc: &AbsLoc) {
         match self {
-            Self::AtAddr(_) => {}
+            Self::Top | Self::AtAddr(_) => {}
             Self::Ptr(curr_loc) => {
                 if curr_loc == loc {
-                    curr_loc.projection.push(AccElem::Int(0));
+                    curr_loc.projection.push(AccElem::num_index(0));
                 }
             }
-            Self::Compound(fs) => {
+            Self::Struct(fs) => {
                 for obj in fs.values_mut() {
+                    obj.extend_loc(loc);
+                }
+            }
+            Self::Array(vs) => {
+                for obj in vs.values_mut() {
                     obj.extend_loc(loc);
                 }
             }
@@ -323,44 +377,44 @@ impl Obj {
 
     fn invalidate_symbolic(&mut self, local: Local) {
         match self {
-            Self::AtAddr(_) => {}
-            Self::Ptr(_) => {}
-            Self::Compound(fs) => {
-                while let Some(f) = fs.keys().find(|f| {
-                    let AccElem::Symbolic(ls) = f else { return false };
-                    ls.contains(&local)
-                }) {
-                    let f = f.clone();
-                    let obj = fs.remove(&f).unwrap();
-                    let AccElem::Symbolic(mut ls) = f else { unreachable!() };
-                    ls.remove(&local);
-                    if !ls.is_empty() {
-                        fs.insert(AccElem::Symbolic(ls), obj);
-                    }
-                }
+            Self::Top | Self::AtAddr(_) | Self::Ptr(_) => {}
+            Self::Struct(fs) => {
                 for obj in fs.values_mut() {
                     obj.invalidate_symbolic(local);
+                }
+            }
+            Self::Array(vs) => {
+                let old_vs = std::mem::take(vs);
+                for (mut idx, mut obj) in old_vs {
+                    if let Index::Sym(ls) = &mut idx {
+                        ls.remove(&local);
+                    }
+                    obj.invalidate_symbolic(local);
+                    vs.insert(idx, obj);
                 }
             }
         }
     }
 
-    fn locals(&self) -> HashSet<Local> {
+    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
         match self {
-            Self::AtAddr(_) => HashSet::new(),
-            Self::Ptr(loc) => loc
-                .projection
-                .iter()
-                .flat_map(|elem| elem.locals())
-                .collect(),
-            Self::Compound(fs) => fs
-                .iter()
-                .flat_map(|(f, obj)| {
-                    let mut ls = f.locals();
-                    ls.extend(obj.locals());
-                    ls
-                })
-                .collect(),
+            Self::Top | Self::AtAddr(_) => {}
+            Self::Ptr(loc) => {
+                for elem in &loc.projection {
+                    elem.collect_locals(locals);
+                }
+            }
+            Self::Struct(fs) => {
+                for obj in fs.values() {
+                    obj.collect_locals(locals);
+                }
+            }
+            Self::Array(vs) => {
+                for (idx, obj) in vs {
+                    idx.collect_locals(locals);
+                    obj.collect_locals(locals);
+                }
+            }
         }
     }
 
@@ -369,24 +423,25 @@ impl Obj {
         loc
     }
 
-    pub fn field(&self, i: u128) -> &Obj {
-        let Obj::Compound(fs) = self else { panic!() };
-        fs.get(&AccElem::Int(i)).unwrap()
+    pub fn field(&self, i: u32) -> &Obj {
+        let Obj::Struct(fs) = self else { panic!() };
+        fs.get(&i).unwrap()
     }
 
-    pub fn as_at_addr(&self) -> u128 {
-        let Obj::AtAddr(n) = self else { panic!() };
-        *n
+    #[allow(clippy::should_implement_trait)]
+    pub fn index(&self, i: u128) -> &Obj {
+        let Obj::Array(vs) = self else { panic!() };
+        vs.get(&Index::Num(i)).unwrap()
     }
 
     pub fn symbolic(&self, index: &[usize]) -> Option<&Obj> {
-        let Obj::Compound(fs) = self else { panic!() };
+        let Obj::Array(vs) = self else { panic!() };
         let index = index.iter().copied().map(Local::from_usize).collect();
-        fs.get(&AccElem::Symbolic(index))
+        vs.get(&Index::Sym(index))
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Node {
     pub obj: Obj,
@@ -456,7 +511,7 @@ impl Graph {
             let obj2 = other.obj_at_location(&loc2);
             let id = id_map[&(loc1, loc2)];
 
-            let mut obj = Obj::default();
+            let mut obj = Obj::Top;
             if let (Some(obj1), Some(obj2)) = (obj1, obj2) {
                 join_objs(
                     obj1,
@@ -499,7 +554,7 @@ impl Graph {
 
     fn add_node(&mut self) -> (NodeId, &mut Node) {
         let id = self.nodes.len();
-        self.nodes.push(Node::default());
+        self.nodes.push(Node::new(Obj::Top));
         (id, &mut self.nodes[id])
     }
 
@@ -601,7 +656,7 @@ impl Graph {
 
     pub fn x_eq(&mut self, x: &AccPath, deref: bool) {
         let obj = self.lvalue(x, deref);
-        *obj = Obj::default();
+        *obj = Obj::Top;
     }
 
     pub fn x_eq_ref_y(&mut self, x: &AccPath, y: &AccPath, y_deref: bool) {
@@ -625,19 +680,19 @@ impl Graph {
             let Obj::Ptr(loc) = &self.nodes[id].obj else { panic!() };
             let mut loc = loc.clone();
             self.extend_loc(&loc);
-            loc.projection.push(AccElem::Int(0));
+            loc.projection.push(AccElem::num_index(0));
             self.obj_at_location_mut(&loc, false);
             loc
         } else {
             loc
         };
         let elem = loc.projection.last_mut().unwrap();
-        if let AccElem::Int(n) = elem {
+        if let AccElem::Index(Index::Num(n)) = elem {
             match idx {
                 OpVal::Place(idx, idx_deref) => {
                     assert!(idx.projection.is_empty());
                     assert!(!idx_deref);
-                    *elem = AccElem::Symbolic(self.find_aliases(idx.local));
+                    *elem = AccElem::sym_index(self.find_aliases(idx.local));
                     let obj = self.lvalue(x, false);
                     *obj = Obj::Ptr(loc);
                 }
@@ -648,12 +703,12 @@ impl Graph {
                 }
                 OpVal::Other => {
                     let obj = self.lvalue(x, false);
-                    *obj = Obj::default();
+                    *obj = Obj::Top;
                 }
             }
         } else {
             let obj = self.lvalue(x, false);
-            *obj = Obj::default();
+            *obj = Obj::Top;
         }
     }
 
@@ -662,11 +717,11 @@ impl Graph {
         let mut loc = self.get_pointed_loc_mut(id, &[], false);
         let obj = self.lvalue(x, false);
         let elem = loc.projection.last_mut().unwrap();
-        if let AccElem::Int(n) = elem {
+        if let AccElem::Index(Index::Num(n)) = elem {
             *n += idx;
             *obj = Obj::Ptr(loc);
         } else {
-            *obj = Obj::default();
+            *obj = Obj::Top;
         }
     }
 
@@ -769,11 +824,11 @@ impl Graph {
         } else {
             let obj: *mut Obj = obj;
             let next_id = self.nodes.len();
-            let loc = AbsLoc::new(next_id, vec![AccElem::Int(0)]);
+            let loc = AbsLoc::new(next_id, vec![AccElem::num_index(0)]);
             unsafe {
                 *obj = Obj::Ptr(loc.clone());
             }
-            let obj = Obj::Compound(HashMap::from_iter([(AccElem::Int(0), Obj::default())]));
+            let obj = Obj::Array(HashMap::from_iter([(Index::Num(0), Obj::Top)]));
             self.nodes.push(Node::new(obj));
             loc
         }
@@ -802,9 +857,12 @@ impl Graph {
     }
 
     fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
-        let locals: HashSet<_> = self.nodes.iter().flat_map(|node| node.locals()).collect();
+        let mut locals = HybridBitSet::new_empty(dead_locals.domain_size());
+        for node in &self.nodes {
+            node.collect_locals(&mut locals);
+        }
         self.locals
-            .retain(|local, _| !dead_locals.contains(*local) || locals.contains(local));
+            .retain(|local, _| !dead_locals.contains(*local) || locals.contains(*local));
     }
 
     fn path_to_loc(&self, path: AccPath) -> Option<AbsLoc> {
@@ -885,7 +943,7 @@ fn invalidate_rec(
     }
     let edges = &ctx.may_points_to.graph[&node];
     let v = match obj {
-        Obj::AtAddr(_) => vec![],
+        Obj::Top | Obj::AtAddr(_) => vec![],
         Obj::Ptr(ptr_loc) => {
             let v = if let points_to::Edges::Deref(nodes) = edges {
                 nodes.iter().map(|node| (ptr_loc.clone(), *node)).collect()
@@ -901,29 +959,30 @@ fn invalidate_rec(
                     .map(|s| !s.is_prefix_of(&loc))
                     .unwrap_or(true)
             {
-                *obj = Obj::default();
+                *obj = Obj::Top;
             }
 
             v
         }
-        Obj::Compound(fs) => {
+        Obj::Struct(fs) => {
             let mut v = vec![];
-            match edges {
-                points_to::Edges::Fields(fs2) => {
-                    for (index, node) in fs2.iter().enumerate() {
-                        let index = index as u128;
-                        let obj = some_or!(fs.get_mut(&AccElem::Int(index)), continue);
-                        let loc = loc.clone().extend_int(index);
-                        v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
-                    }
+            if let points_to::Edges::Fields(fs2) = edges {
+                for (index, node) in fs2.iter().enumerate() {
+                    let index = index as u32;
+                    let obj = some_or!(fs.get_mut(&index), continue);
+                    let loc = loc.clone().push_field(index);
+                    v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                 }
-                points_to::Edges::Index(node) => {
-                    for (elem, obj) in fs {
-                        let loc = loc.clone().extend_elem(elem.clone());
-                        v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
-                    }
+            }
+            v
+        }
+        Obj::Array(vs) => {
+            let mut v = vec![];
+            if let points_to::Edges::Index(node) = edges {
+                for (elem, obj) in vs {
+                    let loc = loc.clone().push_index(elem.clone());
+                    v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                 }
-                _ => {}
             }
             v
         }
@@ -963,19 +1022,37 @@ fn join_objs(
             };
             *obj = Obj::Ptr(AbsLoc::new(nid, l));
         }
-        (Obj::Compound(fs1), Obj::Compound(fs2)) => {
+        (Obj::Struct(fs1), Obj::Struct(fs2)) => {
             let mut fs = HashMap::new();
-            for (f1, obj1) in fs1 {
-                for (f2, obj2) in fs2 {
-                    let f = f1.join(f2);
-                    let mut nobj = Obj::default();
-                    let mut curr_loc = curr_loc.clone();
-                    curr_loc.projection.push(f.clone());
+            for (f, obj1) in fs1 {
+                let obj2 = some_or!(fs2.get(f), continue);
+                let mut new_obj = Obj::Top;
+                let curr_loc = curr_loc.clone().push_field(*f);
+                join_objs(
+                    obj1,
+                    obj2,
+                    &mut new_obj,
+                    joined,
+                    id_map,
+                    remaining,
+                    curr_loc,
+                );
+                fs.insert(*f, new_obj);
+            }
+            *obj = Obj::Struct(fs);
+        }
+        (Obj::Array(vs1), Obj::Array(vs2)) => {
+            let mut fs = HashMap::new();
+            for (v1, obj1) in vs1 {
+                for (v2, obj2) in vs2 {
+                    let v = v1.join(v2);
+                    let mut nobj = Obj::Top;
+                    let curr_loc = curr_loc.clone().push_index(v.clone());
                     join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
-                    fs.insert(f, nobj);
+                    fs.insert(v, nobj);
                 }
             }
-            *obj = Obj::Compound(fs);
+            *obj = Obj::Array(fs);
         }
         _ => {}
     }
@@ -988,13 +1065,16 @@ fn cmp_projection(proj1: &[AccElem], proj2: &[AccElem]) -> Option<Vec<AccElem>> 
     let mut proj = vec![];
     for e in proj1.iter().zip(proj2) {
         match e {
-            (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => proj.push(AccElem::Int(*i1)),
-            (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
+            (AccElem::Field(i1), AccElem::Field(i2)) if i1 == i2 => proj.push(AccElem::Field(*i1)),
+            (AccElem::Index(Index::Num(i1)), AccElem::Index(Index::Num(i2))) if i1 == i2 => {
+                proj.push(AccElem::num_index(*i1))
+            }
+            (AccElem::Index(Index::Sym(l1)), AccElem::Index(Index::Sym(l2))) => {
                 let l: BTreeSet<_> = l1.intersection(l2).copied().collect();
                 if l.is_empty() {
                     return None;
                 }
-                proj.push(AccElem::Symbolic(l));
+                proj.push(AccElem::sym_index(l));
             }
             _ => return None,
         }
@@ -1009,7 +1089,7 @@ fn ord_objs(
     remaining: &mut Vec<(NodeId, NodeId)>,
 ) -> bool {
     match (obj1, obj2) {
-        (_, Obj::Compound(fs)) if fs.is_empty() => true,
+        (_, Obj::Top) => true,
         (Obj::AtAddr(i1), Obj::AtAddr(i2)) => i1 == i2,
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
             let idp = (l1.root, l2.root);
@@ -1019,10 +1099,14 @@ fn ord_objs(
             }
             ord_projection(&l1.projection, &l2.projection)
         }
-        (Obj::Compound(fs1), Obj::Compound(fs2)) => fs2.iter().all(|(f2, obj2)| {
-            let obj1 = fs1
+        (Obj::Struct(fs1), Obj::Struct(fs2)) => fs2.iter().all(|(f, obj2)| {
+            let obj1 = some_or!(fs1.get(f), return false);
+            ord_objs(obj1, obj2, id_set, remaining)
+        }),
+        (Obj::Array(vs1), Obj::Array(vs2)) => vs2.iter().all(|(idx2, obj2)| {
+            let obj1 = vs1
                 .iter()
-                .find_map(|(f1, obj1)| if f1.ord(f2) { Some(obj1) } else { None });
+                .find_map(|(idx1, obj1)| if idx1.ord(idx2) { Some(obj1) } else { None });
             let obj1 = some_or!(obj1, return false);
             ord_objs(obj1, obj2, id_set, remaining)
         }),
@@ -1037,8 +1121,9 @@ fn ord_projection(proj1: &[AccElem], proj2: &[AccElem]) -> bool {
     let mut b = true;
     for e in proj1.iter().zip(proj2) {
         match e {
-            (AccElem::Int(i1), AccElem::Int(i2)) if i1 == i2 => {}
-            (AccElem::Symbolic(l1), AccElem::Symbolic(l2)) => {
+            (AccElem::Field(i1), AccElem::Field(i2)) if i1 == i2 => {}
+            (AccElem::Index(Index::Num(i1)), AccElem::Index(Index::Num(i2))) if i1 == i2 => {}
+            (AccElem::Index(Index::Sym(l1)), AccElem::Index(Index::Sym(l2))) => {
                 if l1.is_disjoint(l2) {
                     return true;
                 }

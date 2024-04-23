@@ -320,8 +320,8 @@ fn test_eq_ref_struct() {
 
             assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
 
-            assert_eq!(n[&5].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
-            assert_eq!(n[&6].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+            assert_eq!(n[&5].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
+            assert_eq!(n[&6].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
         },
     );
 }
@@ -469,8 +469,8 @@ fn test_eq_ref_deref() {
             assert_eq!(n[&5].as_ptr(), &AbsLoc::new_root(i[&1]));
             assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&1]));
 
-            assert_eq!(n[&7].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
-            assert_eq!(n[&8].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Int(0)]));
+            assert_eq!(n[&7].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
+            assert_eq!(n[&8].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
         },
     );
 }
@@ -527,8 +527,8 @@ fn test_eq_array() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=11);
-            assert_eq!(n[&1].field(0).as_ptr(), n[&2].as_ptr());
-            assert_eq!(n[&1].field(1).as_ptr(), n[&2].as_ptr());
+            assert_eq!(n[&1].index(0).as_ptr(), n[&2].as_ptr());
+            assert_eq!(n[&1].index(1).as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&3].as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&4].as_ptr(), n[&2].as_ptr());
             assert_eq!(n[&7].as_ptr(), n[&2].as_ptr());
@@ -560,7 +560,7 @@ fn test_eq_array_symbolic() {
         y[x as usize] = 1 as libc::c_int;
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=6);
+            let n = get_nodes(&g, 1..=5);
             assert_eq!(n[&1].as_ptr(), n[&4].as_ptr());
             assert_eq!(n[&2].symbolic(&[1, 4]).unwrap().as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&3].as_ptr(), n[&5].as_ptr());
@@ -615,7 +615,7 @@ fn test_eq_array_symbolic_invalidated() {
         x = 2 as libc::c_int;
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=8);
+            let n = get_nodes(&g, (1..=6).chain(8..=8));
             assert_eq!(n[&1].as_ptr(), n[&8].as_ptr());
             assert_eq!(n[&2].symbolic(&[4, 5]).unwrap().as_ptr(), n[&3].as_ptr());
             assert_eq!(n[&4].as_ptr(), n[&5].as_ptr());
@@ -857,7 +857,7 @@ fn test_eq_invalidate() {
         |g, _, _| {
             let n = get_nodes(&g, 4..=4);
             let dn4 = g.obj_at_location(n[&4].as_ptr()).unwrap();
-            assert_eq!(dn4, &Obj::default());
+            assert_eq!(dn4, &Obj::Top);
             assert_eq!(g.get_local_as_int(2), Some(1));
             assert_eq!(g.get_local_as_int(3), Some(0));
         },
@@ -909,7 +909,7 @@ fn test_struct_eq_invalidate() {
             assert_ne!(n[&2].field(0).as_ptr(), n[&6].field(0).as_ptr());
             assert_eq!(n[&2].field(1).as_ptr(), n[&6].field(1).as_ptr());
             let dn7 = g.obj_at_location(n[&7].as_ptr()).unwrap();
-            assert_eq!(dn7.field(0), &Obj::default());
+            assert_eq!(dn7.field(0), &Obj::Top);
             assert_eq!(n[&2].field(1).as_ptr(), dn7.field(1).as_ptr());
         },
     );
@@ -962,16 +962,15 @@ fn test_struct_eq_field_invalidate() {
         z.x = 2 as libc::c_int;
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 2..=7);
-            let n_ = get_nodes(&g, 10..=10);
+            let n = get_nodes(&g, (2..=7).chain(10..=10));
             assert_eq!(n[&2].field(0).as_ptr(), n[&2].field(1).as_ptr());
             assert_eq!(n[&2].field(0).as_ptr(), n[&3].field(0).as_ptr());
             assert_eq!(n[&2].field(0).as_ptr(), n[&3].field(1).as_ptr());
             assert_ne!(n[&2].field(0).as_ptr(), n[&6].field(0).as_ptr());
             assert_eq!(n[&2].field(0).as_ptr(), n[&6].field(1).as_ptr());
             let dn7 = g.obj_at_location(n[&7].as_ptr()).unwrap();
-            assert_eq!(dn7, &Obj::default());
-            let dn10 = g.obj_at_location(n_[&10].as_ptr()).unwrap();
+            assert_eq!(dn7, &Obj::Top);
+            let dn10 = g.obj_at_location(n[&10].as_ptr()).unwrap();
             assert_eq!(dn10.as_ptr(), n[&2].field(0).as_ptr());
         },
     );
@@ -1001,8 +1000,8 @@ fn test_deref_eq_invalidate() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 2..=3);
-            assert_eq!(n[&2].obj, Obj::default());
-            assert_eq!(n[&3].obj, Obj::default());
+            assert_eq!(n[&2].obj, Obj::Top);
+            assert_eq!(n[&3].obj, Obj::Top);
         },
     );
 }
@@ -1048,9 +1047,9 @@ fn test_deref_struct_eq_invalidate() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 2..=8);
-            assert_eq!(n[&2].field(0), &Obj::default());
+            assert_eq!(n[&2].field(0), &Obj::Top);
             assert_eq!(n[&3].field(0).as_ptr(), n[&4].as_ptr());
-            assert_eq!(n[&6].field(0), &Obj::default());
+            assert_eq!(n[&6].field(0), &Obj::Top);
             assert_eq!(n[&2].field(1).as_ptr(), n[&3].field(1).as_ptr());
             assert_eq!(n[&2].field(1).as_ptr(), n[&6].field(1).as_ptr());
             let dn8 = g.obj_at_location(n[&8].as_ptr()).unwrap();
@@ -1101,12 +1100,12 @@ fn test_deref_struct_eq_field_invalidate() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 2..=8);
-            assert_eq!(n[&2].field(0), &Obj::default());
+            assert_eq!(n[&2].field(0), &Obj::Top);
             assert_eq!(n[&2].field(1).as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&3].field(0).as_ptr(), n[&4].as_ptr());
             assert_eq!(n[&3].field(1).as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&6].field(0).as_ptr(), n[&4].as_ptr());
-            assert_eq!(n[&6].field(1), &Obj::default());
+            assert_eq!(n[&6].field(1), &Obj::Top);
             let dn8 = g.obj_at_location(n[&8].as_ptr()).unwrap();
             assert_eq!(dn8.as_ptr(), n[&7].as_ptr());
         },
@@ -1238,7 +1237,7 @@ fn test_as_mut_ptr() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=5);
-            assert_eq!(n[&1].field(0).as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&1].index(0).as_ptr(), n[&5].as_ptr());
 
             assert_eq!(g.get_local_as_int(5), Some(1));
         },
@@ -1258,7 +1257,7 @@ fn test_write_volatile() {
         ::std::ptr::write_volatile(&mut x as *mut libc::c_int, 1 as libc::c_int);
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=5);
+            let n = get_nodes(&g, [1, 5].into_iter());
             assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
             assert_eq!(g.get_local_as_int(1), Some(1));
         },
@@ -1286,7 +1285,7 @@ fn test_read_volatile() {
         );
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 1..=9);
+            let n = get_nodes(&g, (1..=1).chain(3..=9));
             assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
             assert_eq!(n[&1].as_ptr(), n[&9].as_ptr());
             assert_eq!(g.get_local_as_int(1), Some(1));
@@ -1315,7 +1314,7 @@ fn test_offset_array() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=5);
-            assert_eq!(n[&1].field(1).as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&1].index(1).as_ptr(), n[&5].as_ptr());
 
             assert_eq!(g.get_local_as_int(5), Some(1));
         },
@@ -1366,10 +1365,10 @@ fn test_offset() {
         |g, _, _| {
             let n = get_nodes(&g, 1..=3);
             assert_eq!(n[&1].as_ptr().root(), n[&3].as_ptr().root());
-            assert_eq!(n[&1].as_ptr().projection()[0], AccElem::Int(0));
-            assert_eq!(n[&3].as_ptr().projection()[0], AccElem::Int(1));
+            assert_eq!(n[&1].as_ptr().projection()[0], AccElem::num_index(0));
+            assert_eq!(n[&3].as_ptr().projection()[0], AccElem::num_index(1));
 
-            let n11 = &g.nodes[n[&3].as_ptr().root()].field(1);
+            let n11 = &g.nodes[n[&3].as_ptr().root()].index(1);
             assert_eq!(n11.as_ptr(), n[&2].as_ptr());
         },
     );
@@ -1548,7 +1547,7 @@ fn test_write_twice() {
         z[y as usize] = 1 as libc::c_int;
         ",
         |g, _, _| {
-            let n = get_nodes(&g, 3..=8);
+            let n = get_nodes(&g, [3, 8].into_iter());
             assert_eq!(n[&3].symbolic(&[2, 9]).unwrap().as_ptr(), n[&8].as_ptr());
             assert_eq!(n[&3].symbolic(&[1, 5]), None);
         },
