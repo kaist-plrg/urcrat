@@ -4,10 +4,11 @@ use std::{
 };
 
 use etrace::some_or;
+use rustc_ast::UintTy;
 use rustc_data_structures::graph::{
     scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
 };
-use rustc_hir::ItemKind;
+use rustc_hir::{def::Res, ItemKind, PrimTy, QPath, TyKind as HirTyKind};
 use rustc_index::{
     bit_set::{HybridBitSet, HybridIter},
     Idx, IndexVec,
@@ -57,6 +58,54 @@ pub struct AnalysisResults {
 
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
+
+    let mut bitfield_structs = HashMap::new();
+    let mut bitfield_impls = HashMap::new();
+    for item_id in hir.items() {
+        let item = hir.item(item_id);
+        match item.kind {
+            ItemKind::Struct(vd, _) => {
+                for field in vd.fields() {
+                    let HirTyKind::Array(ty, _) = field.ty.kind else { continue };
+                    let HirTyKind::Path(QPath::Resolved(_, path)) = ty.kind else { continue };
+                    if !matches!(path.res, Res::PrimTy(PrimTy::Uint(UintTy::U8))) {
+                        continue;
+                    }
+                    let name = field.ident.name.to_ident_string();
+                    if !name.starts_with("c2rust_padding") {
+                        bitfield_structs.insert(item_id.owner_id.def_id, name);
+                        break;
+                    }
+                }
+            }
+            ItemKind::Impl(imp) if imp.of_trait.is_none() => {
+                let HirTyKind::Path(QPath::Resolved(_, path)) = imp.self_ty.kind else {
+                    unreachable!()
+                };
+                let Res::Def(_, def_id) = path.res else { unreachable!() };
+                let local_def_id = def_id.expect_local();
+                let fields: Vec<_> = imp
+                    .items
+                    .chunks(2)
+                    .map(|items| {
+                        let name0 = items[0].ident.name.to_ident_string();
+                        let name0 = name0.strip_prefix("set_").unwrap();
+                        let name1 = items[1].ident.name.to_ident_string();
+                        assert_eq!(name0, name1);
+                        name1
+                    })
+                    .collect();
+                bitfield_impls.insert(local_def_id, fields);
+            }
+            _ => {}
+        }
+    }
+    for (ty, bitfield) in bitfield_structs {
+        let fields = &bitfield_impls[&ty];
+        let field: String = fields.iter().map(|f| f.as_str()).intersperse("_").collect();
+        assert_eq!(field, bitfield);
+        println!("{:?}\n{:?}", ty, fields);
+    }
 
     let bodies: Vec<_> = hir
         .items()

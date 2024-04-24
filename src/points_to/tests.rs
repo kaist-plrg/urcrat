@@ -15,6 +15,8 @@ where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
     let code = format!(
         "
         extern crate libc;
+        #[macro_use]
+        extern crate c2rust_bitfields;
         extern \"C\" {{
             fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
         }}
