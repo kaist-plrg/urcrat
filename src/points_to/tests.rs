@@ -2468,6 +2468,174 @@ fn test_writes_malloc() {
 }
 
 #[test]
+fn test_writes_field_taken() {
+    // _1 = s { x: const 0_i32, y: const 0_i32 }
+    // _3 = &mut _1
+    // _2 = &raw mut (*_3)
+    // _4 = const 1_i32
+    // (_1.1: i32) = move _4
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = s { x: 0, y: 0 };
+        let mut y: *mut s = &mut x;
+        x.y = 1 as libc::c_int;
+        ",
+        |mut res, tcx| {
+            assert_eq!(res.ends, vec![0, 2, 2, 3, 4, 5]);
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![1]);
+            assert_eq!(sol(&res, 4), vec![1]);
+            assert_eq!(sol(&res, 5), e());
+
+            let def_id = find("f", tcx);
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![1, 2]);
+            assert_eq!(wg(&w, 0, 1), e());
+            assert_eq!(wg(&w, 0, 2), e());
+            assert_eq!(wg(&w, 0, 3), e());
+            assert_eq!(wg(&w, 0, 4), vec![2]);
+        },
+    );
+}
+
+#[test]
+fn test_writes_field_untaken() {
+    // _1 = s { x: const 0_i32, y: const 0_i32 }
+    // _3 = &mut (_1.1: i32)
+    // _2 = &raw mut (*_3)
+    // _4 = const 2_i32
+    // (_1.0: i32) = move _4
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: s = s { x: 0, y: 0 };
+        let mut y: *mut libc::c_int = &mut x.y;
+        x.x = 2 as libc::c_int;
+        ",
+        |mut res, tcx| {
+            assert_eq!(res.ends, vec![0, 2, 2, 3, 4, 5]);
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), vec![2]);
+            assert_eq!(sol(&res, 4), vec![2]);
+            assert_eq!(sol(&res, 5), e());
+
+            let def_id = find("f", tcx);
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), vec![2]);
+            assert_eq!(wg(&w, 0, 1), e());
+            assert_eq!(wg(&w, 0, 2), e());
+            assert_eq!(wg(&w, 0, 3), e());
+            assert_eq!(wg(&w, 0, 4), e());
+        },
+    );
+}
+
+#[test]
+fn test_writes_bitfield() {
+    // _2 = [const 0_u8; 1]
+    // _3 = [const 0_u8; 3]
+    // _1 = s { x: const 0_i32, y_z: move _2, c2rust_padding: move _3 }
+    // _4 = _1
+    // _5 = const 1_i32
+    // (_4.0: i32) = move _5
+    // _7 = &mut _4
+    // _8 = const 2_i32
+    // _6 = s::set_y(move _7, move _8) -> [return: bb1, unwind continue]
+    // _10 = &mut _4
+    // _11 = const 3_i32
+    // _9 = s::set_z(move _10, move _11) -> [return: bb2, unwind continue]
+
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=2\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"3..=7\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "",
+        "
+        let mut x: s = s {
+            x: 0,
+            y_z: [0; 1],
+            c2rust_padding: [0; 3],
+        };
+        let mut y: s = x;
+        y.x = 1 as libc::c_int;
+        y.set_y(2 as libc::c_int);
+        y.set_z(3 as libc::c_int);
+        ",
+        |mut res, tcx| {
+            assert_eq!(
+                res.ends,
+                vec![0, 5, 2, 3, 4, 5, 6, 7, 12, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+            );
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), e());
+            assert_eq!(sol(&res, 5), e());
+            assert_eq!(sol(&res, 6), e());
+            assert_eq!(sol(&res, 7), e());
+            assert_eq!(sol(&res, 8), e());
+            assert_eq!(sol(&res, 9), e());
+            assert_eq!(sol(&res, 10), e());
+            assert_eq!(sol(&res, 11), e());
+            assert_eq!(sol(&res, 12), e());
+            assert_eq!(sol(&res, 13), e());
+            assert_eq!(sol(&res, 14), e());
+            assert_eq!(sol(&res, 15), vec![8]);
+            assert_eq!(sol(&res, 16), e());
+            assert_eq!(sol(&res, 17), e());
+            assert_eq!(sol(&res, 18), vec![8]);
+            assert_eq!(sol(&res, 19), e());
+
+            let def_id = find("f", tcx);
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), e());
+            assert_eq!(wg(&w, 0, 1), e());
+            assert_eq!(wg(&w, 0, 2), e());
+            assert_eq!(wg(&w, 0, 3), vec![8, 9, 10, 11, 12]);
+            assert_eq!(wg(&w, 0, 4), e());
+            assert_eq!(wg(&w, 0, 5), vec![8]);
+            assert_eq!(wg(&w, 0, 6), e());
+            assert_eq!(wg(&w, 0, 7), e());
+            assert_eq!(wg(&w, 0, 8), vec![11]);
+            assert_eq!(wg(&w, 1, 0), e());
+            assert_eq!(wg(&w, 1, 1), e());
+            assert_eq!(wg(&w, 1, 2), vec![12]);
+        },
+    );
+}
+
+#[test]
 fn test_call_graph() {
     // _1 = g() -> [return: bb1, unwind continue]
     // _3 = _1

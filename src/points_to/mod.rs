@@ -59,11 +59,27 @@ pub struct AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     let hir = tcx.hir();
 
+    let mut bodies = vec![];
+    let mut fn_def_ids = HashSet::new();
     let mut bitfield_structs = HashMap::new();
     let mut bitfield_impls = HashMap::new();
+    let mut visitor = FnPtrVisitor::new(tcx);
     for item_id in hir.items() {
         let item = hir.item(item_id);
+        let local_def_id = item.owner_id.def_id;
+        let def_id = local_def_id.to_def_id();
         match item.kind {
+            ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+                fn_def_ids.insert(local_def_id);
+                let body = tcx.optimized_mir(def_id);
+                visitor.visit_body(body);
+                bodies.push((local_def_id, body, true));
+            }
+            ItemKind::Static(_, _, _) => {
+                let body = tcx.mir_for_ctfe(def_id);
+                visitor.visit_body(body);
+                bodies.push((local_def_id, body, false));
+            }
             ItemKind::Struct(vd, _) => {
                 for field in vd.fields() {
                     let HirTyKind::Array(ty, _) = field.ty.kind else { continue };
@@ -73,7 +89,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                     }
                     let name = field.ident.name.to_ident_string();
                     if !name.starts_with("c2rust_padding") {
-                        bitfield_structs.insert(item_id.owner_id.def_id, name);
+                        let len = vd.fields().len();
+                        bitfield_structs.insert(item_id.owner_id.def_id, (name, len));
                         break;
                     }
                 }
@@ -100,40 +117,21 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
             _ => {}
         }
     }
-    for (ty, bitfield) in bitfield_structs {
-        let fields = &bitfield_impls[&ty];
-        let field: String = fields.iter().map(|f| f.as_str()).intersperse("_").collect();
-        assert_eq!(field, bitfield);
-        println!("{:?}\n{:?}", ty, fields);
-    }
-
-    let bodies: Vec<_> = hir
-        .items()
-        .filter_map(|item_id| {
-            let item = hir.item(item_id);
-            if item.ident.name.as_str() == "main" {
-                return None;
-            }
-            let local_def_id = item.owner_id.def_id;
-            let def_id = local_def_id.to_def_id();
-            let (is_fn, body) = match item.kind {
-                ItemKind::Fn(_, _, _) => (true, tcx.optimized_mir(def_id)),
-                ItemKind::Static(_, _, _) => (false, tcx.mir_for_ctfe(def_id)),
-                _ => return None,
-            };
-            Some((local_def_id, body, is_fn))
+    let bitfields = bitfield_impls
+        .into_iter()
+        .map(|(ty, fields)| {
+            let bf1: String = fields.iter().map(|f| f.as_str()).intersperse("_").collect();
+            let (ref bf2, len) = bitfield_structs[&ty];
+            assert_eq!(&bf1, bf2);
+            let field_indices = fields
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| (f, len + i))
+                .collect();
+            (ty, field_indices)
         })
         .collect();
-    let fn_def_ids: HashSet<_> = bodies
-        .iter()
-        .filter_map(|(def_id, _, is_fn)| if *is_fn { Some(*def_id) } else { None })
-        .collect();
     let mut call_graph: HashMap<_, _> = fn_def_ids.iter().map(|f| (*f, HashSet::new())).collect();
-
-    let mut visitor = FnPtrVisitor::new(tcx);
-    for (_, body, _) in &bodies {
-        visitor.visit_body(body);
-    }
     let fn_ptrs = visitor.fn_ptrs;
 
     let arena = Arena::new();
@@ -171,7 +169,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
-            let ty = compute_ty_info(local_decl.ty, &mut ty_infos, prim, &arena, tcx);
+            let ty = compute_ty_info(local_decl.ty, &mut ty_infos, &bitfields, prim, &arena, tcx);
             let node = add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
             var_nodes.insert((*local_def_id, local), node);
             compute_ends(ty, &mut ends);
@@ -182,7 +180,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
                 let mut ends = vec![];
-                let ty = compute_ty_info(ty, &mut ty_infos, prim, &arena, tcx);
+                let ty = compute_ty_info(ty, &mut ty_infos, &bitfields, prim, &arena, tcx);
                 compute_ends(ty, &mut ends);
                 for (i, end) in ends.into_iter().enumerate() {
                     if alloc_ends.len() > i {
@@ -243,7 +241,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
         graph: Graph::new(ends.len()),
     };
     for (local_def_id, body, _) in &bodies {
-        // println!("{}", compile_util::body_to_str(body));
+        println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
                 let ctx = Context::new(&body.local_decls, *local_def_id);
@@ -269,6 +267,13 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
+    for (i, _) in ends.iter().enumerate() {
+        if address_taken_indices.contains(i) {
+            for j in (i + 1)..=ends[i] {
+                address_taken_indices.insert(j);
+            }
+        }
+    }
 
     analyzer.graph = Graph::new(0);
     let mut writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> = HashMap::new();
@@ -284,18 +289,28 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
                 };
                 compute_writes(l, location, &ends, &solutions, ctx, &analyzer, writes);
             }
-            if let TerminatorKind::Call { destination, .. } = bbd.terminator().kind {
+            if let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &bbd.terminator().kind
+            {
                 let location = Location {
                     block,
                     statement_index: bbd.statements.len(),
                 };
                 compute_writes(
-                    destination,
+                    *destination,
                     location,
                     &ends,
                     &solutions,
                     ctx,
                     &analyzer,
+                    writes,
+                );
+                compute_bitfield_writes(
+                    func, args, location, &bitfields, tcx, &ends, &solutions, ctx, &analyzer,
                     writes,
                 );
             }
@@ -367,6 +382,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> AnalysisResults {
 fn compute_ty_info<'a, 'tcx>(
     ty: Ty<'tcx>,
     tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
     prim: &'a TyInfo<'a>,
     arena: &'a Arena<TyInfo<'a>>,
     tcx: TyCtxt<'tcx>,
@@ -385,14 +401,20 @@ fn compute_ty_info<'a, 'tcx>(
                         .iter()
                         .map(|field| field.ty(tcx, generic_args))
                 });
-                compute_ty_info_iter(ts, tys, prim, arena, tcx)
+                let bitfield = adt_def
+                    .did()
+                    .as_local()
+                    .and_then(|local_def_id| bitfields.get(&local_def_id));
+                compute_ty_info_iter(ts, tys, bitfield, bitfields, prim, arena, tcx)
             }
         }
         TyKind::Array(ty, _) => {
-            let t = compute_ty_info(*ty, tys, prim, arena, tcx);
+            let t = compute_ty_info(*ty, tys, bitfields, prim, arena, tcx);
             arena.alloc(TyInfo::Array(t))
         }
-        TyKind::Tuple(ts) => compute_ty_info_iter(ts.iter(), tys, prim, arena, tcx),
+        TyKind::Tuple(ts) => {
+            compute_ty_info_iter(ts.iter(), tys, None, bitfields, prim, arena, tcx)
+        }
         _ => prim,
     };
     tys.insert(ty, ty_info);
@@ -404,6 +426,8 @@ fn compute_ty_info<'a, 'tcx>(
 fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
     ts: I,
     tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    bitfield: Option<&HashMap<String, usize>>,
+    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
     prim: &'a TyInfo<'a>,
     arena: &'a Arena<TyInfo<'a>>,
     tcx: TyCtxt<'tcx>,
@@ -411,9 +435,15 @@ fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
     let mut len = 0;
     let mut fields = vec![];
     for ty in ts {
-        let ty_info = compute_ty_info(ty, tys, prim, arena, tcx);
+        let ty_info = compute_ty_info(ty, tys, bitfields, prim, arena, tcx);
         fields.push((len, ty_info));
         len += ty_info.len();
+    }
+    if let Some(fs) = bitfield {
+        for _ in fs {
+            fields.push((len, prim));
+            len += 1;
+        }
     }
     if len == 0 {
         prim
@@ -467,6 +497,53 @@ fn compute_writes<'tcx>(
         let loc = l.var.root + l.var.proj;
         for i in 0..len {
             writes.insert(loc + i);
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn compute_bitfield_writes<'tcx>(
+    func: &Operand<'tcx>,
+    args: &[Operand<'tcx>],
+    location: Location,
+    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
+    tcx: TyCtxt<'tcx>,
+    ends: &[usize],
+    solutions: &[HybridBitSet<usize>],
+    ctx: Context<'_, 'tcx>,
+    analyzer: &Analyzer<'_, 'tcx>,
+    writes: &mut HashMap<Location, HybridBitSet<usize>>,
+) {
+    if args.len() != 2 {
+        return;
+    }
+    let hir = tcx.hir();
+    let Operand::Constant(box constant) = func else { return };
+    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+    let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+    let local_def_id = some_or!(def_id.as_local(), return);
+    let impl_def_id = some_or!(tcx.impl_of_method(*def_id), return);
+    let impl_item = hir.expect_impl_item(local_def_id);
+    let method = impl_item.ident.name.to_ident_string();
+    let field = method.strip_prefix("set_").unwrap();
+    let item = hir.expect_item(impl_def_id.expect_local());
+    let ItemKind::Impl(imp) = item.kind else { unreachable!() };
+    let HirTyKind::Path(QPath::Resolved(_, path)) = imp.self_ty.kind else { unreachable!() };
+    let Res::Def(_, struct_def_id) = path.res else { unreachable!() };
+    let local_def_id = struct_def_id.expect_local();
+    let offset = bitfields[&local_def_id][&field.to_string()];
+    let Operand::Move(lhs) = args[0] else { unreachable!() };
+    assert!(lhs.projection.is_empty());
+    let l = analyzer.prefixed_loc(lhs, ctx);
+    let writes = writes
+        .entry(location)
+        .or_insert(HybridBitSet::new_empty(ends.len()));
+    for loc in solutions[l.var.root].iter() {
+        let loc = loc + offset;
+        let end = ends[loc];
+        if loc <= end {
+            writes.insert(loc);
         }
     }
 }
