@@ -1,7 +1,6 @@
 use rustc_middle::ty::TyCtxt;
 
 use super::*;
-use crate::compile_util;
 
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     let input = compile_util::str_to_input(code);
@@ -27,7 +26,12 @@ where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
     ",
         types, name, params, code
     );
-    run_compiler(&code, |tcx| f(analyze(tcx), tcx));
+    run_compiler(&code, |tcx| {
+        let bitfields = ty_info::get_bitfields(tcx);
+        let arena = Arena::new();
+        let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
+        f(analyze(&bitfields, &ty_infos, tcx), tcx)
+    });
 }
 
 fn analyze_fn<F>(code: &str, f: F)
@@ -2627,9 +2631,12 @@ fn test_writes_bitfield() {
             assert_eq!(wg(&w, 0, 5), vec![8]);
             assert_eq!(wg(&w, 0, 6), e());
             assert_eq!(wg(&w, 0, 7), e());
-            assert_eq!(wg(&w, 0, 8), vec![11]);
+            assert_eq!(wg(&w, 0, 8), e());
             assert_eq!(wg(&w, 1, 0), e());
             assert_eq!(wg(&w, 1, 1), e());
+            assert_eq!(wg(&w, 1, 2), e());
+            let w = res.bitfield_writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 8), vec![11]);
             assert_eq!(wg(&w, 1, 2), vec![12]);
         },
     );

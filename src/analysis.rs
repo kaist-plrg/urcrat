@@ -17,6 +17,7 @@ use rustc_middle::{
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::LocalDefId, Span};
+use typed_arena::Arena;
 
 use crate::*;
 
@@ -41,7 +42,10 @@ fn analyze_input(input: Input, conf: &Config) {
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let visitor = ty_finder::TyVisitor::new(tcx);
     let foreign_tys = visitor.find_foreign_tys(tcx);
-    let may_points_to = points_to::analyze(tcx);
+    let bitfields = ty_info::get_bitfields(tcx);
+    let arena = Arena::new();
+    let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
+    let may_points_to = points_to::analyze(&bitfields, &ty_infos, tcx);
 
     let mut accesses: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();
     for item_id in tcx.hir().items() {
@@ -56,7 +60,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         visitor.visit_body(body);
         if !visitor.accesses.is_empty() {
             println!("{:?}", local_def_id);
-            let states = relational::analyze_fn(tcx, &may_points_to, local_def_id, true);
+            let states = relational::analyze_fn(
+                local_def_id,
+                &bitfields,
+                &ty_infos,
+                &may_points_to,
+                true,
+                tcx,
+            );
             for access in &visitor.accesses {
                 let span = body.source_info(access.location).span;
                 let tags = compute_tags(*access, &states);

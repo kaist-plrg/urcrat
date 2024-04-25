@@ -373,6 +373,17 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     block: *target,
                     statement_index: 0,
                 };
+                let (l, l_deref) = AccPath::from_place(*destination, &state);
+                if let Some(writes) = self.get_assign_writes(term_loc) {
+                    let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
+                    state.gm().invalidate(
+                        self.local_def_id,
+                        strong_update.as_ref(),
+                        !l_deref,
+                        self.may_points_to,
+                        writes,
+                    );
+                }
                 let need_update = match func {
                     Operand::Copy(func) | Operand::Move(func) => {
                         assert!(func.projection.is_empty());
@@ -384,51 +395,36 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
                         assert!(matches!(value, ConstValue::ZeroSized));
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let name = self.def_id_to_string(*def_id);
-                        let mut segs: Vec<_> = name.split("::").collect();
-                        let seg0 = segs.pop().unwrap_or_default();
-                        let seg1 = segs.pop().unwrap_or_default();
-                        let seg2 = segs.pop().unwrap_or_default();
-                        let seg3 = segs.pop().unwrap_or_default();
+                        let name: Vec<_> = self
+                            .tcx
+                            .def_path(*def_id)
+                            .data
+                            .into_iter()
+                            .map(|data| data.to_string())
+                            .collect();
+                        let is_extern = name.iter().any(|s| s.starts_with("{extern#"));
+                        let seg = |i: usize| name.get(i).map(|s| s.as_str()).unwrap_or_default();
+                        let name = (seg(0), seg(1), seg(2), seg(3));
                         let sig = self.tcx.fn_sig(def_id).skip_binder();
                         let inputs = sig.inputs().skip_binder();
                         if let Some(local_def_id) = def_id.as_local() {
-                            if let Some(impl_def_id) = self.tcx.impl_of_method(*def_id) {
-                                let span = self.tcx.span_of_impl(impl_def_id).unwrap();
-                                let code =
-                                    self.tcx.sess.source_map().span_to_snippet(span).unwrap();
-                                assert_eq!(code, "BitfieldStruct");
-                                true
-                            } else if seg1.contains("{extern#") {
-                                self.transfer_c_call(seg0, inputs, args, &mut state);
+                            if self.tcx.impl_of_method(*def_id).is_some() {
+                                self.transfer_method_call(local_def_id, args, term_loc, &mut state);
+                                false
+                            } else if is_extern {
+                                self.transfer_c_call(name.1, inputs, args, &mut state);
                                 true
                             } else {
                                 self.transfer_intra_call(&[local_def_id], &mut state);
                                 true
                             }
                         } else {
-                            self.transfer_rust_call(
-                                (seg3, seg2, seg1, seg0),
-                                inputs,
-                                args,
-                                destination,
-                                &mut state,
-                            )
+                            self.transfer_rust_call(name, args, destination, &mut state);
+                            false
                         }
                     }
                 };
                 if need_update {
-                    let (l, l_deref) = AccPath::from_place(*destination, &state);
-                    if let Some(writes) = self.get_assign_writes(term_loc) {
-                        let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
-                        state.gm().invalidate(
-                            self.local_def_id,
-                            strong_update.as_ref(),
-                            !l_deref,
-                            self.may_points_to,
-                            writes,
-                        );
-                    }
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state
                         .gm()
@@ -445,6 +441,44 @@ impl<'tcx> Analyzer<'tcx, '_> {
             state
                 .gm()
                 .invalidate(self.local_def_id, None, false, self.may_points_to, &writes);
+        }
+    }
+
+    fn transfer_method_call(
+        &self,
+        f: LocalDefId,
+        args: &[Operand<'_>],
+        loc: Location,
+        state: &mut AbsMem,
+    ) {
+        let l = args[0].place().unwrap();
+        let (mut l, l_deref) = AccPath::from_place(l, state);
+        assert!(!l_deref);
+
+        if let Some(writes) = self.get_bitfield_writes(loc) {
+            let strong_update = state.g().strong_update_loc(l.clone(), true);
+            state.gm().invalidate(
+                self.local_def_id,
+                strong_update.as_ref(),
+                false,
+                self.may_points_to,
+                writes,
+            );
+        }
+
+        let (ty, method) = points_to::receiver_and_method(f, self.tcx).unwrap();
+        match args.len() {
+            1 => {
+                let _offset = self.get_bitfield_offset(ty, &method);
+            }
+            2 => {
+                let field = method.strip_prefix("set_").unwrap();
+                let offset = self.get_bitfield_offset(ty, field);
+                l.extend_projection(&[AccElem::Field(offset as _)]);
+                let r = self.transfer_op(&args[1], state);
+                state.gm().assign_with_suffixes(&l, true, &r, &[vec![]]);
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -477,36 +511,19 @@ impl<'tcx> Analyzer<'tcx, '_> {
     fn transfer_rust_call(
         &self,
         name: (&str, &str, &str, &str),
-        inputs: &[Ty<'_>],
         args: &[Operand<'_>],
         dst: &Place<'_>,
         state: &mut AbsMem,
-    ) -> bool {
-        if inputs.iter().all(|t| t.is_primitive()) {
-            return true;
-        }
+    ) {
         let (d, d_deref) = AccPath::from_place(*dst, state);
         assert!(!d_deref);
         match name {
-            (_, "clone", "Clone", "clone")
-            | ("ops", _, _, _)
-            | (_, "ffi", _, _)
-            | (_, "cmp", _, _)
-            | (_, "cast", _, _)
-            | (_, "convert", _, _)
-            | (_, "f128_t", _, _)
-            | (_, "option", _, _)
-            | (_, "vec", _, _)
-            | (_, _, "vec", _)
-            | (_, _, "AsmCastTrait", _)
-            | ("ptr", _, _, "is_null" | "offset_from") => true,
-            (_, "slice", _, "as_ptr" | "as_mut_ptr") => {
+            ("slice", _, "as_ptr" | "as_mut_ptr", _) => {
                 let ptr = args[0].place().unwrap();
                 let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);
                 assert!(!ptr_deref);
                 ptr.projection.push(AccElem::num_index(0));
                 state.gm().x_eq_ref_y(&d, &ptr, true);
-                false
             }
             ("ptr", _, _, "offset") => {
                 let ptr = args[0].place().unwrap();
@@ -514,42 +531,8 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 assert!(!ptr_deref);
                 let idx = self.transfer_op(&args[1], state);
                 state.gm().x_eq_offset(&d, &ptr, idx);
-                false
             }
-            (_, _, "ptr", "write_volatile") => {
-                let ptr = args[0].place().unwrap();
-                let (l, l_deref) = AccPath::from_place(ptr, state);
-                assert!(!l_deref);
-                let suffixes = self.get_path_suffixes(&l, l_deref);
-                let r = self.transfer_op(&args[1], state);
-                state.gm().assign_with_suffixes(&l, true, &r, &suffixes);
-                true
-            }
-            (_, _, "ptr", "read_volatile") => {
-                let ptr = args[0].place().unwrap();
-                let (r, r_deref) = AccPath::from_place(ptr, state);
-                assert!(!r_deref);
-                let r = OpVal::Place(r, true);
-                let suffixes = self.get_path_suffixes(&d, d_deref);
-                state.gm().assign_with_suffixes(&d, d_deref, &r, &suffixes);
-                false
-            }
-            (_, "unix", _, "memcpy") => {
-                if let Some(arg) = args[0].place() {
-                    assert!(arg.projection.is_empty());
-                    if let Some(writes) = self.get_arg_writes(std::iter::once(arg.local)) {
-                        state.gm().invalidate(
-                            self.local_def_id,
-                            None,
-                            false,
-                            self.may_points_to,
-                            &writes,
-                        );
-                    }
-                }
-                true
-            }
-            _ => todo!("{:?}", name),
+            _ => {}
         }
     }
 }

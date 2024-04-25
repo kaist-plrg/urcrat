@@ -47,6 +47,8 @@ where F: FnOnce(Graph, AnalysisResults, TyCtxt<'_>) + Send {
     let code = format!(
         "
         extern crate libc;
+        #[macro_use]
+        extern crate c2rust_bitfields;
         {}
         unsafe extern \"C\" fn {}({}) {{
             {}
@@ -1197,7 +1199,7 @@ fn test_memcpy_invalidate() {
     // _11 = std::mem::size_of::<i32>()
     // _10 = move _11 as u64 (IntToInt)
     // _3 = foo::memcpy(move _4, move _7, move _10)
-    analyze_fn(
+    analyze_fn_with(
         "
         extern \"C\" {
             fn memcpy(
@@ -1206,6 +1208,9 @@ fn test_memcpy_invalidate() {
                 _: libc::c_ulong,
             ) -> *mut libc::c_void;
         }
+        ",
+        "",
+        "
         let mut x: libc::c_int = 0 as libc::c_int;
         let mut y: libc::c_int = 0 as libc::c_int;
         memcpy(
@@ -1240,56 +1245,6 @@ fn test_as_mut_ptr() {
             assert_eq!(n[&1].index(0).as_ptr(), n[&5].as_ptr());
 
             assert_eq!(g.get_local_as_int(5), Some(1));
-        },
-    );
-}
-
-#[test]
-fn test_write_volatile() {
-    // _1 = const 0_i32
-    // _4 = &mut _1
-    // _3 = &raw mut (*_4)
-    // _5 = const 1_i32
-    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
-    analyze_fn(
-        "
-        let mut x: libc::c_int = 0 as libc::c_int;
-        ::std::ptr::write_volatile(&mut x as *mut libc::c_int, 1 as libc::c_int);
-        ",
-        |g, _, _| {
-            let n = get_nodes(&g, [1, 5].into_iter());
-            assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
-            assert_eq!(g.get_local_as_int(1), Some(1));
-        },
-    );
-}
-
-#[test]
-fn test_read_volatile() {
-    // _1 = const 0_i32
-    // _4 = &mut _1
-    // _3 = &raw mut (*_4)
-    // _8 = &_1
-    // _7 = &raw const (*_8)
-    // _6 = std::ptr::read_volatile::<i32>(move _7)
-    // _9 = const 1_i32
-    // _5 = Add(move _6, move _9)
-    // _2 = std::ptr::write_volatile::<i32>(move _3, move _5)
-    analyze_fn(
-        "
-        let mut x: libc::c_int = 0 as libc::c_int;
-        ::std::ptr::write_volatile(
-            &mut x as *mut libc::c_int,
-            ::std::ptr::read_volatile::<libc::c_int>(&x as *const libc::c_int)
-                + 1 as libc::c_int,
-        );
-        ",
-        |g, _, _| {
-            let n = get_nodes(&g, (1..=1).chain(3..=9));
-            assert_eq!(n[&1].as_ptr(), n[&5].as_ptr());
-            assert_eq!(n[&1].as_ptr(), n[&9].as_ptr());
-            assert_eq!(g.get_local_as_int(1), Some(1));
-            assert_eq!(g.get_local_as_int(6), Some(0));
         },
     );
 }
@@ -1663,6 +1618,52 @@ fn test_loop_offset_struct() {
         ",
         |g, _, _| {
             assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
+fn test_bitfield_write() {
+    // _2 = [const 0_u8; 1]
+    // _3 = [const 0_u8; 3]
+    // _1 = s { x: const 0_i32, y_z: move _2, c2rust_padding: move _3 }
+    // _4 = const 0_i32
+    // (_1.0: i32) = move _4
+    // _6 = &mut _1
+    // _7 = const 1_i32
+    // _5 = s::set_y(move _6, move _7) -> [return: bb1, unwind continue]
+    // _9 = &mut _1
+    // _10 = const 2_i32
+    // _8 = s::set_z(move _9, move _10) -> [return: bb2, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=2\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"3..=7\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "",
+        "
+        let mut x: s = s {
+            x: 0,
+            y_z: [0; 1],
+            c2rust_padding: [0; 3],
+        };
+        x.x = 0 as libc::c_int;
+        x.set_y(1 as libc::c_int);
+        x.set_z(2 as libc::c_int);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, [1, 4, 7, 10].into_iter());
+            assert_eq!(n[&1].field(0).as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&1].field(3).as_ptr(), n[&7].as_ptr());
+            assert_eq!(n[&1].field(4).as_ptr(), n[&10].as_ptr());
         },
     );
 }
