@@ -196,7 +196,7 @@ pub fn analyze<'tcx, 'a>(
         graph: Graph::new(ends.len()),
     };
     for (local_def_id, body, _) in &bodies {
-        println!("{}", compile_util::body_to_str(body));
+        // println!("{}", compile_util::body_to_str(body));
         for (block, bbd) in body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
                 let ctx = Context::new(&body.local_decls, *local_def_id);

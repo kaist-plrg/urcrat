@@ -1667,3 +1667,253 @@ fn test_bitfield_write() {
         },
     );
 }
+
+#[test]
+fn test_bitfield_read() {
+    // _3 = [const 0_u8; 1]
+    // _4 = [const 0_u8; 3]
+    // _5 = const 0_i32
+    // _2 = s { x: move _5, y_z: move _3, c2rust_padding: move _4 }
+    // _7 = &mut _2
+    // _8 = const 1_i32
+    // _6 = s::set_y(move _7, move _8) -> [return: bb1, unwind continue]
+    // _10 = &mut _2
+    // _11 = const 2_i32
+    // _9 = s::set_z(move _10, move _11) -> [return: bb2, unwind continue]
+    // _1 = _2
+    // _12 = (_1.0: i32)
+    // _14 = &_1
+    // _13 = s::y(move _14) -> [return: bb3, unwind continue]
+    // _16 = &_1
+    // _15 = s::z(move _16) -> [return: bb4, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=2\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"3..=7\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "",
+        "
+        let mut x: s = {
+            let mut init = s {
+                y_z: [0; 1],
+                c2rust_padding: [0; 3],
+                x: 0 as libc::c_int,
+            };
+            init.set_y(1 as libc::c_int);
+            init.set_z(2 as libc::c_int);
+            init
+        };
+        let mut y: libc::c_int = x.x;
+        let mut z: libc::c_int = x.y();
+        let mut w: libc::c_int = x.z();
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, [1, 2, 5, 8, 11, 12, 13, 15].into_iter());
+            assert_eq!(n[&1].field(0).as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&1].field(3).as_ptr(), n[&8].as_ptr());
+            assert_eq!(n[&1].field(4).as_ptr(), n[&11].as_ptr());
+            assert_eq!(n[&2].field(0).as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&2].field(3).as_ptr(), n[&8].as_ptr());
+            assert_eq!(n[&2].field(4).as_ptr(), n[&11].as_ptr());
+            assert_eq!(n[&12].as_ptr(), n[&5].as_ptr());
+            assert_eq!(n[&13].as_ptr(), n[&8].as_ptr());
+            assert_eq!(n[&15].as_ptr(), n[&11].as_ptr());
+        },
+    );
+}
+
+#[test]
+fn test_bitfield_eq_invalidate() {
+    // _4 = [const 0_u8; 1]
+    // _5 = [const 0_u8; 3]
+    // _6 = const 0_i32
+    // _3 = s { x: move _6, y_z: move _4, c2rust_padding: move _5 }
+    // _8 = &mut _3
+    // _9 = const 0_i32
+    // _7 = s::set_y(move _8, move _9) -> [return: bb1, unwind continue]
+    // _11 = &mut _3
+    // _12 = const 0_i32
+    // _10 = s::set_z(move _11, move _12) -> [return: bb2, unwind continue]
+    // _2 = _3
+    // _15 = [const 0_u8; 1]
+    // _16 = [const 0_u8; 3]
+    // _17 = const 0_i32
+    // _14 = s { x: move _17, y_z: move _15, c2rust_padding: move _16 }
+    // _19 = &mut _14
+    // _20 = const 0_i32
+    // _18 = s::set_y(move _19, move _20) -> [return: bb3, unwind continue]
+    // _22 = &mut _14
+    // _23 = const 0_i32
+    // _21 = s::set_z(move _22, move _23) -> [return: bb4, unwind continue]
+    // _13 = _14
+    // switchInt(move _1) -> [0: bb6, otherwise: bb5]
+    // _25 = &mut _2
+    // _24 = &raw mut (*_25)
+    // goto -> bb7
+    // _26 = &mut _13
+    // _24 = &raw mut (*_26)
+    // goto -> bb7
+    // _28 = &mut _2
+    // _29 = const 1_i32
+    // _27 = s::set_y(move _28, move _29) -> [return: bb8, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=2\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"3..=7\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "mut x: libc::c_int",
+        "
+        let mut y: s = {
+            let mut init = s {
+                y_z: [0; 1],
+                c2rust_padding: [0; 3],
+                x: 0 as libc::c_int,
+            };
+            init.set_y(0 as libc::c_int);
+            init.set_z(0 as libc::c_int);
+            init
+        };
+        let mut z: s = {
+            let mut init = s {
+                y_z: [0; 1],
+                c2rust_padding: [0; 3],
+                x: 0 as libc::c_int,
+            };
+            init.set_y(0 as libc::c_int);
+            init.set_z(0 as libc::c_int);
+            init
+        };
+        let mut w: *mut s = if x != 0 { &mut y } else { &mut z };
+        y.set_y(1 as libc::c_int);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, [2, 3, 6, 13, 14, 24, 29].into_iter());
+            assert_eq!(n[&2].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&2].field(3).as_ptr(), n[&29].as_ptr());
+            assert_eq!(n[&2].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(3).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&13].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&13].field(3).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&13].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(3).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(4).as_ptr(), n[&6].as_ptr());
+            let dn24 = g.obj_at_location(n[&24].as_ptr()).unwrap();
+            assert_eq!(dn24.field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(dn24.field(3), &Obj::Top);
+            assert_eq!(dn24.field(4).as_ptr(), n[&6].as_ptr());
+        },
+    );
+}
+
+#[test]
+fn test_bitfield_deref_eq_invalidate() {
+    // _4 = [const 0_u8; 1]
+    // _5 = [const 0_u8; 3]
+    // _6 = const 0_i32
+    // _3 = s { x: move _6, y_z: move _4, c2rust_padding: move _5 }
+    // _8 = &mut _3
+    // _9 = const 0_i32
+    // _7 = s::set_y(move _8, move _9) -> [return: bb1, unwind continue]
+    // _11 = &mut _3
+    // _12 = const 0_i32
+    // _10 = s::set_z(move _11, move _12) -> [return: bb2, unwind continue]
+    // _2 = _3
+    // _15 = [const 0_u8; 1]
+    // _16 = [const 0_u8; 3]
+    // _17 = const 0_i32
+    // _14 = s { x: move _17, y_z: move _15, c2rust_padding: move _16 }
+    // _19 = &mut _14
+    // _20 = const 0_i32
+    // _18 = s::set_y(move _19, move _20) -> [return: bb3, unwind continue]
+    // _22 = &mut _14
+    // _23 = const 0_i32
+    // _21 = s::set_z(move _22, move _23) -> [return: bb4, unwind continue]
+    // _13 = _14
+    // switchInt(move _1) -> [0: bb6, otherwise: bb5]
+    // _25 = &mut _2
+    // _24 = &raw mut (*_25)
+    // goto -> bb7
+    // _26 = &mut _13
+    // _24 = &raw mut (*_26)
+    // goto -> bb7
+    // _28 = &mut (*_24)
+    // _29 = const 1_i32
+    // _27 = s::set_y(move _28, move _29) -> [return: bb8, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=2\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"3..=7\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "mut x: libc::c_int",
+        "
+        let mut y: s = {
+            let mut init = s {
+                y_z: [0; 1],
+                c2rust_padding: [0; 3],
+                x: 0 as libc::c_int,
+            };
+            init.set_y(0 as libc::c_int);
+            init.set_z(0 as libc::c_int);
+            init
+        };
+        let mut z: s = {
+            let mut init = s {
+                y_z: [0; 1],
+                c2rust_padding: [0; 3],
+                x: 0 as libc::c_int,
+            };
+            init.set_y(0 as libc::c_int);
+            init.set_z(0 as libc::c_int);
+            init
+        };
+        let mut w: *mut s = if x != 0 { &mut y } else { &mut z };
+        (*w).set_y(1 as libc::c_int);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, [2, 3, 6, 13, 14, 24, 29].into_iter());
+            assert_eq!(n[&2].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&2].field(3), &Obj::Top);
+            assert_eq!(n[&2].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(3).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&3].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&13].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&13].field(3), &Obj::Top);
+            assert_eq!(n[&13].field(4).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(3).as_ptr(), n[&6].as_ptr());
+            assert_eq!(n[&14].field(4).as_ptr(), n[&6].as_ptr());
+            let dn24 = g.obj_at_location(n[&24].as_ptr()).unwrap();
+            assert_eq!(dn24.field(0).as_ptr(), n[&6].as_ptr());
+            assert_eq!(dn24.field(3).as_ptr(), n[&29].as_ptr());
+            assert_eq!(dn24.field(4).as_ptr(), n[&6].as_ptr());
+        },
+    );
+}

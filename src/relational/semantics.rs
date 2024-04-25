@@ -409,7 +409,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let inputs = sig.inputs().skip_binder();
                         if let Some(local_def_id) = def_id.as_local() {
                             if self.tcx.impl_of_method(*def_id).is_some() {
-                                self.transfer_method_call(local_def_id, args, term_loc, &mut state);
+                                self.transfer_method_call(
+                                    local_def_id,
+                                    args,
+                                    &l,
+                                    term_loc,
+                                    &mut state,
+                                );
                                 false
                             } else if is_extern {
                                 self.transfer_c_call(name.1, inputs, args, &mut state);
@@ -448,6 +454,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         &self,
         f: LocalDefId,
         args: &[Operand<'_>],
+        dst: &AccPath,
         loc: Location,
         state: &mut AbsMem,
     ) {
@@ -469,7 +476,11 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (ty, method) = points_to::receiver_and_method(f, self.tcx).unwrap();
         match args.len() {
             1 => {
-                let _offset = self.get_bitfield_offset(ty, &method);
+                let offset = self.get_bitfield_offset(ty, &method);
+                let mut r = l;
+                r.extend_projection(&[AccElem::Field(offset as _)]);
+                let r = OpVal::Place(r, true);
+                state.gm().assign_with_suffixes(dst, false, &r, &[vec![]]);
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
