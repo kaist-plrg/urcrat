@@ -8,7 +8,39 @@ use typed_arena::Arena;
 
 use crate::*;
 
-pub fn get_bitfields(tcx: TyCtxt<'_>) -> HashMap<LocalDefId, HashMap<String, usize>> {
+pub struct TyShapes<'a, 'tcx> {
+    pub bitfields: HashMap<LocalDefId, HashMap<String, usize>>,
+    pub tys: HashMap<Ty<'tcx>, &'a TyShape<'a>>,
+    prim: &'a TyShape<'a>,
+    arena: &'a Arena<TyShape<'a>>,
+}
+
+impl std::fmt::Debug for TyShapes<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TyShapes")
+            .field("bitfields", &self.bitfields)
+            .field("tys", &self.tys)
+            .finish()
+    }
+}
+
+pub fn get_ty_shapes<'a, 'tcx>(
+    arena: &'a Arena<TyShape<'a>>,
+    tcx: TyCtxt<'tcx>,
+) -> TyShapes<'a, 'tcx> {
+    let prim = arena.alloc(TyShape::Primitive);
+    let mut tss = TyShapes {
+        bitfields: HashMap::new(),
+        tys: HashMap::new(),
+        prim,
+        arena,
+    };
+    compute_bitfields(&mut tss, tcx);
+    compute_ty_shapes(&mut tss, tcx);
+    tss
+}
+
+fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
     let hir = tcx.hir();
 
     let mut bitfield_structs = HashMap::new();
@@ -53,7 +85,7 @@ pub fn get_bitfields(tcx: TyCtxt<'_>) -> HashMap<LocalDefId, HashMap<String, usi
             _ => {}
         }
     }
-    bitfield_impls
+    tss.bitfields = bitfield_impls
         .into_iter()
         .map(|(ty, fields)| {
             let bf1: String = fields.iter().map(|f| f.as_str()).intersperse("_").collect();
@@ -66,18 +98,12 @@ pub fn get_bitfields(tcx: TyCtxt<'_>) -> HashMap<LocalDefId, HashMap<String, usi
                 .collect();
             (ty, field_indices)
         })
-        .collect()
+        .collect();
 }
 
-pub fn get_ty_infos<'a, 'tcx>(
-    arena: &'a Arena<TyInfo<'a>>,
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
-    tcx: TyCtxt<'tcx>,
-) -> HashMap<Ty<'tcx>, &'a TyInfo<'a>> {
+fn compute_ty_shapes<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
     let hir = tcx.hir();
 
-    let prim = arena.alloc(TyInfo::Primitive);
-    let mut ty_infos = HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let local_def_id = item.owner_id.def_id;
@@ -90,123 +116,104 @@ pub fn get_ty_infos<'a, 'tcx>(
             _ => continue,
         };
         for local_decl in body.local_decls.iter() {
-            compute_ty_info(
-                local_decl.ty,
-                &mut ty_infos,
-                bitfields,
-                prim,
-                def_id,
-                arena,
-                tcx,
-            );
+            compute_ty_shape(local_decl.ty, def_id, tss, tcx);
             if let Some(ty) = points_to::unwrap_ptr(local_decl.ty) {
-                compute_ty_info(ty, &mut ty_infos, bitfields, prim, def_id, arena, tcx);
+                compute_ty_shape(ty, def_id, tss, tcx);
             }
         }
     }
-
-    ty_infos
 }
 
-fn compute_ty_info<'a, 'tcx>(
+fn compute_ty_shape<'a, 'tcx>(
     ty: Ty<'tcx>,
-    tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
-    prim: &'a TyInfo<'a>,
-    def_id: DefId,
-    arena: &'a Arena<TyInfo<'a>>,
+    owner: DefId,
+    tss: &mut TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> &'a TyInfo<'a> {
-    if let Some(ty_info) = tys.get(&ty) {
-        return ty_info;
+) -> &'a TyShape<'a> {
+    if let Some(ts) = tss.tys.get(&ty) {
+        return ts;
     }
-    let ty_info = match ty.kind() {
+    let ts = match ty.kind() {
         TyKind::Adt(adt_def, generic_args) => {
             if ty.is_c_void(tcx) {
-                prim
+                tss.prim
             } else {
-                let ts = adt_def.variants().iter().flat_map(|variant| {
+                let tys = adt_def.variants().iter().flat_map(|variant| {
                     variant
                         .fields
                         .iter()
                         .map(|field| field.ty(tcx, generic_args))
                 });
-                let bitfield = adt_def
+                let bitfield_len = adt_def
                     .did()
                     .as_local()
-                    .and_then(|local_def_id| bitfields.get(&local_def_id));
-                compute_ty_info_iter(ts, tys, bitfield, bitfields, prim, def_id, arena, tcx)
+                    .and_then(|local_def_id| tss.bitfields.get(&local_def_id))
+                    .map(|fields| fields.len())
+                    .unwrap_or_default();
+                compute_ty_shape_many(tys, bitfield_len, owner, tss, tcx)
             }
         }
         TyKind::Array(ty, len) => {
-            let t = compute_ty_info(*ty, tys, bitfields, prim, def_id, arena, tcx);
+            let t = compute_ty_shape(*ty, owner, tss, tcx);
             let len = len
-                .eval(tcx, tcx.param_env(def_id))
+                .eval(tcx, tcx.param_env(owner))
                 .try_to_scalar_int()
                 .unwrap()
                 .try_to_u64()
                 .unwrap() as usize;
-            arena.alloc(TyInfo::Array(t, len))
+            tss.arena.alloc(TyShape::Array(t, len))
         }
-        TyKind::Tuple(ts) => {
-            compute_ty_info_iter(ts.iter(), tys, None, bitfields, prim, def_id, arena, tcx)
-        }
-        _ => prim,
+        TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, owner, tss, tcx),
+        _ => tss.prim,
     };
-    tys.insert(ty, ty_info);
-    assert_ne!(ty_info.len(), 0);
-    ty_info
+    tss.tys.insert(ty, ts);
+    assert_ne!(ts.len(), 0);
+    ts
 }
 
 #[inline]
-#[allow(clippy::too_many_arguments)]
-fn compute_ty_info_iter<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
-    ts: I,
-    tys: &mut HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
-    bitfield: Option<&HashMap<String, usize>>,
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
-    prim: &'a TyInfo<'a>,
-    def_id: DefId,
-    arena: &'a Arena<TyInfo<'a>>,
+fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
+    tys: I,
+    bitfield_len: usize,
+    owner: DefId,
+    tss: &mut TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> &'a TyInfo<'a> {
+) -> &'a TyShape<'a> {
     let mut len = 0;
     let mut fields = vec![];
-    for ty in ts {
-        let ty_info = compute_ty_info(ty, tys, bitfields, prim, def_id, arena, tcx);
-        fields.push((len, ty_info));
-        len += ty_info.len();
+    for ty in tys {
+        let ts = compute_ty_shape(ty, owner, tss, tcx);
+        fields.push((len, ts));
+        len += ts.len();
     }
-    if let Some(fs) = bitfield {
-        for _ in fs {
-            fields.push((len, prim));
-            len += 1;
-        }
+    for _ in 0..bitfield_len {
+        fields.push((len, tss.prim));
+        len += 1;
     }
     if len == 0 {
-        prim
+        tss.prim
     } else {
-        arena.alloc(TyInfo::Struct(len, fields))
+        tss.arena.alloc(TyShape::Struct(len, fields))
     }
 }
 
 #[allow(variant_size_differences)]
-pub enum TyInfo<'a> {
+pub enum TyShape<'a> {
     Primitive,
-    Array(&'a TyInfo<'a>, usize),
-    Struct(usize, Vec<(usize, &'a TyInfo<'a>)>),
+    Array(&'a TyShape<'a>, usize),
+    Struct(usize, Vec<(usize, &'a TyShape<'a>)>),
 }
 
-impl std::fmt::Debug for TyInfo<'_> {
+impl std::fmt::Debug for TyShape<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Primitive => write!(f, "*"),
             Self::Array(t, len) => write!(f, "[{:?} * {}]", t, len),
             Self::Struct(len, fields) => {
                 write!(f, "[{}", len)?;
-                for (i, ty_info) in fields {
+                for (i, ts) in fields {
                     let sep = if *i == 0 { ";" } else { "," };
-                    write!(f, "{} {}: {:?}", sep, i, ty_info)?;
+                    write!(f, "{} {}: {:?}", sep, i, ts)?;
                 }
                 write!(f, "]")
             }
@@ -214,7 +221,7 @@ impl std::fmt::Debug for TyInfo<'_> {
     }
 }
 
-impl TyInfo<'_> {
+impl TyShape<'_> {
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {

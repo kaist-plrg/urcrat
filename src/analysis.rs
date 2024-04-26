@@ -42,10 +42,9 @@ fn analyze_input(input: Input, conf: &Config) {
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let visitor = ty_finder::TyVisitor::new(tcx);
     let foreign_tys = visitor.find_foreign_tys(tcx);
-    let bitfields = ty_info::get_bitfields(tcx);
     let arena = Arena::new();
-    let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
-    let may_points_to = points_to::analyze(&bitfields, &ty_infos, tcx);
+    let tss = ty_shape::get_ty_shapes(&arena, tcx);
+    let may_points_to = points_to::analyze(&tss, tcx);
 
     let mut accesses: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();
     for item_id in tcx.hir().items() {
@@ -60,14 +59,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         visitor.visit_body(body);
         if !visitor.accesses.is_empty() {
             println!("{:?}", local_def_id);
-            let states = relational::analyze_fn(
-                local_def_id,
-                &bitfields,
-                &ty_infos,
-                &may_points_to,
-                true,
-                tcx,
-            );
+            let states = relational::analyze_fn(local_def_id, &tss, &may_points_to, true, tcx);
             for access in &visitor.accesses {
                 let span = body.source_info(access.location).span;
                 let tags = compute_tags(*access, &states);

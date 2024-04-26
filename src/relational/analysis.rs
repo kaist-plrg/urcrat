@@ -15,7 +15,7 @@ use rustc_middle::{
 use rustc_mir_dataflow::Analysis;
 use rustc_session::config::Input;
 use rustc_span::def_id::LocalDefId;
-use ty_info::TyInfo;
+use ty_shape::*;
 use typed_arena::Arena;
 
 use super::*;
@@ -35,34 +35,27 @@ fn analyze_input(input: Input, gc: bool) -> AnalysisResults {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
-    let bitfields = ty_info::get_bitfields(tcx);
     let arena = Arena::new();
-    let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
-    let may_points_to = points_to::analyze(&bitfields, &ty_infos, tcx);
+    let tss = get_ty_shapes(&arena, tcx);
+    let may_points_to = points_to::analyze(&tss, tcx);
     let functions = may_points_to
         .call_graph
         .keys()
-        .map(|def_id| {
-            (
-                *def_id,
-                analyze_fn(*def_id, &bitfields, &ty_infos, &may_points_to, gc, tcx),
-            )
-        })
+        .map(|def_id| (*def_id, analyze_fn(*def_id, &tss, &may_points_to, gc, tcx)))
         .collect();
     AnalysisResults { functions }
 }
 
 pub fn analyze_fn<'a, 'tcx>(
     local_def_id: LocalDefId,
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
-    ty_infos: &HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
-    may_points_to: &points_to::AnalysisResults,
+    tss: &'a TyShapes<'a, 'tcx>,
+    may_points_to: &'a points_to::AnalysisResults,
     gc: bool,
     tcx: TyCtxt<'tcx>,
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    println!("{}", compile_util::body_to_str(body));
+    // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
@@ -76,8 +69,7 @@ pub fn analyze_fn<'a, 'tcx>(
         dead_locals,
         local_def_id,
         discriminant_values,
-        bitfields,
-        ty_infos,
+        tss,
         may_points_to,
         gc,
     };
@@ -97,8 +89,7 @@ pub struct Analyzer<'tcx, 'a> {
     dead_locals: Vec<BitSet<Local>>,
     pub local_def_id: LocalDefId,
     discriminant_values: HashMap<BasicBlock, DiscrVal>,
-    bitfields: &'a HashMap<LocalDefId, HashMap<String, usize>>,
-    ty_infos: &'a HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    tss: &'a TyShapes<'a, 'tcx>,
     pub may_points_to: &'a points_to::AnalysisResults,
     gc: bool,
 }
@@ -155,7 +146,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         } else {
             ty
         };
-        let mut suffixes = get_path_suffixes(self.ty_infos[&ty], &path.projection);
+        let mut suffixes = get_path_suffixes(self.tss.tys[&ty], &path.projection);
         for suffix in &mut suffixes {
             suffix.reverse();
         }
@@ -180,7 +171,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
     }
 
     pub fn get_bitfield_offset(&self, ty: LocalDefId, field: &str) -> usize {
-        self.bitfields[&ty][field]
+        self.tss.bitfields[&ty][field]
     }
 
     pub fn get_bitfield_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
@@ -258,9 +249,9 @@ impl<'a> WorkList<'a> {
     }
 }
 
-fn get_path_suffixes(ty: &TyInfo<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
+fn get_path_suffixes(ty: &TyShape<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
     match ty {
-        TyInfo::Struct(_, tys) => {
+        TyShape::Struct(_, tys) => {
             if let Some(elem) = proj.get(0) {
                 let AccElem::Field(n) = elem else { unreachable!() };
                 get_path_suffixes(tys[*n as usize].1, &proj[1..])
@@ -277,7 +268,7 @@ fn get_path_suffixes(ty: &TyInfo<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
                     .collect()
             }
         }
-        TyInfo::Array(ty, len) => {
+        TyShape::Array(ty, len) => {
             if let Some(elem) = proj.get(0) {
                 assert!(matches!(elem, AccElem::Index(_)));
                 get_path_suffixes(ty, &proj[1..])
@@ -293,7 +284,7 @@ fn get_path_suffixes(ty: &TyInfo<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
                     .collect()
             }
         }
-        TyInfo::Primitive => {
+        TyShape::Primitive => {
             assert!(proj.is_empty());
             vec![vec![]]
         }

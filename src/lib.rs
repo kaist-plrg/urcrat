@@ -61,4 +61,4 @@ pub mod points_to;
 pub mod relational;
 pub mod steensgaard;
 pub mod ty_finder;
-pub mod ty_info;
+pub mod ty_shape;

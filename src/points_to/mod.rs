@@ -23,7 +23,7 @@ use rustc_middle::{
 };
 use rustc_session::config::Input;
 use rustc_span::def_id::{DefId, LocalDefId};
-use ty_info::TyInfo;
+use ty_shape::*;
 use typed_arena::Arena;
 
 use crate::*;
@@ -39,10 +39,9 @@ pub fn analyze_str(code: &str) {
 fn analyze_input(input: Input) {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
-        let bitfields = ty_info::get_bitfields(tcx);
         let arena = Arena::new();
-        let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
-        analyze(&bitfields, &ty_infos, tcx);
+        let tss = get_ty_shapes(&arena, tcx);
+        analyze(&tss, tcx);
     })
     .unwrap();
 }
@@ -60,11 +59,7 @@ pub struct AnalysisResults {
     pub var_nodes: HashMap<(LocalDefId, Local), Node>,
 }
 
-pub fn analyze<'tcx, 'a>(
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
-    ty_infos: &HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
-    tcx: TyCtxt<'tcx>,
-) -> AnalysisResults {
+pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> AnalysisResults {
     let hir = tcx.hir();
 
     let mut bodies = vec![];
@@ -124,7 +119,7 @@ pub fn analyze<'tcx, 'a>(
 
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(*local_def_id, local), ends.len());
-            let ty = ty_infos[&local_decl.ty];
+            let ty = tss.tys[&local_decl.ty];
             let node = add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
             var_nodes.insert((*local_def_id, local), node);
             compute_ends(ty, &mut ends);
@@ -135,7 +130,7 @@ pub fn analyze<'tcx, 'a>(
 
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
                 let mut ends = vec![];
-                let ty = ty_infos[&ty];
+                let ty = tss.tys[&ty];
                 compute_ends(ty, &mut ends);
                 for (i, end) in ends.into_iter().enumerate() {
                     if alloc_ends.len() > i {
@@ -190,7 +185,7 @@ pub fn analyze<'tcx, 'a>(
 
     let mut analyzer = Analyzer {
         tcx,
-        ty_infos,
+        tss,
         vars,
         globals,
         graph: Graph::new(ends.len()),
@@ -271,7 +266,7 @@ pub fn analyze<'tcx, 'a>(
                     func,
                     args,
                     location,
-                    bitfields,
+                    &tss.bitfields,
                     tcx,
                     &ends,
                     &solutions,
@@ -346,11 +341,11 @@ pub fn analyze<'tcx, 'a>(
     }
 }
 
-fn compute_ends(ty: &TyInfo<'_>, ends: &mut Vec<usize>) {
+fn compute_ends(ty: &TyShape<'_>, ends: &mut Vec<usize>) {
     match ty {
-        TyInfo::Primitive => ends.push(ends.len()),
-        TyInfo::Array(t, _) => compute_ends(t, ends),
-        TyInfo::Struct(len, ts) => {
+        TyShape::Primitive => ends.push(ends.len()),
+        TyShape::Array(t, _) => compute_ends(t, ends),
+        TyShape::Struct(len, ts) => {
             let end = ends.len();
             for (_, t) in ts {
                 compute_ends(t, ends);
@@ -374,7 +369,7 @@ fn compute_writes<'tcx>(
         .entry(location)
         .or_insert(HybridBitSet::new_empty(ends.len()));
     let ty = l.ty(ctx.locals, analyzer.tcx).ty;
-    let len = analyzer.ty_infos[&ty].len();
+    let len = analyzer.tss.tys[&ty].len();
     let l = analyzer.prefixed_loc(l, ctx);
     if l.deref {
         for loc in solutions[l.var.root].iter() {
@@ -451,20 +446,20 @@ pub fn receiver_and_method(
 }
 
 fn add_edges(
-    ty: &TyInfo<'_>,
+    ty: &TyShape<'_>,
     index: usize,
     graph: &mut LocGraph,
     index_prefixes: &mut HashMap<usize, u8>,
 ) -> Node {
     let node = match ty {
-        TyInfo::Primitive => return Node::new(0, index),
-        TyInfo::Array(t, _) => {
+        TyShape::Primitive => return Node::new(0, index),
+        TyShape::Array(t, _) => {
             let succ = add_edges(t, index, graph, index_prefixes);
             let node = succ.parent();
             graph.insert(node, Edges::Index(succ));
             node
         }
-        TyInfo::Struct(_, ts) => {
+        TyShape::Struct(_, ts) => {
             let succs: Vec<_> = ts
                 .iter()
                 .map(|(offset, t)| add_edges(t, index + offset, graph, index_prefixes))
@@ -558,7 +553,7 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
 
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    ty_infos: &'a HashMap<Ty<'tcx>, &'a TyInfo<'a>>,
+    tss: &'a TyShapes<'a, 'tcx>,
     vars: HashMap<Var, usize>,
     globals: HashMap<LocalDefId, usize>,
     graph: Graph,
@@ -649,7 +644,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }
                 }
                 AggregateKind::Adt(_, v_idx, _, _, idx) => {
-                    let TyInfo::Struct(_, ts) = self.ty_infos[&ty] else { unreachable!() };
+                    let TyShape::Struct(_, ts) = self.tss.tys[&ty] else { unreachable!() };
                     let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
                     let variant = adt_def.variant(*v_idx);
                     for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
@@ -673,7 +668,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
 
     fn transfer_assign(&mut self, l: PrefixedLoc, r: PrefixedLoc, ty: Ty<'tcx>) {
         assert!(!l.r#ref);
-        let len = self.ty_infos[&ty].len();
+        let len = self.tss.tys[&ty].len();
         for i in 0..len {
             let l = l.add(i);
             let r = r.add(i);
@@ -746,7 +741,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     if let Some(arg) = arg_loc {
                         self.transfer_assign(func, arg, ty);
                     }
-                    func = func.add(self.ty_infos[&ty].len());
+                    func = func.add(self.tss.tys[&ty].len());
                 }
                 self.transfer_assign(dst, func, output);
             }
@@ -783,7 +778,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 let loc = Loc::new_root(index);
                                 self.transfer_assign(PrefixedLoc::new(loc), arg, ty);
                             }
-                            index += self.ty_infos[&ty].len();
+                            index += self.tss.tys[&ty].len();
                         }
                         let loc = Loc::new_root(index);
                         self.transfer_assign(dst, PrefixedLoc::new(loc), output);
@@ -817,16 +812,16 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         if deref {
             ty = unwrap_ptr(ty).unwrap();
         }
-        let mut ty = self.ty_infos[&ty];
+        let mut ty = self.tss.tys[&ty];
         for proj in place.projection {
             match proj {
                 PlaceElem::Deref => {}
                 PlaceElem::Index(_) => {
-                    let TyInfo::Array(t, _) = ty else { unreachable!() };
+                    let TyShape::Array(t, _) = ty else { unreachable!() };
                     ty = t;
                 }
                 PlaceElem::Field(f, _) => {
-                    let TyInfo::Struct(_, fs) = ty else { unreachable!() };
+                    let TyShape::Struct(_, fs) = ty else { unreachable!() };
                     let (i, nested_ty) = fs[f.index()];
                     index += i;
                     ty = nested_ty;

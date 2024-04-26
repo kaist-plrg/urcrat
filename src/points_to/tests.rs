@@ -27,10 +27,9 @@ where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
         types, name, params, code
     );
     run_compiler(&code, |tcx| {
-        let bitfields = ty_info::get_bitfields(tcx);
         let arena = Arena::new();
-        let ty_infos = ty_info::get_ty_infos(&arena, &bitfields, tcx);
-        f(analyze(&bitfields, &ty_infos, tcx), tcx)
+        let tss = get_ty_shapes(&arena, tcx);
+        f(analyze(&tss, tcx), tcx)
     });
 }
 
