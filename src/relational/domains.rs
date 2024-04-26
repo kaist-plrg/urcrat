@@ -934,10 +934,10 @@ struct InvalidateCtx<'a> {
 fn invalidate_rec(
     loc: AbsLoc,
     obj: &mut Obj,
-    node: points_to::Node,
-    visited: &mut HashSet<(AbsLoc, points_to::Node)>,
+    node: points_to::LocNode,
+    visited: &mut HashSet<(AbsLoc, points_to::LocNode)>,
     ctx: InvalidateCtx<'_>,
-) -> Vec<(AbsLoc, points_to::Node)> {
+) -> Vec<(AbsLoc, points_to::LocNode)> {
     if !visited.insert((loc.clone(), node)) {
         return vec![];
     }
@@ -945,7 +945,7 @@ fn invalidate_rec(
     let v = match obj {
         Obj::Top | Obj::AtAddr(_) => vec![],
         Obj::Ptr(ptr_loc) => {
-            let v = if let points_to::Edges::Deref(nodes) = edges {
+            let v = if let points_to::LocEdges::Deref(nodes) = edges {
                 nodes.iter().map(|node| (ptr_loc.clone(), *node)).collect()
             } else {
                 vec![]
@@ -966,7 +966,7 @@ fn invalidate_rec(
         }
         Obj::Struct(fs) => {
             let mut v = vec![];
-            if let points_to::Edges::Fields(fs2) = edges {
+            if let points_to::LocEdges::Fields(fs2) = edges {
                 for (index, node) in fs2.iter().enumerate() {
                     let index = index as u32;
                     let obj = some_or!(fs.get_mut(&index), continue);
@@ -978,7 +978,7 @@ fn invalidate_rec(
         }
         Obj::Array(vs) => {
             let mut v = vec![];
-            if let points_to::Edges::Index(node) = edges {
+            if let points_to::LocEdges::Index(node) = edges {
                 for (elem, obj) in vs {
                     let loc = loc.clone().push_index(elem.clone());
                     v.extend(invalidate_rec(loc, obj, *node, visited, ctx));

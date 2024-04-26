@@ -16,8 +16,8 @@ use rustc_middle::{
     mir::{
         interpret::{ConstValue, GlobalAlloc, Scalar},
         visit::Visitor,
-        AggregateKind, BasicBlock, BinOp, ConstantKind, Local, LocalDecl, Location, Operand, Place,
-        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
+        AggregateKind, BasicBlock, BinOp, Body, ConstantKind, Local, LocalDecl, Location, Operand,
+        Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
     },
     ty::{Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -41,25 +41,56 @@ fn analyze_input(input: Input) {
     compile_util::run_compiler(config, |tcx| {
         let arena = Arena::new();
         let tss = get_ty_shapes(&arena, tcx);
-        analyze(&tss, tcx);
+        let pre = pre_analyze(&tss, tcx);
+        analyze(&pre, &tss, tcx);
     })
     .unwrap();
 }
 
 #[derive(Debug)]
-pub struct AnalysisResults {
-    pub solutions: Vec<HybridBitSet<usize>>,
-    pub ends: Vec<usize>,
-    pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub graph: LocGraph,
-    pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
-    pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
-    pub call_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
-    pub var_nodes: HashMap<(LocalDefId, Local), Node>,
+pub struct BodyItem<'tcx> {
+    local_def_id: LocalDefId,
+    body: &'tcx Body<'tcx>,
+    is_fn: bool,
 }
 
-pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> AnalysisResults {
+#[derive(Debug)]
+pub struct PreAnalysisData<'tcx> {
+    bodies: Vec<BodyItem<'tcx>>,
+
+    pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
+    indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, usize>>,
+
+    ends: Vec<usize>,
+    globals: HashMap<LocalDefId, usize>,
+    inv_fns: HashMap<usize, LocalDefId>,
+    vars: HashMap<Var, usize>,
+
+    index_prefixes: HashMap<usize, u8>,
+    graph: HashMap<LocNode, LocEdges>,
+    var_nodes: HashMap<(LocalDefId, Local), LocNode>,
+}
+
+#[derive(Debug)]
+pub struct AnalysisResults {
+    pub ends: Vec<usize>,
+    pub graph: LocGraph,
+    pub var_nodes: HashMap<(LocalDefId, Local), LocNode>,
+
+    pub solutions: Vec<HybridBitSet<usize>>,
+
+    pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
+    pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
+
+    pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
+    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
+    pub call_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+}
+
+pub fn pre_analyze<'a, 'tcx>(
+    tss: &'a TyShapes<'a, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> PreAnalysisData<'tcx> {
     let hir = tcx.hir();
 
     let mut bodies = vec![];
@@ -74,12 +105,22 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
                 fn_def_ids.insert(local_def_id);
                 let body = tcx.optimized_mir(def_id);
                 visitor.visit_body(body);
-                bodies.push((local_def_id, body, true));
+                let body_item = BodyItem {
+                    local_def_id,
+                    body,
+                    is_fn: true,
+                };
+                bodies.push(body_item);
             }
             ItemKind::Static(_, _, _) => {
                 let body = tcx.mir_for_ctfe(def_id);
                 visitor.visit_body(body);
-                bodies.push((local_def_id, body, false));
+                let body_item = BodyItem {
+                    local_def_id,
+                    body,
+                    is_fn: false,
+                };
+                bodies.push(body_item);
             }
             _ => {}
         }
@@ -97,19 +138,19 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
     let mut index_prefixes = HashMap::new();
     let mut indirect_calls: HashMap<_, HashMap<_, _>> = HashMap::new();
     let mut var_nodes = HashMap::new();
-    for (local_def_id, body, is_fn) in &bodies {
-        let fn_ptr = fn_ptrs.contains(local_def_id);
+    for item in &bodies {
+        let fn_ptr = fn_ptrs.contains(&item.local_def_id);
         let global_index = ends.len();
-        globals.insert(*local_def_id, global_index);
+        globals.insert(item.local_def_id, global_index);
 
-        if *is_fn {
-            inv_fns.insert(global_index, *local_def_id);
+        if item.is_fn {
+            inv_fns.insert(global_index, item.local_def_id);
         }
 
-        let mut local_decls = body.local_decls.iter_enumerated();
+        let mut local_decls = item.body.local_decls.iter_enumerated();
         let ret = local_decls.next().unwrap();
         let mut params = vec![];
-        for _ in 0..body.arg_count {
+        for _ in 0..item.body.arg_count {
             params.push(local_decls.next().unwrap());
         }
         let local_decls = params
@@ -118,10 +159,10 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
             .chain(local_decls);
 
         for (local, local_decl) in local_decls {
-            vars.insert(Var::Local(*local_def_id, local), ends.len());
+            vars.insert(Var::Local(item.local_def_id, local), ends.len());
             let ty = tss.tys[&local_decl.ty];
             let node = add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
-            var_nodes.insert((*local_def_id, local), node);
+            var_nodes.insert((item.local_def_id, local), node);
             compute_ends(ty, &mut ends);
 
             if fn_ptr && local.index() == 0 {
@@ -142,7 +183,7 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
             }
         }
 
-        for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+        for (bb, bbd) in item.body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call {
                 func, destination, ..
             } = &bbd.terminator().kind
@@ -152,22 +193,25 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
             match func {
                 Operand::Copy(func) | Operand::Move(func) => {
                     assert!(func.projection.is_empty());
-                    let var = Var::Local(*local_def_id, func.local);
+                    let var = Var::Local(item.local_def_id, func.local);
                     let index = vars[&var];
                     indirect_calls
-                        .entry(*local_def_id)
+                        .entry(item.local_def_id)
                         .or_default()
                         .insert(bb, index);
                 }
                 _ => {
                     let def_id = some_or!(operand_to_fn(func), continue);
-                    let ty = destination.ty(&body.local_decls, tcx).ty;
+                    let ty = destination.ty(&item.body.local_decls, tcx).ty;
                     if ty.is_unsafe_ptr() && is_c_fn(def_id, tcx) {
-                        allocs.push(Var::Alloc(*local_def_id, bb));
+                        allocs.push(Var::Alloc(item.local_def_id, bb));
                     }
                     if let Some(callee) = def_id.as_local() {
                         if fn_def_ids.contains(&callee) {
-                            call_graph.get_mut(local_def_id).unwrap().insert(callee);
+                            call_graph
+                                .get_mut(&item.local_def_id)
+                                .unwrap()
+                                .insert(callee);
                         }
                     }
                 }
@@ -183,64 +227,94 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
         }
     }
 
+    PreAnalysisData {
+        bodies,
+        call_graph,
+        indirect_calls,
+        ends,
+        globals,
+        inv_fns,
+        vars,
+        index_prefixes,
+        graph,
+        var_nodes,
+    }
+}
+
+pub fn analyze<'a, 'tcx>(
+    pre: &PreAnalysisData<'tcx>,
+    tss: &'a TyShapes<'a, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Vec<HybridBitSet<usize>> {
     let mut analyzer = Analyzer {
         tcx,
         tss,
-        vars,
-        globals,
-        graph: Graph::new(ends.len()),
+        pre,
+        graph: Graph::new(pre.ends.len()),
     };
-    for (local_def_id, body, _) in &bodies {
+    for item in &pre.bodies {
         // println!("{}", compile_util::body_to_str(body));
-        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+        for (block, bbd) in item.body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
-                let ctx = Context::new(&body.local_decls, *local_def_id);
+                let ctx = Context::new(&item.body.local_decls, item.local_def_id);
                 analyzer.transfer_stmt(stmt, ctx);
             }
             let terminator = bbd.terminator();
-            let ctx = Context::new(&body.local_decls, *local_def_id);
+            let ctx = Context::new(&item.body.local_decls, item.local_def_id);
             analyzer.transfer_term(terminator, ctx, block);
         }
     }
 
-    let solutions = analyzer.graph.solve(&ends);
+    analyzer.graph.solve(&pre.ends)
+}
+
+pub fn post_analyze<'a, 'tcx>(
+    mut pre: PreAnalysisData<'tcx>,
+    solutions: Vec<HybridBitSet<usize>>,
+    tss: &'a TyShapes<'a, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> AnalysisResults {
     for (index, sols) in solutions.iter().enumerate() {
-        let node = Node::new(0, index);
+        let node = LocNode::new(0, index);
         let mut succs = vec![];
         for succ in sols.iter() {
-            let max = index_prefixes.get(&succ).cloned().unwrap_or(0);
-            succs.extend((0..=max).map(|p| Node::new(p, succ)));
+            let max = pre.index_prefixes.get(&succ).cloned().unwrap_or(0);
+            succs.extend((0..=max).map(|p| LocNode::new(p, succ)));
         }
-        graph.insert(node, Edges::Deref(succs));
+        pre.graph.insert(node, LocEdges::Deref(succs));
     }
-    let mut address_taken_indices = HybridBitSet::new_empty(ends.len());
+    let mut address_taken_indices = HybridBitSet::new_empty(pre.ends.len());
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
-    for (i, _) in ends.iter().enumerate() {
+    for (i, _) in pre.ends.iter().enumerate() {
         if address_taken_indices.contains(i) {
-            for j in (i + 1)..=ends[i] {
+            for j in (i + 1)..=pre.ends[i] {
                 address_taken_indices.insert(j);
             }
         }
     }
 
-    analyzer.graph = Graph::new(0);
-    let mut writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> = HashMap::new();
-    let mut bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>> =
-        HashMap::new();
-    for (local_def_id, body, _) in &bodies {
-        let writes = writes.entry(*local_def_id).or_default();
-        let bitfield_writes = bitfield_writes.entry(*local_def_id).or_default();
-        let ctx = Context::new(&body.local_decls, *local_def_id);
-        for (block, bbd) in body.basic_blocks.iter_enumerated() {
+    let analyzer = Analyzer {
+        tcx,
+        pre: &pre,
+        tss,
+        graph: Graph::new(pre.ends.len()),
+    };
+    let mut writes: HashMap<_, HashMap<_, _>> = HashMap::new();
+    let mut bitfield_writes: HashMap<_, HashMap<_, _>> = HashMap::new();
+    for item in &pre.bodies {
+        let writes = writes.entry(item.local_def_id).or_default();
+        let bitfield_writes = bitfield_writes.entry(item.local_def_id).or_default();
+        let ctx = Context::new(&item.body.local_decls, item.local_def_id);
+        for (block, bbd) in item.body.basic_blocks.iter_enumerated() {
             for (statement_index, stmt) in bbd.statements.iter().enumerate() {
                 let StatementKind::Assign(box (l, _)) = stmt.kind else { continue };
                 let location = Location {
                     block,
                     statement_index,
                 };
-                compute_writes(l, location, &ends, &solutions, ctx, &analyzer, writes);
+                compute_writes(l, location, &pre.ends, &solutions, ctx, &analyzer, writes);
             }
             if let TerminatorKind::Call {
                 func,
@@ -256,7 +330,7 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
                 compute_writes(
                     *destination,
                     location,
-                    &ends,
+                    &pre.ends,
                     &solutions,
                     ctx,
                     &analyzer,
@@ -268,7 +342,7 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
                     location,
                     &tss.bitfields,
                     tcx,
-                    &ends,
+                    &pre.ends,
                     &solutions,
                     ctx,
                     &analyzer,
@@ -285,7 +359,7 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
     let fn_writes: HashMap<_, _> = writes
         .iter()
         .map(|(f, writes)| {
-            let mut ws = HybridBitSet::new_empty(ends.len());
+            let mut ws = HybridBitSet::new_empty(pre.ends.len());
             for w in writes.values() {
                 ws.union(w);
             }
@@ -293,7 +367,8 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
         })
         .collect();
 
-    let indirect_calls: HashMap<_, HashMap<_, Vec<_>>> = indirect_calls
+    let indirect_calls: HashMap<_, HashMap<_, Vec<_>>> = pre
+        .indirect_calls
         .into_iter()
         .map(|(def_id, calls)| {
             let calls = calls
@@ -301,7 +376,7 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
                 .map(|(bb, index)| {
                     let callees = solutions[index]
                         .iter()
-                        .filter_map(|index| inv_fns.get(&index).copied())
+                        .filter_map(|index| pre.inv_fns.get(&index).copied())
                         .collect();
                     (bb, callees)
                 })
@@ -310,17 +385,17 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
         })
         .collect();
     for (caller, calls) in &indirect_calls {
-        let callees = call_graph.get_mut(caller).unwrap();
+        let callees = pre.call_graph.get_mut(caller).unwrap();
         callees.extend(calls.values().flatten());
     }
-    let mut reachability = graph::transitive_closure(&call_graph);
+    let mut reachability = graph::transitive_closure(&pre.call_graph);
     for (func, reachables) in &mut reachability {
         reachables.insert(*func);
     }
     let call_writes: HashMap<_, _> = reachability
         .iter()
         .map(|(func, reachables)| {
-            let mut writes = HybridBitSet::new_empty(ends.len());
+            let mut writes = HybridBitSet::new_empty(pre.ends.len());
             for reachable in reachables {
                 writes.union(&fn_writes[reachable]);
             }
@@ -329,15 +404,15 @@ pub fn analyze<'a, 'tcx>(tss: &'a TyShapes<'a, 'tcx>, tcx: TyCtxt<'tcx>) -> Anal
         .collect();
 
     AnalysisResults {
+        ends: pre.ends,
+        graph: pre.graph,
+        var_nodes: pre.var_nodes,
         solutions,
-        ends,
+        call_graph: pre.call_graph,
+        indirect_calls,
         writes,
         bitfield_writes,
-        graph,
-        indirect_calls,
-        call_graph,
         call_writes,
-        var_nodes,
     }
 }
 
@@ -362,7 +437,7 @@ fn compute_writes<'tcx>(
     ends: &[usize],
     solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
-    analyzer: &Analyzer<'_, 'tcx>,
+    analyzer: &Analyzer<'_, '_, 'tcx>,
     writes: &mut HashMap<Location, HybridBitSet<usize>>,
 ) {
     let writes = writes
@@ -401,7 +476,7 @@ fn compute_bitfield_writes<'tcx>(
     ends: &[usize],
     solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
-    analyzer: &Analyzer<'_, 'tcx>,
+    analyzer: &Analyzer<'_, '_, 'tcx>,
     writes: &mut HashMap<Location, HybridBitSet<usize>>,
 ) {
     if args.len() != 2 {
@@ -450,13 +525,13 @@ fn add_edges(
     index: usize,
     graph: &mut LocGraph,
     index_prefixes: &mut HashMap<usize, u8>,
-) -> Node {
+) -> LocNode {
     let node = match ty {
-        TyShape::Primitive => return Node::new(0, index),
+        TyShape::Primitive => return LocNode::new(0, index),
         TyShape::Array(t, _) => {
             let succ = add_edges(t, index, graph, index_prefixes);
             let node = succ.parent();
-            graph.insert(node, Edges::Index(succ));
+            graph.insert(node, LocEdges::Index(succ));
             node
         }
         TyShape::Struct(_, ts) => {
@@ -465,7 +540,7 @@ fn add_edges(
                 .map(|(offset, t)| add_edges(t, index + offset, graph, index_prefixes))
                 .collect();
             let node = succs[0].parent();
-            graph.insert(node, Edges::Fields(succs));
+            graph.insert(node, LocEdges::Fields(succs));
             node
         }
     };
@@ -473,15 +548,15 @@ fn add_edges(
     node
 }
 
-pub type LocGraph = HashMap<Node, Edges>;
+pub type LocGraph = HashMap<LocNode, LocEdges>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Node {
+pub struct LocNode {
     pub prefix: u8,
     pub index: usize,
 }
 
-impl std::fmt::Debug for Node {
+impl std::fmt::Debug for LocNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.index)?;
         if self.prefix != 0 {
@@ -491,7 +566,7 @@ impl std::fmt::Debug for Node {
     }
 }
 
-impl Node {
+impl LocNode {
     fn new(prefix: u8, index: usize) -> Self {
         Self { prefix, index }
     }
@@ -504,16 +579,16 @@ impl Node {
     }
 }
 
-pub enum Edges {
-    Fields(Vec<Node>),
-    Index(Node),
-    Deref(Vec<Node>),
+pub enum LocEdges {
+    Fields(Vec<LocNode>),
+    Index(LocNode),
+    Deref(Vec<LocNode>),
 }
 
-impl std::fmt::Debug for Edges {
+impl std::fmt::Debug for LocEdges {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Edges::Fields(succs) => {
+            LocEdges::Fields(succs) => {
                 write!(f, "[")?;
                 for (i, succ) in succs.iter().enumerate() {
                     if i != 0 {
@@ -523,8 +598,8 @@ impl std::fmt::Debug for Edges {
                 }
                 write!(f, "]")
             }
-            Edges::Index(succ) => write!(f, "[_: {:?}]", succ),
-            Edges::Deref(succs) => {
+            LocEdges::Index(succ) => write!(f, "[_: {:?}]", succ),
+            LocEdges::Deref(succs) => {
                 write!(f, "[")?;
                 for (i, field) in succs.iter().enumerate() {
                     if i != 0 {
@@ -551,15 +626,14 @@ impl<'a, 'tcx> Context<'a, 'tcx> {
     }
 }
 
-struct Analyzer<'a, 'tcx> {
+struct Analyzer<'a, 'b, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    pre: &'b PreAnalysisData<'tcx>,
     tss: &'a TyShapes<'a, 'tcx>,
-    vars: HashMap<Var, usize>,
-    globals: HashMap<LocalDefId, usize>,
     graph: Graph,
 }
 
-impl<'tcx> Analyzer<'_, 'tcx> {
+impl<'tcx> Analyzer<'_, '_, 'tcx> {
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Context<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.locals, self.tcx).ty;
@@ -701,7 +775,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let var = Loc::new_root(self.globals.get(&def_id.as_local()?).copied()?);
+                        let var =
+                            Loc::new_root(self.pre.globals.get(&def_id.as_local()?).copied()?);
                         Some(PrefixedLoc::new_ref(var))
                     }
                     ConstValue::Slice { .. } => None,
@@ -767,11 +842,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     } else if is_extern {
                         if output.is_unsafe_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
-                            let loc = Loc::new_root(self.vars[&var]);
+                            let loc = Loc::new_root(self.pre.vars[&var]);
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                         }
                     } else {
-                        let mut index = self.globals[&local_def_id];
+                        let mut index = self.pre.globals[&local_def_id];
                         for (arg, arg_loc) in args.iter().zip(arg_locs) {
                             let ty = arg.ty(ctx.locals, self.tcx);
                             if let Some(arg) = arg_loc {
@@ -801,7 +876,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
 
     fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
         let var = Var::Local(def_id.as_local()?, Local::new(0));
-        let loc = Loc::new_root(self.vars.get(&var).copied()?);
+        let loc = Loc::new_root(self.pre.vars.get(&var).copied()?);
         Some(PrefixedLoc::new_ref(loc))
     }
 
@@ -830,7 +905,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
         }
         let var = Var::Local(ctx.owner, place.local);
-        let loc = Loc::new(self.vars[&var], index);
+        let loc = Loc::new(self.pre.vars[&var], index);
         PrefixedLoc::new(loc).with_deref(place.is_indirect_first_projection())
     }
 }

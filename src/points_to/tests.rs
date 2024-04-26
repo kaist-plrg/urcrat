@@ -29,7 +29,9 @@ where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
     run_compiler(&code, |tcx| {
         let arena = Arena::new();
         let tss = get_ty_shapes(&arena, tcx);
-        f(analyze(&tss, tcx), tcx)
+        let pre = pre_analyze(&tss, tcx);
+        let solutions = analyze(&pre, &tss, tcx);
+        f(post_analyze(pre, solutions, &tss, tcx), tcx)
     });
 }
 
