@@ -23,6 +23,7 @@ use crate::*;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub solutions: Option<points_to::Solutions>,
     pub unions: HashSet<String>,
 }
 
@@ -45,7 +46,10 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
     let pre = points_to::pre_analyze(&tss, tcx);
-    let solutions = points_to::analyze(&pre, &tss, tcx);
+    let solutions = conf
+        .solutions
+        .clone()
+        .unwrap_or_else(|| points_to::analyze(&pre, &tss, tcx));
     let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
 
     let mut accesses: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();

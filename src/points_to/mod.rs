@@ -28,23 +28,23 @@ use typed_arena::Arena;
 
 use crate::*;
 
-pub fn analyze_path(path: &Path) {
-    analyze_input(compile_util::path_to_input(path));
+pub fn analyze_path(path: &Path) -> Solutions {
+    analyze_input(compile_util::path_to_input(path))
 }
 
-pub fn analyze_str(code: &str) {
-    analyze_input(compile_util::str_to_input(code));
+pub fn analyze_str(code: &str) -> Solutions {
+    analyze_input(compile_util::str_to_input(code))
 }
 
-fn analyze_input(input: Input) {
+fn analyze_input(input: Input) -> Solutions {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
         let arena = Arena::new();
         let tss = get_ty_shapes(&arena, tcx);
         let pre = pre_analyze(&tss, tcx);
-        analyze(&pre, &tss, tcx);
+        analyze(&pre, &tss, tcx)
     })
-    .unwrap();
+    .unwrap()
 }
 
 #[derive(Debug)]
@@ -71,13 +71,15 @@ pub struct PreAnalysisData<'tcx> {
     var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 }
 
+pub type Solutions = Vec<HybridBitSet<usize>>;
+
 #[derive(Debug)]
 pub struct AnalysisResults {
     pub ends: Vec<usize>,
     pub graph: LocGraph,
     pub var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 
-    pub solutions: Vec<HybridBitSet<usize>>,
+    pub solutions: Solutions,
 
     pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
     pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
@@ -245,7 +247,7 @@ pub fn analyze<'a, 'tcx>(
     pre: &PreAnalysisData<'tcx>,
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> Vec<HybridBitSet<usize>> {
+) -> Solutions {
     let mut analyzer = Analyzer {
         tcx,
         tss,
@@ -264,13 +266,30 @@ pub fn analyze<'a, 'tcx>(
             analyzer.transfer_term(terminator, ctx, block);
         }
     }
-
     analyzer.graph.solve(&pre.ends)
+}
+
+pub fn solutions_to_string(solutions: &Solutions) -> String {
+    let v: Vec<Vec<_>> = solutions.iter().map(|s| s.iter().collect()).collect();
+    serde_json::to_string(&v).unwrap()
+}
+
+pub fn solutions_from_slice(s: &[u8]) -> Solutions {
+    let sols: Vec<Vec<usize>> = serde_json::from_slice(s).unwrap();
+    sols.iter()
+        .map(|v| {
+            let mut s = HybridBitSet::new_empty(sols.len());
+            for i in v {
+                s.insert(*i);
+            }
+            s
+        })
+        .collect()
 }
 
 pub fn post_analyze<'a, 'tcx>(
     mut pre: PreAnalysisData<'tcx>,
-    solutions: Vec<HybridBitSet<usize>>,
+    solutions: Solutions,
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> AnalysisResults {
@@ -913,7 +932,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
 type WeightedGraph = HashMap<usize, HashMap<usize, HashSet<usize>>>;
 
 struct Graph {
-    solutions: Vec<HybridBitSet<usize>>,
+    solutions: Solutions,
     zero_weight_edges: Vec<HybridBitSet<usize>>,
     pos_weight_edges: WeightedGraph,
     deref_eqs: WeightedGraph,
@@ -982,7 +1001,7 @@ impl Graph {
             .insert(proj);
     }
 
-    fn solve(self, ends: &[usize]) -> Vec<HybridBitSet<usize>> {
+    fn solve(self, ends: &[usize]) -> Solutions {
         let Self {
             mut solutions,
             mut zero_weight_edges,
