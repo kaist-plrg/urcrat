@@ -291,6 +291,28 @@ impl Obj {
         }
     }
 
+    fn project_mut_opt<'a>(&'a mut self, proj: &[AccElem]) -> Option<&'a mut Obj> {
+        if let Some(elem) = proj.get(0) {
+            let inner = match elem {
+                AccElem::Field(f, _) => {
+                    let Self::Struct(fs, _) = self else { return None };
+                    fs.get_mut(f)?
+                }
+                AccElem::Index(i) => {
+                    let Self::Array(vs) = self else { return None };
+                    vs.iter_mut().find_map(|(idx, obj)| match (idx, i) {
+                        (Index::Num(n1), Index::Num(n2)) if n1 == n2 => Some(obj),
+                        (Index::Sym(l1), Index::Sym(l2)) if !l1.is_disjoint(l2) => Some(obj),
+                        _ => None,
+                    })?
+                }
+            };
+            inner.project_mut_opt(&proj[1..])
+        } else {
+            Some(self)
+        }
+    }
+
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
         if let Some(elem) = proj.get(0) {
             let inner = match elem {
@@ -299,7 +321,7 @@ impl Obj {
                         *self = Self::Struct(HashMap::new(), *is_union);
                     }
                     let Self::Struct(fs, _) = self else { unreachable!() };
-                    if *is_union && write {
+                    if *is_union {
                         let keys: Vec<_> = fs.keys().copied().collect();
                         for k in keys {
                             if k != *f {
@@ -862,6 +884,10 @@ impl Graph {
         self.nodes[loc.root].project(&loc.projection)
     }
 
+    fn obj_at_location_mut_opt(&mut self, loc: &AbsLoc) -> Option<&mut Obj> {
+        self.nodes[loc.root].project_mut_opt(&loc.projection)
+    }
+
     fn obj_at_location_mut(&mut self, loc: &AbsLoc, write: bool) -> &mut Obj {
         self.nodes[loc.root].project_mut(&loc.projection, write)
     }
@@ -934,7 +960,7 @@ impl Graph {
             writes,
         };
         while let Some((loc, node)) = worklist.pop() {
-            let obj = self.obj_at_location_mut(&loc, false);
+            let obj = some_or!(self.obj_at_location_mut_opt(&loc), continue);
             let v = invalidate_rec(loc, obj, node, &mut visited, ctx);
             worklist.extend(v);
         }
