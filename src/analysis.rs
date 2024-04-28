@@ -5,15 +5,15 @@ use std::{
 
 use etrace::some_or;
 use relational::{AbsMem, AccPath, Obj};
-use rustc_abi::FieldIdx;
-use rustc_hir::{def_id::DefId, ItemKind};
+use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_hir::{def_id::DefId, definitions::DefPathDataName, ItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         visit::{PlaceContext, Visitor},
         HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
     },
-    ty::{TyCtxt, TyKind},
+    ty::{List, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::LocalDefId, Span};
@@ -41,6 +41,8 @@ fn analyze_input(input: Input, conf: &Config) {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
+    let hir = tcx.hir();
+
     let visitor = ty_finder::TyVisitor::new(tcx);
     let foreign_tys = visitor.find_foreign_tys(tcx);
     let arena = Arena::new();
@@ -52,9 +54,50 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         .unwrap_or_else(|| points_to::analyze(&pre, &tss, tcx));
     let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
 
+    for item_id in hir.items() {
+        let item = hir.item(item_id);
+        if !matches!(item.kind, ItemKind::Struct(_, _)) {
+            continue;
+        }
+        let local_def_id = item_id.owner_id.def_id;
+        if foreign_tys.contains(&local_def_id) {
+            continue;
+        }
+        let adt_def = tcx.adt_def(local_def_id);
+        let variant = adt_def.variant(VariantIdx::from_u32(0));
+        let has_int_field = variant
+            .fields
+            .iter()
+            .any(|f| f.ty(tcx, List::empty()).is_integral());
+        if !has_int_field && !tss.bitfields.contains_key(&local_def_id) {
+            continue;
+        }
+        let unions: Vec<_> = variant
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let TyKind::Adt(adt_def, _) = f.ty(tcx, List::empty()).kind() else { return None };
+                if !adt_def.is_union() {
+                    return None;
+                }
+                let def_id = adt_def.did();
+                let name = tcx.def_path(def_id).data.last().unwrap().data.name();
+                let DefPathDataName::Named(name) = name else { return None };
+                if name.to_ident_string().starts_with("C2RustUnnamed") {
+                    Some(def_id.expect_local())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !unions.is_empty() {
+            println!("{:?} {:?}", local_def_id, unions);
+        }
+    }
+
     let mut accesses: HashMap<_, BTreeMap<_, Vec<_>>> = HashMap::new();
-    for item_id in tcx.hir().items() {
-        let item = tcx.hir().item(item_id);
+    for item_id in hir.items() {
+        let item = hir.item(item_id);
         if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
             continue;
         }
