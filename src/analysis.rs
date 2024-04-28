@@ -11,7 +11,7 @@ use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         visit::{PlaceContext, Visitor},
-        Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
+        HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
     },
     ty::{TyCtxt, TyKind},
 };
@@ -68,7 +68,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             let states = relational::analyze_fn(local_def_id, &tss, &may_points_to, true, tcx);
             for access in &visitor.accesses {
                 let span = body.source_info(access.location).span;
-                let tags = compute_tags(*access, &states);
+                let tags = compute_tags(*access, &states, &body.local_decls, tcx);
                 let aa = AnalyzedAccess {
                     span,
                     ctx: access.ctx,
@@ -106,12 +106,17 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     }
 }
 
-fn compute_tags(access: FieldAccess<'_>, states: &HashMap<Location, AbsMem>) -> Vec<(u32, u128)> {
+fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
+    access: FieldAccess<'tcx>,
+    states: &HashMap<Location, AbsMem>,
+    local_decls: &D,
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(u32, u128)> {
     let state = some_or!(states.get(&access.location), return vec![]);
-    let (path, is_deref) = access.get_path(state);
+    let (path, is_deref) = access.get_path(state, local_decls, tcx);
     let g = state.g();
     let obj = some_or!(g.get_obj(&path, is_deref), return vec![]);
-    let Obj::Struct(fields) = obj else { return vec![] };
+    let Obj::Struct(fields, _) = obj else { return vec![] };
     let mut v: Vec<_> = fields
         .iter()
         .filter_map(|(f, obj)| {
@@ -209,13 +214,20 @@ struct FieldAccess<'tcx> {
     location: Location,
 }
 
-impl FieldAccess<'_> {
-    fn get_path(&self, state: &AbsMem) -> (AccPath, bool) {
+impl<'tcx> FieldAccess<'tcx> {
+    fn get_path<D: HasLocalDecls<'tcx> + ?Sized>(
+        &self,
+        state: &AbsMem,
+        local_decls: &D,
+        tcx: TyCtxt<'tcx>,
+    ) -> (AccPath, bool) {
         assert!(!self.projection.is_empty());
         AccPath::from_local_projection(
             self.local,
             &self.projection[..self.projection.len() - 1],
             state,
+            local_decls,
+            tcx,
         )
     }
 }

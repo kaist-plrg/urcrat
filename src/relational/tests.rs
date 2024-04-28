@@ -322,8 +322,14 @@ fn test_eq_ref_struct() {
 
             assert_eq!(n[&1].field(0).as_ptr(), n[&7].as_ptr());
 
-            assert_eq!(n[&5].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
-            assert_eq!(n[&6].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
+            assert_eq!(
+                n[&5].as_ptr(),
+                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+            );
+            assert_eq!(
+                n[&6].as_ptr(),
+                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+            );
         },
     );
 }
@@ -471,8 +477,14 @@ fn test_eq_ref_deref() {
             assert_eq!(n[&5].as_ptr(), &AbsLoc::new_root(i[&1]));
             assert_eq!(n[&6].as_ptr(), &AbsLoc::new_root(i[&1]));
 
-            assert_eq!(n[&7].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
-            assert_eq!(n[&8].as_ptr(), &AbsLoc::new(i[&1], vec![AccElem::Field(0)]));
+            assert_eq!(
+                n[&7].as_ptr(),
+                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+            );
+            assert_eq!(
+                n[&8].as_ptr(),
+                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+            );
         },
     );
 }
@@ -504,6 +516,37 @@ fn test_eq_union() {
             let n = get_nodes(&g, 1..=3);
             assert_eq!(n[&2].field(1).as_ptr(), n[&1].as_ptr());
             assert_eq!(n[&3].as_ptr(), n[&1].as_ptr());
+        },
+    );
+}
+
+#[test]
+fn test_union_field_eq() {
+    // _2 = const 0_i32
+    // _1 = u { x: move _2 }
+    // _3 = const 1_i32
+    // (_1.1: i32) = move _3
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union u {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: u = u { x: 0 as libc::c_int };
+        x.y = 1 as libc::c_int;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=3);
+            let Obj::Struct(fs, is_union) = &n[&1].obj else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 1);
+            assert_eq!(fs.get(&0), None);
+            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&3].as_ptr());
         },
     );
 }

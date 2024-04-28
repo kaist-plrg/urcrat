@@ -2,10 +2,11 @@ use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, Scalar},
-        AggregateKind, BinOp, CastKind, ConstantKind, Local, Location, Operand, Place, PlaceElem,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
+        AggregateKind, BinOp, CastKind, ConstantKind, HasLocalDecls, Local, Location, Operand,
+        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorKind, UnOp,
     },
-    ty::{adjustment::PointerCoercion, IntTy, Ty, TyKind, UintTy},
+    ty::{adjustment::PointerCoercion, IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
 use rustc_span::def_id::LocalDefId;
 
@@ -18,7 +19,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if l.projection.is_empty() {
             state.gm().invalidate_symbolic(l.local);
         }
-        let (l, l_deref) = AccPath::from_place(*l, state);
+        let (l, l_deref) = self.acc_path(*l, state);
         if let Some(writes) = self.get_assign_writes(stmt_loc) {
             let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
             state.gm().invalidate(
@@ -98,7 +99,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             Rvalue::Ref(_, _, r) => {
                 assert!(empty_suffix());
                 assert!(!l_deref);
-                let (r, r_deref) = AccPath::from_place(*r, state);
+                let (r, r_deref) = self.acc_path(*r, state);
                 state.gm().x_eq_ref_y(&l, &r, r_deref);
             }
             Rvalue::ThreadLocalRef(_) => {
@@ -108,7 +109,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             Rvalue::AddressOf(_, r) => {
                 assert!(empty_suffix());
                 assert_eq!(r.projection.len(), 1);
-                let (path, is_deref) = AccPath::from_place(*r, state);
+                let (path, is_deref) = self.acc_path(*r, state);
                 assert!(is_deref);
                 let v = OpVal::Place(path, false);
                 state.gm().assign(&l, l_deref, &v);
@@ -174,13 +175,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
-                    let l = l.extended(&[AccElem::Field(field.as_u32())]);
+                    let l = l.extended(&[AccElem::Field(field.as_u32(), true)]);
                     let suffixes = self.get_path_suffixes(&l, l_deref);
                     state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                 } else {
                     for (field, op) in rs.iter_enumerated() {
                         let v = self.transfer_op(op, state);
-                        let l = l.extended(&[AccElem::Field(field.as_u32())]);
+                        let l = l.extended(&[AccElem::Field(field.as_u32(), false)]);
                         let suffixes = self.get_path_suffixes(&l, l_deref);
                         state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
                     }
@@ -189,17 +190,17 @@ impl<'tcx> Analyzer<'tcx, '_> {
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
                 assert!(empty_suffix());
-                let (path, is_deref) = AccPath::from_place(*r, state);
+                let (path, is_deref) = self.acc_path(*r, state);
                 let v = OpVal::Place(path, is_deref);
                 state.gm().assign(&l, l_deref, &v);
             }
         }
     }
 
-    fn transfer_op(&self, op: &Operand<'_>, state: &AbsMem) -> OpVal {
+    fn transfer_op(&self, op: &Operand<'tcx>, state: &AbsMem) -> OpVal {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
-                let (path, is_deref) = AccPath::from_place(*place, state);
+                let (path, is_deref) = self.acc_path(*place, state);
                 if let Some(i) = state.g().get_x_as_int(&path, is_deref) {
                     OpVal::Int(i)
                 } else {
@@ -373,7 +374,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     block: *target,
                     statement_index: 0,
                 };
-                let (l, l_deref) = AccPath::from_place(*destination, &state);
+                let (l, l_deref) = self.acc_path(*destination, &state);
                 if let Some(writes) = self.get_assign_writes(term_loc) {
                     let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
                     state.gm().invalidate(
@@ -453,13 +454,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
     fn transfer_method_call(
         &self,
         f: LocalDefId,
-        args: &[Operand<'_>],
+        args: &[Operand<'tcx>],
         dst: &AccPath,
         loc: Location,
         state: &mut AbsMem,
     ) {
         let l = args[0].place().unwrap();
-        let (mut l, l_deref) = AccPath::from_place(l, state);
+        let (mut l, l_deref) = self.acc_path(l, state);
         assert!(!l_deref);
 
         if let Some(writes) = self.get_bitfield_writes(loc) {
@@ -478,14 +479,14 @@ impl<'tcx> Analyzer<'tcx, '_> {
             1 => {
                 let offset = self.get_bitfield_offset(ty, &method);
                 let mut r = l;
-                r.extend_projection(&[AccElem::Field(offset as _)]);
+                r.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = OpVal::Place(r, true);
                 state.gm().assign_with_suffixes(dst, false, &r, &[vec![]]);
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
                 let offset = self.get_bitfield_offset(ty, field);
-                l.extend_projection(&[AccElem::Field(offset as _)]);
+                l.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = self.transfer_op(&args[1], state);
                 state.gm().assign_with_suffixes(&l, true, &r, &[vec![]]);
             }
@@ -522,29 +523,33 @@ impl<'tcx> Analyzer<'tcx, '_> {
     fn transfer_rust_call(
         &self,
         name: (&str, &str, &str, &str),
-        args: &[Operand<'_>],
-        dst: &Place<'_>,
+        args: &[Operand<'tcx>],
+        dst: &Place<'tcx>,
         state: &mut AbsMem,
     ) {
-        let (d, d_deref) = AccPath::from_place(*dst, state);
+        let (d, d_deref) = self.acc_path(*dst, state);
         assert!(!d_deref);
         match name {
             ("slice", _, "as_ptr" | "as_mut_ptr", _) => {
                 let ptr = args[0].place().unwrap();
-                let (mut ptr, ptr_deref) = AccPath::from_place(ptr, state);
+                let (mut ptr, ptr_deref) = self.acc_path(ptr, state);
                 assert!(!ptr_deref);
                 ptr.projection.push(AccElem::num_index(0));
                 state.gm().x_eq_ref_y(&d, &ptr, true);
             }
             ("ptr", _, _, "offset") => {
                 let ptr = args[0].place().unwrap();
-                let (ptr, ptr_deref) = AccPath::from_place(ptr, state);
+                let (ptr, ptr_deref) = self.acc_path(ptr, state);
                 assert!(!ptr_deref);
                 let idx = self.transfer_op(&args[1], state);
                 state.gm().x_eq_offset(&d, &ptr, idx);
             }
             _ => {}
         }
+    }
+
+    fn acc_path(&self, place: Place<'tcx>, state: &AbsMem) -> (AccPath, bool) {
+        AccPath::from_place(place, state, &self.body.local_decls, self.tcx)
     }
 }
 
@@ -586,20 +591,29 @@ impl AccPath {
     }
 
     #[inline]
-    fn from_place(place: Place<'_>, state: &AbsMem) -> (Self, bool) {
-        Self::from_local_projection(place.local, place.projection, state)
+    fn from_place<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
+        place: Place<'tcx>,
+        state: &AbsMem,
+        local_decls: &D,
+        tcx: TyCtxt<'tcx>,
+    ) -> (Self, bool) {
+        Self::from_local_projection(place.local, place.projection, state, local_decls, tcx)
     }
 
-    pub fn from_local_projection(
+    pub fn from_local_projection<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
         local: Local,
-        proj: &[PlaceElem<'_>],
+        proj: &[PlaceElem<'tcx>],
         state: &AbsMem,
+        local_decls: &D,
+        tcx: TyCtxt<'tcx>,
     ) -> (Self, bool) {
-        let projections = proj
-            .iter()
-            .filter_map(|e| AccElem::from_elem(*e, state))
-            .collect();
         let is_deref = proj.get(0).map_or(false, |e| matches!(e, PlaceElem::Deref));
+        let mut projections = vec![];
+        for (i, e) in proj.iter().enumerate().skip(is_deref as usize) {
+            let ty = Place::ty_from(local, &proj[..i], local_decls, tcx).ty;
+            let elem = AccElem::from_elem(*e, ty, state);
+            projections.push(elem);
+        }
         (AccPath::new(local, projections), is_deref)
     }
 
@@ -617,16 +631,19 @@ impl AccPath {
 }
 
 impl AccElem {
-    fn from_elem(proj: PlaceElem<'_>, state: &AbsMem) -> Option<Self> {
+    fn from_elem(proj: PlaceElem<'_>, ty: Ty<'_>, state: &AbsMem) -> Self {
         match proj {
-            ProjectionElem::Deref => None,
-            ProjectionElem::Field(i, _) => Some(AccElem::Field(i.as_u32())),
+            ProjectionElem::Deref => unreachable!(),
+            ProjectionElem::Field(i, _) => {
+                let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
+                AccElem::Field(i.as_u32(), adt_def.is_union())
+            }
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);
                 if let Some(i) = state.g().get_x_as_int(&path, false) {
-                    Some(AccElem::num_index(i))
+                    AccElem::num_index(i)
                 } else {
-                    Some(AccElem::sym_index(state.g().find_aliases(local)))
+                    AccElem::sym_index(state.g().find_aliases(local))
                 }
             }
             ProjectionElem::ConstantIndex { .. } => unreachable!(),

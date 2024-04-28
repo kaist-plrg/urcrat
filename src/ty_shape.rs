@@ -150,7 +150,8 @@ fn compute_ty_shape<'a, 'tcx>(
                     .and_then(|local_def_id| tss.bitfields.get(&local_def_id))
                     .map(|fields| fields.len())
                     .unwrap_or_default();
-                compute_ty_shape_many(tys, bitfield_len, owner, tss, tcx)
+                let is_union = adt_def.is_union();
+                compute_ty_shape_many(tys, bitfield_len, is_union, owner, tss, tcx)
             }
         }
         TyKind::Array(ty, len) => {
@@ -163,7 +164,7 @@ fn compute_ty_shape<'a, 'tcx>(
                 .unwrap() as usize;
             tss.arena.alloc(TyShape::Array(t, len))
         }
-        TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, owner, tss, tcx),
+        TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, false, owner, tss, tcx),
         _ => tss.prim,
     };
     tss.tys.insert(ty, ts);
@@ -175,6 +176,7 @@ fn compute_ty_shape<'a, 'tcx>(
 fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
     tys: I,
     bitfield_len: usize,
+    is_union: bool,
     owner: DefId,
     tss: &mut TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
@@ -193,7 +195,7 @@ fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
     if len == 0 {
         tss.prim
     } else {
-        tss.arena.alloc(TyShape::Struct(len, fields))
+        tss.arena.alloc(TyShape::Struct(len, fields, is_union))
     }
 }
 
@@ -201,7 +203,7 @@ fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
 pub enum TyShape<'a> {
     Primitive,
     Array(&'a TyShape<'a>, usize),
-    Struct(usize, Vec<(usize, &'a TyShape<'a>)>),
+    Struct(usize, Vec<(usize, &'a TyShape<'a>)>, bool),
 }
 
 impl std::fmt::Debug for TyShape<'_> {
@@ -209,13 +211,17 @@ impl std::fmt::Debug for TyShape<'_> {
         match self {
             Self::Primitive => write!(f, "*"),
             Self::Array(t, len) => write!(f, "[{:?} * {}]", t, len),
-            Self::Struct(len, fields) => {
+            Self::Struct(len, fields, is_union) => {
                 write!(f, "[{}", len)?;
                 for (i, ts) in fields {
                     let sep = if *i == 0 { ";" } else { "," };
                     write!(f, "{} {}: {:?}", sep, i, ts)?;
                 }
-                write!(f, "]")
+                write!(f, "]")?;
+                if *is_union {
+                    write!(f, "u")?;
+                }
+                Ok(())
             }
         }
     }
@@ -228,7 +234,7 @@ impl TyShape<'_> {
         match self {
             Self::Primitive => 1,
             Self::Array(t, _) => t.len(),
-            Self::Struct(len, _) => *len,
+            Self::Struct(len, _, _) => *len,
         }
     }
 }

@@ -86,7 +86,7 @@ pub struct AnalysisResults {
 #[allow(missing_debug_implementations)]
 pub struct Analyzer<'tcx, 'a> {
     pub tcx: TyCtxt<'tcx>,
-    body: &'tcx Body<'tcx>,
+    pub body: &'tcx Body<'tcx>,
     rpo_map: HashMap<BasicBlock, usize>,
     dead_locals: Vec<BitSet<Local>>,
     pub local_def_id: LocalDefId,
@@ -253,9 +253,10 @@ impl<'a> WorkList<'a> {
 
 fn get_path_suffixes(ty: &TyShape<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
     match ty {
-        TyShape::Struct(_, tys) => {
+        TyShape::Struct(_, tys, is_union) => {
             if let Some(elem) = proj.get(0) {
-                let AccElem::Field(n) = elem else { unreachable!() };
+                let AccElem::Field(n, elem_is_union) = elem else { unreachable!() };
+                assert_eq!(is_union, elem_is_union);
                 get_path_suffixes(tys[*n as usize].1, &proj[1..])
             } else {
                 tys.iter()
@@ -263,7 +264,7 @@ fn get_path_suffixes(ty: &TyShape<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
                     .flat_map(|(i, (_, ty))| {
                         let mut suffixes = get_path_suffixes(ty, &[]);
                         for suffix in &mut suffixes {
-                            suffix.push(AccElem::Field(i as _));
+                            suffix.push(AccElem::Field(i as _, *is_union));
                         }
                         suffixes
                     })

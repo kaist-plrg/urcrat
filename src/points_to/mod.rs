@@ -481,7 +481,7 @@ fn compute_ends(ty: &TyShape<'_>, ends: &mut Vec<usize>) {
     match ty {
         TyShape::Primitive => ends.push(ends.len()),
         TyShape::Array(t, _) => compute_ends(t, ends),
-        TyShape::Struct(len, ts) => {
+        TyShape::Struct(len, ts, _) => {
             let end = ends.len();
             for (_, t) in ts {
                 compute_ends(t, ends);
@@ -595,7 +595,7 @@ fn add_edges(
             graph.insert(node, LocEdges::Index(succ));
             node
         }
-        TyShape::Struct(_, ts) => {
+        TyShape::Struct(_, ts, _) => {
             let succs: Vec<_> = ts
                 .iter()
                 .map(|(offset, t)| add_edges(t, index + offset, graph, index_prefixes))
@@ -779,7 +779,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     }
                 }
                 AggregateKind::Adt(_, v_idx, _, _, idx) => {
-                    let TyShape::Struct(_, ts) = self.tss.tys[&ty] else { unreachable!() };
+                    let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] else { unreachable!() };
                     let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
                     let variant = adt_def.variant(*v_idx);
                     for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
@@ -957,7 +957,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     ty = t;
                 }
                 PlaceElem::Field(f, _) => {
-                    let TyShape::Struct(_, fs) = ty else { unreachable!() };
+                    let TyShape::Struct(_, fs, _) = ty else { unreachable!() };
                     let (i, nested_ty) = fs[f.index()];
                     index += i;
                     ty = nested_ty;

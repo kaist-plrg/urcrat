@@ -124,14 +124,20 @@ impl Index {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccElem {
-    Field(u32),
+    Field(u32, bool),
     Index(Index),
 }
 
 impl std::fmt::Debug for AccElem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AccElem::Field(i) => write!(f, ".{}", i),
+            AccElem::Field(i, is_union) => {
+                write!(f, ".{}", i)?;
+                if *is_union {
+                    write!(f, "u")?;
+                }
+                Ok(())
+            }
             AccElem::Index(i) => write!(f, "[{:?}]", i),
         }
     }
@@ -198,8 +204,8 @@ impl AbsLoc {
     }
 
     #[inline]
-    fn push_field(mut self, i: u32) -> Self {
-        self.projection.push(AccElem::Field(i));
+    fn push_field(mut self, i: u32, is_union: bool) -> Self {
+        self.projection.push(AccElem::Field(i, is_union));
         self
     }
 
@@ -226,7 +232,7 @@ pub enum Obj {
     Top,
     AtAddr(u128),
     Ptr(AbsLoc),
-    Struct(HashMap<u32, Obj>),
+    Struct(HashMap<u32, Obj>, bool),
     Array(HashMap<Index, Obj>),
 }
 
@@ -236,7 +242,7 @@ impl std::fmt::Debug for Obj {
             Self::Top => write!(f, "T"),
             Self::AtAddr(n) => write!(f, "@{}", n),
             Self::Ptr(l) => write!(f, "{:?}", l),
-            Self::Struct(fs) => {
+            Self::Struct(fs, is_union) => {
                 write!(f, "[")?;
                 let mut v = fs.keys().cloned().collect::<Vec<_>>();
                 v.sort();
@@ -246,7 +252,11 @@ impl std::fmt::Debug for Obj {
                     }
                     write!(f, "{}: {:?}", k, fs[k])?;
                 }
-                write!(f, "]")
+                write!(f, "]")?;
+                if *is_union {
+                    write!(f, "u")?;
+                }
+                Ok(())
             }
             Self::Array(vs) => {
                 write!(f, "[")?;
@@ -268,7 +278,7 @@ impl Obj {
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
         if let Some(elem) = proj.get(0) {
             let inner = match (self, elem) {
-                (Self::Struct(fs), AccElem::Field(f)) => fs.get(f),
+                (Self::Struct(fs, _), AccElem::Field(f, _)) => fs.get(f),
                 (Self::Array(vs), AccElem::Index(i)) => {
                     vs.iter()
                         .find_map(|(idx, obj)| if idx.equiv(i) { Some(obj) } else { None })
@@ -284,11 +294,19 @@ impl Obj {
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
         if let Some(elem) = proj.get(0) {
             let inner = match elem {
-                AccElem::Field(f) => {
-                    if !matches!(self, Self::Struct(_)) {
-                        *self = Self::Struct(HashMap::new());
+                AccElem::Field(f, is_union) => {
+                    if !matches!(self, Self::Struct(_, _)) {
+                        *self = Self::Struct(HashMap::new(), *is_union);
                     }
-                    let Self::Struct(fs) = self else { unreachable!() };
+                    let Self::Struct(fs, _) = self else { unreachable!() };
+                    if *is_union && write {
+                        let keys: Vec<_> = fs.keys().copied().collect();
+                        for k in keys {
+                            if k != *f {
+                                fs.remove(&k);
+                            }
+                        }
+                    }
                     fs.entry(*f).or_insert(Obj::Top)
                 }
                 AccElem::Index(i) => {
@@ -341,7 +359,7 @@ impl Obj {
                     *loc = new_loc.clone();
                 }
             }
-            Self::Struct(fs) => {
+            Self::Struct(fs, _) => {
                 for obj in fs.values_mut() {
                     obj.substitute(old_loc, new_loc);
                 }
@@ -362,7 +380,7 @@ impl Obj {
                     curr_loc.projection.push(AccElem::num_index(0));
                 }
             }
-            Self::Struct(fs) => {
+            Self::Struct(fs, _) => {
                 for obj in fs.values_mut() {
                     obj.extend_loc(loc);
                 }
@@ -378,7 +396,7 @@ impl Obj {
     fn invalidate_symbolic(&mut self, local: Local) {
         match self {
             Self::Top | Self::AtAddr(_) | Self::Ptr(_) => {}
-            Self::Struct(fs) => {
+            Self::Struct(fs, _) => {
                 for obj in fs.values_mut() {
                     obj.invalidate_symbolic(local);
                 }
@@ -404,7 +422,7 @@ impl Obj {
                     elem.collect_locals(locals);
                 }
             }
-            Self::Struct(fs) => {
+            Self::Struct(fs, _) => {
                 for obj in fs.values() {
                     obj.collect_locals(locals);
                 }
@@ -424,7 +442,7 @@ impl Obj {
     }
 
     pub fn field(&self, i: u32) -> &Obj {
-        let Obj::Struct(fs) = self else { panic!() };
+        let Obj::Struct(fs, _) = self else { panic!() };
         fs.get(&i).unwrap()
     }
 
@@ -964,13 +982,13 @@ fn invalidate_rec(
 
             v
         }
-        Obj::Struct(fs) => {
+        Obj::Struct(fs, is_union) => {
             let mut v = vec![];
             if let points_to::LocEdges::Fields(fs2) = edges {
                 for (index, node) in fs2.iter().enumerate() {
                     let index = index as u32;
                     let obj = some_or!(fs.get_mut(&index), continue);
-                    let loc = loc.clone().push_field(index);
+                    let loc = loc.clone().push_field(index, *is_union);
                     v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                 }
             }
@@ -1022,12 +1040,13 @@ fn join_objs(
             };
             *obj = Obj::Ptr(AbsLoc::new(nid, l));
         }
-        (Obj::Struct(fs1), Obj::Struct(fs2)) => {
+        (Obj::Struct(fs1, u1), Obj::Struct(fs2, u2)) => {
+            assert_eq!(u1, u2);
             let mut fs = HashMap::new();
             for (f, obj1) in fs1 {
                 let obj2 = some_or!(fs2.get(f), continue);
                 let mut new_obj = Obj::Top;
-                let curr_loc = curr_loc.clone().push_field(*f);
+                let curr_loc = curr_loc.clone().push_field(*f, *u1);
                 join_objs(
                     obj1,
                     obj2,
@@ -1039,7 +1058,7 @@ fn join_objs(
                 );
                 fs.insert(*f, new_obj);
             }
-            *obj = Obj::Struct(fs);
+            *obj = Obj::Struct(fs, *u1);
         }
         (Obj::Array(vs1), Obj::Array(vs2)) => {
             let mut fs = HashMap::new();
@@ -1065,7 +1084,9 @@ fn cmp_projection(proj1: &[AccElem], proj2: &[AccElem]) -> Option<Vec<AccElem>> 
     let mut proj = vec![];
     for e in proj1.iter().zip(proj2) {
         match e {
-            (AccElem::Field(i1), AccElem::Field(i2)) if i1 == i2 => proj.push(AccElem::Field(*i1)),
+            (AccElem::Field(i1, u1), AccElem::Field(i2, u2)) if i1 == i2 && u1 == u2 => {
+                proj.push(AccElem::Field(*i1, *u1))
+            }
             (AccElem::Index(Index::Num(i1)), AccElem::Index(Index::Num(i2))) if i1 == i2 => {
                 proj.push(AccElem::num_index(*i1))
             }
@@ -1099,7 +1120,7 @@ fn ord_objs(
             }
             ord_projection(&l1.projection, &l2.projection)
         }
-        (Obj::Struct(fs1), Obj::Struct(fs2)) => fs2.iter().all(|(f, obj2)| {
+        (Obj::Struct(fs1, _), Obj::Struct(fs2, _)) => fs2.iter().all(|(f, obj2)| {
             let obj1 = some_or!(fs1.get(f), return false);
             ord_objs(obj1, obj2, id_set, remaining)
         }),
@@ -1121,7 +1142,7 @@ fn ord_projection(proj1: &[AccElem], proj2: &[AccElem]) -> bool {
     let mut b = true;
     for e in proj1.iter().zip(proj2) {
         match e {
-            (AccElem::Field(i1), AccElem::Field(i2)) if i1 == i2 => {}
+            (AccElem::Field(i1, u1), AccElem::Field(i2, u2)) if i1 == i2 && u1 == u2 => {}
             (AccElem::Index(Index::Num(i1)), AccElem::Index(Index::Num(i2))) if i1 == i2 => {}
             (AccElem::Index(Index::Sym(l1)), AccElem::Index(Index::Sym(l2))) => {
                 if l1.is_disjoint(l2) {
