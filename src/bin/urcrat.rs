@@ -41,27 +41,30 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    let start = std::time::Instant::now();
-    match args.command {
+    let elapsed = match args.command {
         Command::May { dump } => {
+            let start = std::time::Instant::now();
             let solutions = points_to::analyze_path(&file);
+            let elapsed = start.elapsed();
             if let Some(dump) = dump {
-                let s = points_to::solutions_to_string(&solutions);
-                std::fs::write(dump, s).unwrap();
+                let arr = points_to::serialize_solutions(&solutions);
+                std::fs::write(dump, arr).unwrap();
             }
+            elapsed
         }
         Command::Must { may, r#union } => {
             let solutions = may.map(|file| {
-                let s = std::fs::read(file).unwrap();
-                points_to::solutions_from_slice(&s)
+                let arr = std::fs::read(file).unwrap();
+                points_to::deserialize_solutions(&arr)
             });
             let conf = analysis::Config {
                 solutions,
                 unions: r#union.into_iter().collect(),
             };
+            let start = std::time::Instant::now();
             analysis::analyze_path(&file, &conf);
+            start.elapsed()
         }
-    }
-    let elapsed = start.elapsed();
+    };
     println!("{}", elapsed.as_millis());
 }

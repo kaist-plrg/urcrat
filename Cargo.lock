@@ -352,8 +352,6 @@ dependencies = [
  "etrace",
  "lazy_static",
  "rustfix",
- "serde",
- "serde_json",
  "tracing",
  "tracing-subscriber",
  "typed-arena",

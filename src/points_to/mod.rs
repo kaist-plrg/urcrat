@@ -269,22 +269,64 @@ pub fn analyze<'a, 'tcx>(
     analyzer.graph.solve(&pre.ends)
 }
 
-pub fn solutions_to_string(solutions: &Solutions) -> String {
-    let v: Vec<Vec<_>> = solutions.iter().map(|s| s.iter().collect()).collect();
-    serde_json::to_string(&v).unwrap()
+pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
+    let mut arr = vec![];
+    for v in solutions {
+        for mut i in v.iter() {
+            while i > 0 {
+                arr.push((i & 127) as u8);
+                i >>= 7;
+            }
+            arr.push(254);
+        }
+        arr.push(255);
+    }
+    arr.pop();
+
+    // let sol2 = deserialize_solutions(&arr);
+    // println!("{}", solutions.len());
+    // assert_eq!(solutions.len(), sol2.len());
+    // for (i, (v1, v2)) in solutions.iter().zip(&sol2).enumerate() {
+    //     let v1: HashSet<_> = v1.iter().collect();
+    //     let v2: HashSet<_> = v2.iter().collect();
+    //     if v1 != v2 {
+    //         v1.difference(&v2).for_each(|i| {
+    //             println!("Missing: {}", i);
+    //         });
+    //         v2.difference(&v1).for_each(|i| {
+    //             println!("Extra: {}", i);
+    //         });
+    //         panic!("Mismatch @ {}", i);
+    //     }
+    // }
+
+    arr
 }
 
-pub fn solutions_from_slice(s: &[u8]) -> Solutions {
-    let sols: Vec<Vec<usize>> = serde_json::from_slice(s).unwrap();
-    sols.iter()
-        .map(|v| {
-            let mut s = HybridBitSet::new_empty(sols.len());
-            for i in v {
-                s.insert(*i);
+pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
+    let size = arr.iter().filter(|n| **n == 255).count() + 1;
+    let mut solutions: Solutions = vec![HybridBitSet::new_empty(size)];
+    let mut s = &mut solutions[0];
+    let mut i = 0;
+    let mut len = 0;
+    for n in arr {
+        match *n {
+            255 => {
+                solutions.push(HybridBitSet::new_empty(size));
+                s = solutions.last_mut().unwrap();
             }
-            s
-        })
-        .collect()
+            254 => {
+                s.insert(i);
+                i = 0;
+                len = 0;
+            }
+            n => {
+                i |= (n as usize) << len;
+                len += 7;
+            }
+        }
+    }
+    solutions
 }
 
 pub fn post_analyze<'a, 'tcx>(
