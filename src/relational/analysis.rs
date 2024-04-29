@@ -41,20 +41,25 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
     let functions = may_points_to
         .call_graph
         .keys()
-        .map(|def_id| (*def_id, analyze_fn(*def_id, &tss, &may_points_to, gc, tcx)))
+        .map(|def_id| {
+            let body = tcx.optimized_mir(*def_id);
+            (
+                *def_id,
+                analyze_fn(*def_id, body, &tss, &may_points_to, gc, tcx),
+            )
+        })
         .collect();
     AnalysisResults { functions }
 }
 
 pub fn analyze_fn<'a, 'tcx>(
     local_def_id: LocalDefId,
+    body: &'tcx Body<'tcx>,
     tss: &'a TyShapes<'a, 'tcx>,
     may_points_to: &'a points_to::AnalysisResults,
     gc: bool,
     tcx: TyCtxt<'tcx>,
 ) -> HashMap<Location, AbsMem> {
-    let def_id = local_def_id.to_def_id();
-    let body = tcx.optimized_mir(def_id);
     // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);

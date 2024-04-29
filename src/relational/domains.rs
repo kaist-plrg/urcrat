@@ -688,6 +688,36 @@ impl Graph {
         }
     }
 
+    pub fn objs_at(&self, l: Local, proj: &[crate::analysis::AccElem]) -> Vec<&Obj> {
+        let id = some_or!(self.locals.get(&l), return vec![]);
+        self.obj_at_rec(&self.nodes[*id].obj, proj)
+    }
+
+    fn obj_at_rec<'a>(&'a self, obj: &'a Obj, proj: &[crate::analysis::AccElem]) -> Vec<&'a Obj> {
+        if let Some(elem) = proj.get(0) {
+            match elem {
+                crate::analysis::AccElem::Field(f) => {
+                    let Obj::Struct(fs, _) = obj else { return vec![] };
+                    let obj = some_or!(fs.get(f), return vec![]);
+                    self.obj_at_rec(obj, &proj[1..])
+                }
+                crate::analysis::AccElem::Index => {
+                    let Obj::Array(vs) = obj else { return vec![] };
+                    vs.values()
+                        .flat_map(|obj| self.obj_at_rec(obj, &proj[1..]))
+                        .collect()
+                }
+                crate::analysis::AccElem::Deref => {
+                    let Obj::Ptr(loc) = obj else { return vec![] };
+                    let obj = some_or!(self.obj_at_location(loc), return vec![]);
+                    self.obj_at_rec(obj, &proj[1..])
+                }
+            }
+        } else {
+            vec![obj]
+        }
+    }
+
     pub fn get_obj(&self, x: &AccPath, deref: bool) -> Option<&Obj> {
         if deref {
             let id = self.locals.get(&x.local)?;

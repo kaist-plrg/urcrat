@@ -37,13 +37,26 @@ impl<'tcx> TyVisitor<'tcx> {
         }
     }
 
-    pub fn find_foreign_tys(mut self, tcx: TyCtxt<'tcx>) -> HashSet<LocalDefId> {
+    pub fn find_foreign_tys(
+        mut self,
+        tcx: TyCtxt<'tcx>,
+    ) -> (HashSet<LocalDefId>, HashSet<LocalDefId>) {
         tcx.hir().visit_all_item_likes_in_crate(&mut self);
-        self.foreign_types
+        let ftypes: HashSet<_> = self
+            .foreign_types
             .into_iter()
             .flat_map(|id| graph::reachable_vertices(&self.type_graph, id, self.tys.len()))
-            .map(|id| self.tys[id])
-            .collect()
+            .collect();
+        let mut local_types = HashSet::new();
+        let mut foreign_types = HashSet::new();
+        for (i, ty) in self.tys.iter().enumerate() {
+            if ftypes.contains(&i) {
+                foreign_types.insert(*ty);
+            } else {
+                local_types.insert(*ty);
+            }
+        }
+        (local_types, foreign_types)
     }
 
     fn ty_to_id(&mut self, ty: LocalDefId) -> usize {
