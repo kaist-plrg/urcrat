@@ -648,9 +648,9 @@ impl Graph {
         };
         let obj = some_or!(self.obj_at_location(loc), return);
         let Obj::Struct(fields, is_union) = obj else { return };
-        assert_eq!(fields.len(), 1);
         assert!(*is_union);
-        let (f, _) = fields.iter().next().unwrap();
+        assert!(fields.len() <= 1);
+        let (f, _) = some_or!(fields.iter().next(), return);
 
         let l = l.extended(&[AccElem::Field(*f, true)]);
         let r = r.extended(&[AccElem::Field(*f, true)]);

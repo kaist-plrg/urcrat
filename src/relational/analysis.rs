@@ -55,7 +55,7 @@ pub fn analyze_fn<'a, 'tcx>(
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    println!("{}", compile_util::body_to_str(body));
+    // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
