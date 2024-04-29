@@ -1,4 +1,4 @@
-use rustc_abi::FieldIdx;
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_middle::{
     mir::{
         interpret::{ConstValue, Scalar},
@@ -19,6 +19,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if l.projection.is_empty() {
             state.gm().invalidate_symbolic(l.local);
         }
+        let lty = Place::ty(l, &self.body.local_decls, self.tcx).ty;
         let (l, l_deref) = self.acc_path(*l, state);
         if let Some(writes) = self.get_assign_writes(stmt_loc) {
             let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
@@ -30,17 +31,16 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 writes,
             );
         }
-        let suffixes = self.get_path_suffixes(&l, l_deref);
-        let empty_suffix = || suffixes.iter().all(|s| s.is_empty());
         match r {
             Rvalue::Use(r) => {
                 let r = self.transfer_op(r, state);
-                state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                state
+                    .gm()
+                    .assign_with_ty(&l, l_deref, &r, self.tss.tys[&lty]);
             }
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
-                    assert!(empty_suffix());
-                    let rty = self.ty(r);
+                    let rty = r.ty(&self.body.local_decls, self.tcx);
                     let r = self.transfer_op(r, state);
                     if let OpVal::Int(v) = r {
                         let v = match ty.kind() {
@@ -74,40 +74,39 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     | PointerCoercion::ArrayToPointer => {
                         state
                             .gm()
-                            .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
+                            .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&lty]);
                     }
                     PointerCoercion::MutToConstPointer | PointerCoercion::Unsize => {
                         let r = self.transfer_op(r, state);
-                        state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                        state
+                            .gm()
+                            .assign_with_ty(&l, l_deref, &r, self.tss.tys[&lty]);
                     }
                 },
                 _ => {
                     state
                         .gm()
-                        .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
+                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&lty]);
                 }
             },
             Rvalue::Repeat(r, len) => {
                 let r = self.transfer_op(r, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
+                let TyKind::Array(ty, _) = lty.kind() else { unreachable!() };
                 for i in 0..len.min(10) {
                     let l = l.extended(&[AccElem::num_index(i as _)]);
-                    let suffixes = self.get_path_suffixes(&l, l_deref);
-                    state.gm().assign_with_suffixes(&l, l_deref, &r, &suffixes);
+                    state.gm().assign_with_ty(&l, l_deref, &r, self.tss.tys[ty]);
                 }
             }
             Rvalue::Ref(_, _, r) => {
-                assert!(empty_suffix());
                 assert!(!l_deref);
                 let (r, r_deref) = self.acc_path(*r, state);
                 state.gm().x_eq_ref_y(&l, &r, r_deref);
             }
             Rvalue::ThreadLocalRef(_) => {
-                assert!(empty_suffix());
                 state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::AddressOf(_, r) => {
-                assert!(empty_suffix());
                 assert_eq!(r.projection.len(), 1);
                 let (path, is_deref) = self.acc_path(*r, state);
                 assert!(is_deref);
@@ -116,8 +115,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             Rvalue::Len(_) => unreachable!(),
             Rvalue::BinaryOp(op, box (r1, r2)) => {
-                assert!(empty_suffix());
-                let ty = self.ty(r1);
+                let ty = r1.ty(&self.body.local_decls, self.tcx);
                 let r1 = self.transfer_op(r1, state);
                 let r2 = self.transfer_op(r2, state);
                 if let (OpVal::Int(v1), OpVal::Int(v2)) = (r1, r2) {
@@ -147,8 +145,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
-                assert!(empty_suffix());
-                let ty = self.ty(r);
+                let ty = r.ty(&self.body.local_decls, self.tcx);
                 let r = self.transfer_op(r, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
@@ -162,7 +159,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             Rvalue::NullaryOp(_, _) => unreachable!(),
             Rvalue::Discriminant(_) => {
-                assert!(empty_suffix());
                 state.gm().assign(&l, l_deref, &OpVal::Other);
             }
             Rvalue::Aggregate(box kind, rs) => {
@@ -176,20 +172,39 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
                     let l = l.extended(&[AccElem::Field(field.as_u32(), true)]);
-                    let suffixes = self.get_path_suffixes(&l, l_deref);
-                    state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
+                    let TyKind::Adt(adt_def, gargs) = lty.kind() else { unreachable!() };
+                    let variant = adt_def.variant(VariantIdx::from_u32(0));
+                    let ty = variant.fields[*field].ty(self.tcx, gargs);
+                    state
+                        .gm()
+                        .assign_with_ty(&l, l_deref, &v, self.tss.tys[&ty]);
                 } else {
-                    for (field, op) in rs.iter_enumerated() {
+                    let tys = match lty.kind() {
+                        TyKind::Adt(adt_def, gargs) => {
+                            let AggregateKind::Adt(_, v_idx, _, _, _) = kind else {
+                                unreachable!()
+                            };
+                            let variant = adt_def.variant(*v_idx);
+                            variant
+                                .fields
+                                .iter()
+                                .map(|f| f.ty(self.tcx, gargs))
+                                .collect()
+                        }
+                        TyKind::Array(ty, _) => vec![*ty; rs.len()],
+                        _ => unreachable!(),
+                    };
+                    for ((field, op), ty) in rs.iter_enumerated().zip(tys) {
                         let v = self.transfer_op(op, state);
                         let l = l.extended(&[AccElem::Field(field.as_u32(), false)]);
-                        let suffixes = self.get_path_suffixes(&l, l_deref);
-                        state.gm().assign_with_suffixes(&l, l_deref, &v, &suffixes);
+                        state
+                            .gm()
+                            .assign_with_ty(&l, l_deref, &v, self.tss.tys[&ty]);
                     }
                 }
             }
             Rvalue::ShallowInitBox(_, _) => unreachable!(),
             Rvalue::CopyForDeref(r) => {
-                assert!(empty_suffix());
                 let (path, is_deref) = self.acc_path(*r, state);
                 let v = OpVal::Place(path, is_deref);
                 state.gm().assign(&l, l_deref, &v);
@@ -432,10 +447,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     }
                 };
                 if need_update {
-                    let suffixes = self.get_path_suffixes(&l, l_deref);
+                    let ty = Place::ty(destination, &self.body.local_decls, self.tcx).ty;
                     state
                         .gm()
-                        .assign_with_suffixes(&l, l_deref, &OpVal::Other, &suffixes);
+                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&ty]);
                 }
                 vec![(location, state)]
             }
@@ -477,18 +492,18 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (ty, method) = points_to::receiver_and_method(f, self.tcx).unwrap();
         match args.len() {
             1 => {
-                let offset = self.get_bitfield_offset(ty, &method);
+                let offset = self.tss.bitfields[&ty][&method];
                 let mut r = l;
                 r.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = OpVal::Place(r, true);
-                state.gm().assign_with_suffixes(dst, false, &r, &[vec![]]);
+                state.gm().assign(dst, false, &r);
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
-                let offset = self.get_bitfield_offset(ty, field);
+                let offset = self.tss.bitfields[&ty][field];
                 l.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = self.transfer_op(&args[1], state);
-                state.gm().assign_with_suffixes(&l, true, &r, &[vec![]]);
+                state.gm().assign(&l, true, &r);
             }
             _ => unreachable!(),
         }

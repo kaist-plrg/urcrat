@@ -7,10 +7,8 @@ use rustc_data_structures::graph::WithSuccessors;
 use rustc_hir::def_id::DefId;
 use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::{
-    mir::{
-        BasicBlock, BinOp, Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind,
-    },
-    ty::{Ty, TyCtxt},
+    mir::{BasicBlock, BinOp, Body, Local, Location, Rvalue, StatementKind, TerminatorKind},
+    ty::TyCtxt,
 };
 use rustc_mir_dataflow::Analysis;
 use rustc_session::config::Input;
@@ -57,7 +55,7 @@ pub fn analyze_fn<'a, 'tcx>(
 ) -> HashMap<Location, AbsMem> {
     let def_id = local_def_id.to_def_id();
     let body = tcx.optimized_mir(def_id);
-    // println!("{}", compile_util::body_to_str(body));
+    println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
@@ -87,16 +85,16 @@ pub struct AnalysisResults {
 pub struct Analyzer<'tcx, 'a> {
     pub tcx: TyCtxt<'tcx>,
     pub body: &'tcx Body<'tcx>,
-    rpo_map: HashMap<BasicBlock, usize>,
-    dead_locals: Vec<BitSet<Local>>,
+    pub rpo_map: HashMap<BasicBlock, usize>,
+    pub dead_locals: Vec<BitSet<Local>>,
     pub local_def_id: LocalDefId,
-    discriminant_values: HashMap<BasicBlock, DiscrVal>,
-    tss: &'a TyShapes<'a, 'tcx>,
+    pub discriminant_values: HashMap<BasicBlock, DiscrVal>,
+    pub tss: &'a TyShapes<'a, 'tcx>,
     pub may_points_to: &'a points_to::AnalysisResults,
-    gc: bool,
+    pub gc: bool,
 }
 
-impl<'tcx> Analyzer<'tcx, '_> {
+impl Analyzer<'_, '_> {
     fn analyze(&self) -> HashMap<Location, AbsMem> {
         let bot = AbsMem::bot();
 
@@ -141,24 +139,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
         states
     }
 
-    pub fn get_path_suffixes(&self, path: &AccPath, deref: bool) -> Vec<Vec<AccElem>> {
-        let ty = self.body.local_decls[path.local].ty;
-        let ty = if deref {
-            points_to::unwrap_ptr(ty).unwrap()
-        } else {
-            ty
-        };
-        let mut suffixes = get_path_suffixes(self.tss.tys[&ty], &path.projection);
-        for suffix in &mut suffixes {
-            suffix.reverse();
-        }
-        suffixes
-    }
-
-    pub fn ty(&self, operand: &Operand<'tcx>) -> Ty<'tcx> {
-        operand.ty(&self.body.local_decls, self.tcx)
-    }
-
     pub fn resolve_indirect_call(&self, loc: Location) -> &[LocalDefId] {
         &self.may_points_to.indirect_calls[&self.local_def_id][&loc.block]
     }
@@ -170,10 +150,6 @@ impl<'tcx> Analyzer<'tcx, '_> {
         } else {
             Some(w)
         }
-    }
-
-    pub fn get_bitfield_offset(&self, ty: LocalDefId, field: &str) -> usize {
-        self.tss.bitfields[&ty][field]
     }
 
     pub fn get_bitfield_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
@@ -248,49 +224,6 @@ impl<'a> WorkList<'a> {
         let block_idx = self.rpo_map[&location.block];
         self.locations
             .insert((block_idx, location.statement_index), location);
-    }
-}
-
-fn get_path_suffixes(ty: &TyShape<'_>, proj: &[AccElem]) -> Vec<Vec<AccElem>> {
-    match ty {
-        TyShape::Struct(_, tys, is_union) => {
-            if let Some(elem) = proj.get(0) {
-                let AccElem::Field(n, elem_is_union) = elem else { unreachable!() };
-                assert_eq!(is_union, elem_is_union);
-                get_path_suffixes(tys[*n as usize].1, &proj[1..])
-            } else {
-                tys.iter()
-                    .enumerate()
-                    .flat_map(|(i, (_, ty))| {
-                        let mut suffixes = get_path_suffixes(ty, &[]);
-                        for suffix in &mut suffixes {
-                            suffix.push(AccElem::Field(i as _, *is_union));
-                        }
-                        suffixes
-                    })
-                    .collect()
-            }
-        }
-        TyShape::Array(ty, len) => {
-            if let Some(elem) = proj.get(0) {
-                assert!(matches!(elem, AccElem::Index(_)));
-                get_path_suffixes(ty, &proj[1..])
-            } else {
-                (0..(*len).min(10))
-                    .flat_map(|i| {
-                        let mut suffixes = get_path_suffixes(ty, &[]);
-                        for suffix in &mut suffixes {
-                            suffix.push(AccElem::num_index(i as _));
-                        }
-                        suffixes
-                    })
-                    .collect()
-            }
-        }
-        TyShape::Primitive => {
-            assert!(proj.is_empty());
-            vec![vec![]]
-        }
     }
 }
 

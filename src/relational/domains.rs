@@ -6,7 +6,7 @@ use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
 
 use super::*;
-use crate::points_to;
+use crate::{points_to, ty_shape::TyShape};
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -630,17 +630,61 @@ impl Graph {
         }
     }
 
-    pub fn assign_with_suffixes(
+    pub fn assign_union<'a, T>(
         &mut self,
         l: &AccPath,
         l_deref: bool,
         r: &OpVal,
-        suffixes: &[Vec<AccElem>],
+        tys: &[(T, &'a TyShape<'a>)],
     ) {
-        for suffix in suffixes {
-            let l = l.extended(suffix);
-            let r = r.extended(suffix);
-            self.assign(&l, l_deref, &r);
+        let OpVal::Place(r_path, r_deref) = r else { return };
+        let loc = some_or!(self.path_to_loc(r_path.clone()), return);
+        let loc = if *r_deref {
+            let obj = some_or!(self.obj_at_location(&loc), return);
+            let Obj::Ptr(loc) = obj else { return };
+            loc
+        } else {
+            &loc
+        };
+        let obj = some_or!(self.obj_at_location(loc), return);
+        let Obj::Struct(fields, is_union) = obj else { return };
+        assert_eq!(fields.len(), 1);
+        assert!(*is_union);
+        let (f, _) = fields.iter().next().unwrap();
+
+        let l = l.extended(&[AccElem::Field(*f, true)]);
+        let r = r.extended(&[AccElem::Field(*f, true)]);
+        let ty = tys[*f as usize].1;
+        self.assign_with_ty(&l, l_deref, &r, ty);
+    }
+
+    pub fn assign_with_ty<'a>(
+        &mut self,
+        l: &AccPath,
+        l_deref: bool,
+        r: &OpVal,
+        ty: &'a TyShape<'a>,
+    ) {
+        match ty {
+            TyShape::Primitive => self.assign(l, l_deref, r),
+            TyShape::Array(ty, len) => {
+                for i in 0..(*len).min(10) {
+                    let l = l.extended(&[AccElem::num_index(i as _)]);
+                    let r = r.extended(&[AccElem::num_index(i as _)]);
+                    self.assign_with_ty(&l, l_deref, &r, ty);
+                }
+            }
+            TyShape::Struct(_, tys, is_union) => {
+                if *is_union {
+                    self.assign_union(l, l_deref, r, tys);
+                } else {
+                    for (i, (_, ty)) in tys.iter().enumerate() {
+                        let l = l.extended(&[AccElem::Field(i as _, false)]);
+                        let r = r.extended(&[AccElem::Field(i as _, false)]);
+                        self.assign_with_ty(&l, l_deref, &r, ty);
+                    }
+                }
+            }
         }
     }
 

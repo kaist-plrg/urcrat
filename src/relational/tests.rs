@@ -490,7 +490,38 @@ fn test_eq_ref_deref() {
 }
 
 #[test]
-fn test_eq_union() {
+fn test_eq_union_first() {
+    // _2 = const 0_i32
+    // _1 = u { x: move _2 }
+    // _3 = (_1.0: i32)
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union u {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        ",
+        "",
+        "
+        let mut x: u = u { x: 0 as libc::c_int };
+        let mut y: libc::c_int = x.x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=3);
+            let Obj::Struct(fs, is_union) = &n[&1].obj else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 1);
+            assert_eq!(fs.get(&0).unwrap().as_ptr(), n[&2].as_ptr());
+            assert_eq!(fs.get(&0).unwrap().as_ptr(), n[&3].as_ptr());
+            assert_eq!(fs.get(&1), None);
+        },
+    );
+}
+
+#[test]
+fn test_eq_union_second() {
     // _1 = const 0_i32
     // _2 = u { x: _1 }
     // _3 = (_2.1: i32)
@@ -514,8 +545,12 @@ fn test_eq_union() {
         ",
         |g, _, _| {
             let n = get_nodes(&g, 1..=3);
-            assert_eq!(n[&2].field(1).as_ptr(), n[&1].as_ptr());
-            assert_eq!(n[&3].as_ptr(), n[&1].as_ptr());
+            let Obj::Struct(fs, is_union) = &n[&2].obj else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 1);
+            assert_eq!(fs.get(&0), None);
+            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&1].as_ptr());
+            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&3].as_ptr());
         },
     );
 }
@@ -547,6 +582,115 @@ fn test_union_field_eq() {
             assert_eq!(fs.len(), 1);
             assert_eq!(fs.get(&0), None);
             assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&3].as_ptr());
+        },
+    );
+}
+
+#[test]
+fn test_union_eq_first() {
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union u {
+            pub x: s,
+            pub y: s,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: libc::c_int,
+            pub y: u,
+        }
+        ",
+        "",
+        "
+        let mut x: t = t {
+            x: 0,
+            y: u { x: s { x: 0, y: 0 } },
+        };
+        let mut y: t = x;
+        let mut z: *mut t = &mut y;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=4);
+            let Obj::Struct(fs, is_union) = n[&4].field(1) else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 1);
+            assert_eq!(
+                n[&4].field(1).field(0).field(0).as_ptr(),
+                n[&1].field(1).field(0).field(0).as_ptr()
+            );
+            assert_eq!(
+                n[&4].field(1).field(0).field(1).as_ptr(),
+                n[&1].field(1).field(0).field(1).as_ptr()
+            );
+        },
+    );
+}
+
+#[test]
+fn test_union_eq_second() {
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union u {
+            pub x: s,
+            pub y: s,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct t {
+            pub x: libc::c_int,
+            pub y: u,
+        }
+        ",
+        "",
+        "
+        let mut x: t = {
+            let mut init = t {
+                x: 0 as libc::c_int,
+                y: u {
+                    y: {
+                        let mut init = s {
+                            x: 0 as libc::c_int,
+                            y: 0 as libc::c_int,
+                        };
+                        init
+                    },
+                },
+            };
+            init
+        };
+        let mut y: t = x;
+        let mut z: *mut t = &mut y;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=7);
+            let Obj::Struct(fs, is_union) = n[&7].field(1) else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 1);
+            assert_eq!(
+                n[&7].field(1).field(1).field(0).as_ptr(),
+                n[&1].field(1).field(1).field(0).as_ptr()
+            );
+            assert_eq!(
+                n[&7].field(1).field(1).field(1).as_ptr(),
+                n[&1].field(1).field(1).field(1).as_ptr()
+            );
         },
     );
 }
