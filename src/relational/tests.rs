@@ -2104,3 +2104,43 @@ fn test_bitfield_deref_eq_invalidate() {
         },
     );
 }
+
+#[test]
+fn test_union_invalidate() {
+    // _2 = u { x: const 0_i32 }
+    // _1 = s { x: const 0_i32, y: move _2 }
+    // _5 = &mut _1
+    // _4 = &raw mut (*_5)
+    // _3 = g(move _4) -> [return: bb1, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub union u {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: u,
+        }
+        pub unsafe extern \"C\" fn g(mut x: *mut s) {
+            let mut y: u = u { x: 0 as libc::c_int };
+            (*x).y = y;
+        }
+        ",
+        "",
+        "
+        let mut x: s = s { x: 0, y: u { x: 0 } };
+        g(&mut x);
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=1);
+            let Obj::Struct(fs, is_union) = &n[&1].field(1) else { unreachable!() };
+            assert!(is_union);
+            assert_eq!(fs.len(), 0);
+        },
+    );
+}
