@@ -282,24 +282,6 @@ pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
         arr.push(255);
     }
     arr.pop();
-
-    // let sol2 = deserialize_solutions(&arr);
-    // println!("{}", solutions.len());
-    // assert_eq!(solutions.len(), sol2.len());
-    // for (i, (v1, v2)) in solutions.iter().zip(&sol2).enumerate() {
-    //     let v1: HashSet<_> = v1.iter().collect();
-    //     let v2: HashSet<_> = v2.iter().collect();
-    //     if v1 != v2 {
-    //         v1.difference(&v2).for_each(|i| {
-    //             println!("Missing: {}", i);
-    //         });
-    //         v2.difference(&v1).for_each(|i| {
-    //             println!("Extra: {}", i);
-    //         });
-    //         panic!("Mismatch @ {}", i);
-    //     }
-    // }
-
     arr
 }
 
@@ -510,7 +492,7 @@ fn compute_writes<'tcx>(
     if l.deref {
         for loc in solutions[l.var.root].iter() {
             let loc = loc + l.var.proj;
-            let end = ends[loc];
+            let end = *some_or!(ends.get(loc), continue);
             for i in 0..len {
                 if loc + i > end {
                     break;

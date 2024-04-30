@@ -1,23 +1,22 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
 };
 
 use etrace::some_or;
-use relational::{AbsMem, AccPath, Obj};
+use relational::Obj;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_hir::{definitions::DefPathDataName, ItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         visit::{PlaceContext, Visitor},
-        AggregateKind, HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
-        Rvalue,
+        AggregateKind, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem, Rvalue,
     },
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::LocalDefId, Span};
+use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
 
 use crate::*;
@@ -122,6 +121,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         })
         .collect();
 
+    let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<_>>> = HashMap::new();
+    let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, Vec<_>>>>> =
+        HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let local_def_id = item_id.owner_id.def_id;
@@ -161,16 +163,21 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         }
         println!("{:?}", local_def_id);
         let states = relational::analyze_fn(local_def_id, body, &tss, &may_points_to, true, tcx);
-        for (_loc, mem) in &states {
+        for (loc, mem) in &states {
+            let Location {
+                block,
+                statement_index,
+            } = *loc;
+            let span = body.source_info(*loc).span;
             let g = mem.g();
-            for (_u, paths) in &local_to_unions {
+            for (u, paths) in &local_to_unions {
                 for (l, path) in paths {
                     let len = path.len();
                     let AccElem::Field(f) = path[len - 1] else { unreachable!() };
                     let objs = g.objs_at(*l, &path[..len - 1]);
                     for obj in objs {
                         let Obj::Struct(fs, _) = obj else { continue };
-                        let mut v: Vec<_> = fs
+                        let v: Vec<_> = fs
                             .iter()
                             .filter_map(|(f, obj)| {
                                 let Obj::Ptr(loc) = obj else { return None };
@@ -179,7 +186,17 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                 Some((*f, *n))
                             })
                             .collect();
-                        v.sort_by_key(|(f, _)| *f);
+                        for (f, n) in &v {
+                            tag_values
+                                .entry(*u)
+                                .or_default()
+                                .entry(*f)
+                                .or_default()
+                                .insert(*n);
+                        }
+                        if body.basic_blocks[block].statements.len() > statement_index {
+                            continue;
+                        }
                         let uv = fs
                             .get(&f)
                             .map(|obj| {
@@ -187,49 +204,72 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                 fs.keys().cloned().collect()
                             })
                             .unwrap_or_default();
-                        println!("{:?} {:?}", v, uv);
+                        if uv.len() == 1 {
+                            let variant = uv[0];
+                            for (f, n) in &v {
+                                variant_tag_values
+                                    .entry(*u)
+                                    .or_default()
+                                    .entry(*f)
+                                    .or_default()
+                                    .entry(variant)
+                                    .or_default()
+                                    .entry(*n)
+                                    .or_default()
+                                    .push(span);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // for access in &visitor.accesses {
-    //     let span = body.source_info(access.location).span;
-    //     let tags = compute_tags(*access, &states, &body.local_decls, tcx);
-    //     let aa = AnalyzedAccess {
-    //         span,
-    //         ctx: access.ctx,
-    //         tags,
-    //     };
-    //     accesses
-    //         .entry(access.ty)
-    //         .or_default()
-    //         .entry(access.field)
-    //         .or_default()
-    //         .push(aa);
-    // }
-
-    // let source_map = tcx.sess.source_map();
-    // for (ty, accesses) in accesses {
-    //     println!("[[Type {:?}]]", ty);
-    //     for (f, accesses) in accesses {
-    //         println!("[Field {:?}]", f);
-    //         for aa in accesses {
-    //             let fname = source_map.span_to_filename(aa.span);
-    //             let file_name = fname.prefer_remapped().to_string();
-    //             let file = source_map.get_source_file(&fname).unwrap();
-    //             let (line, _, _) = file.lookup_file_pos_with_col_display(aa.span.lo());
-    //             let tags: String = aa
-    //                 .tags
-    //                 .iter()
-    //                 .map(|(f, t)| format!("{}: {}", f, t))
-    //                 .intersperse(", ".to_string())
-    //                 .collect();
-    //             println!("{}, {:?}, {}:{:?}", tags, aa.ctx, file_name, line);
-    //         }
-    //     }
-    // }
+    for (u, vs) in &variant_tag_values {
+        println!("Union {:?}", u);
+        let tag_field = vs
+            .iter()
+            .filter_map(|(f, vs)| {
+                let mut tags = HashSet::new();
+                for vs in vs.values() {
+                    for v in vs.keys() {
+                        if !tags.insert(*v) {
+                            return None;
+                        }
+                    }
+                }
+                Some((*f, vs.len()))
+            })
+            .max_by_key(|(_, n)| *n);
+        if let Some((tag_field, _)) = tag_field {
+            println!("Field: {:?}", tag_field);
+            let mut all_tags = tag_values[&u][&tag_field].clone();
+            for (variant, vs) in &vs[&tag_field] {
+                for v in vs.keys() {
+                    all_tags.remove(v);
+                }
+                let tags: Vec<_> = vs.keys().copied().collect();
+                println!("  {}: {:?}", variant, tags);
+            }
+            if !all_tags.is_empty() {
+                println!("  *: {:?}", all_tags);
+            }
+        } else {
+            println!("  {:?}", tag_values[u]);
+            for (f, vs) in vs {
+                println!("  {}", f);
+                for (variant, vs) in vs {
+                    println!("    {}", variant);
+                    for (n, spans) in vs {
+                        println!("      {}", n);
+                        for span in spans {
+                            println!("        {:?}", span);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,30 +325,6 @@ fn find_paths(
         }
     }
     visited.remove(&curr);
-}
-
-fn _compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
-    access: FieldAccess<'tcx>,
-    states: &HashMap<Location, AbsMem>,
-    local_decls: &D,
-    tcx: TyCtxt<'tcx>,
-) -> Vec<(u32, u128)> {
-    let state = some_or!(states.get(&access.location), return vec![]);
-    let (path, is_deref) = access.get_path(state, local_decls, tcx);
-    let g = state.g();
-    let obj = some_or!(g.get_obj(&path, is_deref), return vec![]);
-    let Obj::Struct(fields, _) = obj else { return vec![] };
-    let mut v: Vec<_> = fields
-        .iter()
-        .filter_map(|(f, obj)| {
-            let Obj::Ptr(loc) = obj else { return None };
-            let obj = g.obj_at_location(loc)?;
-            let Obj::AtAddr(n) = obj else { return None };
-            Some((*f, *n))
-        })
-        .collect();
-    v.sort_by_key(|(f, _)| *f);
-    v
 }
 
 struct BodyVisitor<'tcx, 'a> {
@@ -378,38 +394,13 @@ impl<'tcx> Visitor<'tcx> for BodyVisitor<'tcx, '_> {
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Clone, Copy)]
 struct FieldAccess<'tcx> {
-    #[allow(unused)]
     ty: LocalDefId,
     local: Local,
     projection: &'tcx [PlaceElem<'tcx>],
-    #[allow(unused)]
     field: FieldIdx,
     ctx: PlaceContext,
     location: Location,
-}
-
-impl<'tcx> FieldAccess<'tcx> {
-    fn get_path<D: HasLocalDecls<'tcx> + ?Sized>(
-        &self,
-        state: &AbsMem,
-        local_decls: &D,
-        tcx: TyCtxt<'tcx>,
-    ) -> (AccPath, bool) {
-        assert!(!self.projection.is_empty());
-        AccPath::from_local_projection(
-            self.local,
-            &self.projection[..self.projection.len() - 1],
-            state,
-            local_decls,
-            tcx,
-        )
-    }
-}
-
-struct AnalyzedAccess {
-    span: Span,
-    ctx: PlaceContext,
-    tags: Vec<(u32, u128)>,
 }
