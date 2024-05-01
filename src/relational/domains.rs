@@ -1026,7 +1026,7 @@ impl Graph {
                 (loc, node)
             })
             .collect();
-        let mut visited = HashMap::new();
+        let mut visited = HashSet::new();
         let ctx = InvalidateCtx {
             strong_update,
             no_update_locals: &no_update_locals,
@@ -1035,8 +1035,7 @@ impl Graph {
         };
         while let Some((loc, node)) = worklist.pop() {
             let obj = some_or!(self.obj_at_location_mut_opt(&loc), continue);
-            let (v, _) = invalidate_rec(loc, obj, node, &mut visited, ctx);
-            worklist.extend(v);
+            worklist.extend(invalidate_rec(loc, obj, node, &mut visited, ctx));
         }
     }
 }
@@ -1053,15 +1052,14 @@ fn invalidate_rec(
     loc: AbsLoc,
     obj: &mut Obj,
     node: points_to::LocNode,
-    visited: &mut HashMap<(AbsLoc, points_to::LocNode), bool>,
+    visited: &mut HashSet<(AbsLoc, points_to::LocNode)>,
     ctx: InvalidateCtx<'_>,
-) -> (Vec<(AbsLoc, points_to::LocNode)>, bool) {
-    if let Some(write) = visited.get(&(loc.clone(), node)) {
-        return (vec![], *write);
+) -> Vec<(AbsLoc, points_to::LocNode)> {
+    if !visited.insert((loc.clone(), node)) {
+        return vec![];
     }
-    let mut write = false;
     let edges = &ctx.may_points_to.graph[&node];
-    let v = match obj {
+    match obj {
         Obj::Top | Obj::AtAddr(_) => vec![],
         Obj::Ptr(ptr_loc) => {
             let v = if let points_to::LocEdges::Deref(nodes) = edges {
@@ -1079,7 +1077,6 @@ fn invalidate_rec(
                     .unwrap_or(true)
             {
                 *obj = Obj::Top;
-                write = true;
             }
 
             v
@@ -1087,19 +1084,25 @@ fn invalidate_rec(
         Obj::Struct(fs, is_union) => {
             let mut v = vec![];
             if let points_to::LocEdges::Fields(fs2) = edges {
-                write = true;
                 for (index, node) in fs2.iter().enumerate() {
                     let index = index as u32;
                     let obj = some_or!(fs.get_mut(&index), continue);
                     let loc = loc.clone().push_field(index, *is_union);
-                    let (v2, w) = invalidate_rec(loc, obj, *node, visited, ctx);
-                    if !w {
-                        write = false;
-                    }
-                    v.extend(v2);
+                    v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                 }
-                if write && *is_union {
-                    *fs = HashMap::new();
+            }
+            if *is_union {
+                let index = node.index;
+                let offsets = &ctx.may_points_to.union_offsets[&index];
+                for (field, (offset, next)) in
+                    offsets.iter().zip(offsets.iter().skip(1)).enumerate()
+                {
+                    if !fs.contains_key(&(field as _))
+                        && (*offset..*next).any(|o| ctx.writes.contains(index + o))
+                    {
+                        *fs = HashMap::new();
+                        break;
+                    }
                 }
             }
             v
@@ -1107,21 +1110,14 @@ fn invalidate_rec(
         Obj::Array(vs) => {
             let mut v = vec![];
             if let points_to::LocEdges::Index(node) = edges {
-                write = true;
                 for (elem, obj) in vs {
                     let loc = loc.clone().push_index(elem.clone());
-                    let (v2, w) = invalidate_rec(loc, obj, *node, visited, ctx);
-                    if !w {
-                        write = false;
-                    }
-                    v.extend(v2);
+                    v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
                 }
             }
             v
         }
-    };
-    visited.insert((loc.clone(), node), write);
-    (v, write)
+    }
 }
 
 fn join_objs(

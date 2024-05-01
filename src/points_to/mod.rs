@@ -67,6 +67,7 @@ pub struct PreAnalysisData<'tcx> {
     vars: HashMap<Var, usize>,
 
     index_prefixes: HashMap<usize, u8>,
+    union_offsets: HashMap<usize, Vec<usize>>,
     graph: HashMap<LocNode, LocEdges>,
     var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 }
@@ -76,6 +77,7 @@ pub type Solutions = Vec<HybridBitSet<usize>>;
 #[derive(Debug)]
 pub struct AnalysisResults {
     pub ends: Vec<usize>,
+    pub union_offsets: HashMap<usize, Vec<usize>>,
     pub graph: LocGraph,
     pub var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 
@@ -137,6 +139,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut alloc_ends: Vec<usize> = vec![];
     let mut allocs = vec![];
     let mut graph = HashMap::new();
+    let mut union_offsets = HashMap::new();
     let mut index_prefixes = HashMap::new();
     let mut indirect_calls: HashMap<_, HashMap<_, _>> = HashMap::new();
     let mut var_nodes = HashMap::new();
@@ -163,7 +166,13 @@ pub fn pre_analyze<'a, 'tcx>(
         for (local, local_decl) in local_decls {
             vars.insert(Var::Local(item.local_def_id, local), ends.len());
             let ty = tss.tys[&local_decl.ty];
-            let node = add_edges(ty, ends.len(), &mut graph, &mut index_prefixes);
+            let node = add_edges(
+                ty,
+                ends.len(),
+                &mut graph,
+                &mut index_prefixes,
+                &mut union_offsets,
+            );
             var_nodes.insert((item.local_def_id, local), node);
             compute_ends(ty, &mut ends);
 
@@ -238,6 +247,7 @@ pub fn pre_analyze<'a, 'tcx>(
         inv_fns,
         vars,
         index_prefixes,
+        union_offsets,
         graph,
         var_nodes,
     }
@@ -448,6 +458,7 @@ pub fn post_analyze<'a, 'tcx>(
 
     AnalysisResults {
         ends: pre.ends,
+        union_offsets: pre.union_offsets,
         graph: pre.graph,
         var_nodes: pre.var_nodes,
         solutions,
@@ -568,22 +579,30 @@ fn add_edges(
     index: usize,
     graph: &mut LocGraph,
     index_prefixes: &mut HashMap<usize, u8>,
+    union_offsets: &mut HashMap<usize, Vec<usize>>,
 ) -> LocNode {
     let node = match ty {
         TyShape::Primitive => return LocNode::new(0, index),
         TyShape::Array(t, _) => {
-            let succ = add_edges(t, index, graph, index_prefixes);
+            let succ = add_edges(t, index, graph, index_prefixes, union_offsets);
             let node = succ.parent();
             graph.insert(node, LocEdges::Index(succ));
             node
         }
-        TyShape::Struct(_, ts, _) => {
+        TyShape::Struct(len, ts, is_union) => {
             let succs: Vec<_> = ts
                 .iter()
-                .map(|(offset, t)| add_edges(t, index + offset, graph, index_prefixes))
+                .map(|(offset, t)| {
+                    add_edges(t, index + offset, graph, index_prefixes, union_offsets)
+                })
                 .collect();
             let node = succs[0].parent();
             graph.insert(node, LocEdges::Fields(succs));
+            if *is_union {
+                let mut offsets: Vec<usize> = ts.iter().map(|(offset, _)| *offset).collect();
+                offsets.push(*len);
+                union_offsets.insert(index, offsets);
+            }
             node
         }
     };
