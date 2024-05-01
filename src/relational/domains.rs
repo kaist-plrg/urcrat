@@ -1093,15 +1093,16 @@ fn invalidate_rec(
             }
             if *is_union {
                 let index = node.index;
-                let offsets = &ctx.may_points_to.union_offsets[&index];
-                for (field, (offset, next)) in
-                    offsets.iter().zip(offsets.iter().skip(1)).enumerate()
-                {
-                    if !fs.contains_key(&(field as _))
-                        && (*offset..*next).any(|o| ctx.writes.contains(index + o))
+                if let Some(offsets) = ctx.may_points_to.union_offsets.get(&index) {
+                    for (field, (offset, next)) in
+                        offsets.iter().zip(offsets.iter().skip(1)).enumerate()
                     {
-                        *fs = HashMap::new();
-                        break;
+                        if !fs.contains_key(&(field as _))
+                            && (*offset..*next).any(|o| ctx.writes.contains(index + o))
+                        {
+                            *fs = HashMap::new();
+                            break;
+                        }
                     }
                 }
             }

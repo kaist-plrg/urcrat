@@ -10,8 +10,9 @@ use rustc_hir::{definitions::DefPathDataName, ItemKind};
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        visit::{PlaceContext, Visitor},
-        AggregateKind, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem, Rvalue,
+        visit::{MutatingUseContext, PlaceContext, Visitor},
+        AggregateKind, HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
+        Rvalue,
     },
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -19,6 +20,7 @@ use rustc_session::config::Input;
 use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
 
+use self::relational::{AbsMem, AccPath};
 use crate::*;
 
 #[derive(Debug, Clone)]
@@ -132,37 +134,48 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
             _ => continue,
         };
-        let mut visitor = BodyVisitor::new(tcx, &body.local_decls, &unions);
-        visitor.visit_body(body);
-        if visitor.accesses.is_empty() && !visitor.aggregate {
-            continue;
-        }
         let mut local_to_unions: HashMap<_, Vec<_>> = HashMap::new();
         for (i, local) in body.local_decls.iter_enumerated() {
-            let (adt_def, ptr) = match local.ty.kind() {
-                TyKind::Adt(adt_def, _) => (adt_def, false),
-                TyKind::Ref(_, ty, _) | TyKind::RawPtr(TypeAndMut { ty, .. }) => {
-                    let TyKind::Adt(adt_ref, _) = ty.kind() else { continue };
-                    (adt_ref, true)
-                }
-                _ => continue,
-            };
-            let local_def_id = some_or!(adt_def.did().as_local(), continue);
+            let (local_def_id, elems) = some_or!(ty_to_proj(local.ty), continue);
             for (u, paths) in &paths_to_unions {
                 let paths = some_or!(paths.get(&local_def_id), continue);
                 let local_to_unions = local_to_unions.entry(*u).or_default();
                 for p in paths {
-                    let mut path = vec![];
-                    if ptr {
-                        path.push(AccElem::Deref);
-                    }
+                    let mut path: Vec<_> = elems.iter().copied().rev().collect();
                     path.extend(p);
                     local_to_unions.push((i, path));
                 }
             }
         }
+        let mut visitor = BodyVisitor::new(tcx, &body.local_decls, &unions);
+        visitor.visit_body(body);
+        if visitor.accesses.is_empty() && local_to_unions.is_empty() {
+            continue;
+        }
         println!("{:?}", local_def_id);
         let states = relational::analyze_fn(local_def_id, body, &tss, &may_points_to, true, tcx);
+        for access in visitor.accesses {
+            if matches!(
+                access.ctx,
+                PlaceContext::MutatingUse(MutatingUseContext::Store)
+            ) {
+                continue;
+            }
+            let span = body.source_info(access.location).span;
+            let tags = compute_tags(access, &states, &body.local_decls, tcx);
+            for (f, n) in tags {
+                variant_tag_values
+                    .entry(access.ty)
+                    .or_default()
+                    .entry(f)
+                    .or_default()
+                    .entry(access.field.as_u32())
+                    .or_default()
+                    .entry(n)
+                    .or_default()
+                    .push(span);
+            }
+        }
         for (loc, mem) in &states {
             let Location {
                 block,
@@ -327,6 +340,30 @@ fn find_paths(
     visited.remove(&curr);
 }
 
+fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
+    access: FieldAccess<'tcx>,
+    states: &HashMap<Location, AbsMem>,
+    local_decls: &D,
+    tcx: TyCtxt<'tcx>,
+) -> Vec<(u32, u128)> {
+    let state = some_or!(states.get(&access.location), return vec![]);
+    let (path, is_deref) = access.get_path(state, local_decls, tcx);
+    let g = state.g();
+    let obj = some_or!(g.get_obj(&path, is_deref), return vec![]);
+    let Obj::Struct(fields, _) = obj else { return vec![] };
+    let mut v: Vec<_> = fields
+        .iter()
+        .filter_map(|(f, obj)| {
+            let Obj::Ptr(loc) = obj else { return None };
+            let obj = g.obj_at_location(loc)?;
+            let Obj::AtAddr(n) = obj else { return None };
+            Some((*f, *n))
+        })
+        .collect();
+    v.sort_by_key(|(f, _)| *f);
+    v
+}
+
 struct BodyVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
@@ -403,4 +440,22 @@ struct FieldAccess<'tcx> {
     field: FieldIdx,
     ctx: PlaceContext,
     location: Location,
+}
+
+impl<'tcx> FieldAccess<'tcx> {
+    fn get_path<D: HasLocalDecls<'tcx> + ?Sized>(
+        &self,
+        state: &AbsMem,
+        local_decls: &D,
+        tcx: TyCtxt<'tcx>,
+    ) -> (AccPath, bool) {
+        assert!(!self.projection.is_empty());
+        AccPath::from_local_projection(
+            self.local,
+            &self.projection[..self.projection.len() - 1],
+            state,
+            local_decls,
+            tcx,
+        )
+    }
 }
