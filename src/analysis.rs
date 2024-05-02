@@ -130,7 +130,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         .collect();
 
     let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<u128>>> = HashMap::new();
-    let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, Vec<_>>>>> =
+    let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, BTreeSet<_>>>>> =
         HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
@@ -179,7 +179,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 continue;
             }
             let span = body.source_info(access.location).span;
-            let tags = compute_tags(access, &states, &body.local_decls, tcx);
+            let tags = compute_tags(access, &states.in_states, &body.local_decls, tcx);
             for (f, ns) in tags {
                 let vs = variant_tag_values
                     .entry(access.ty)
@@ -189,11 +189,15 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     .entry(access.field.as_u32())
                     .or_default();
                 for n in ns.into_set() {
-                    vs.entry(n).or_default().push(span);
+                    vs.entry(n).or_default().insert(span);
                 }
             }
         }
-        for (loc, mem) in &states {
+        for (loc, mem) in states
+            .in_states
+            .iter()
+            .chain(states.out_states.iter().map(|((l, _), m)| (l, m)))
+        {
             let Location {
                 block,
                 statement_index,
@@ -245,7 +249,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                     .entry(variant)
                                     .or_default();
                                 for n in ns.into_set() {
-                                    vs.entry(n).or_default().push(span);
+                                    vs.entry(n).or_default().insert(span);
                                 }
                             }
                         }

@@ -45,7 +45,7 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
             let body = tcx.optimized_mir(*def_id);
             (
                 *def_id,
-                analyze_fn(*def_id, body, &tss, &may_points_to, gc, tcx),
+                analyze_fn(*def_id, body, &tss, &may_points_to, gc, tcx).in_states,
             )
         })
         .collect();
@@ -59,7 +59,7 @@ pub fn analyze_fn<'a, 'tcx>(
     may_points_to: &'a points_to::AnalysisResults,
     gc: bool,
     tcx: TyCtxt<'tcx>,
-) -> HashMap<Location, AbsMem> {
+) -> FnAnalysisResult {
     // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
@@ -102,18 +102,25 @@ pub struct Analyzer<'tcx, 'a> {
     pub gc: bool,
 }
 
+#[derive(Debug)]
+pub struct FnAnalysisResult {
+    pub in_states: HashMap<Location, AbsMem>,
+    pub out_states: HashMap<(Location, Location), AbsMem>,
+}
+
 impl Analyzer<'_, '_> {
-    fn analyze(&self) -> HashMap<Location, AbsMem> {
+    fn analyze(&self) -> FnAnalysisResult {
         let bot = AbsMem::bot();
 
         let mut work_list = WorkList::new(&self.rpo_map);
         work_list.push(Location::START);
 
-        let mut states: HashMap<Location, AbsMem> = HashMap::new();
-        states.insert(Location::START, AbsMem::top());
+        let mut in_states = HashMap::new();
+        in_states.insert(Location::START, AbsMem::top());
+        let mut out_states: HashMap<(Location, Location), AbsMem> = HashMap::new();
 
         while let Some(location) = work_list.pop() {
-            let state = states.get(&location).unwrap_or(&bot);
+            let state = in_states.get(&location).unwrap_or(&bot);
             let nexts = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
@@ -131,7 +138,11 @@ impl Analyzer<'_, '_> {
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
-                let next_state = states.get(&next_location).unwrap_or(&bot);
+                let out_state = out_states.get(&(location, next_location)).unwrap_or(&bot);
+                let new_out_state = out_state.join(&new_next_state);
+                out_states.insert((location, next_location), new_out_state);
+
+                let next_state = in_states.get(&next_location).unwrap_or(&bot);
                 let mut joined = if self.loop_heads.contains(&next_location) {
                     next_state.widen(&new_next_state)
                 } else {
@@ -142,13 +153,16 @@ impl Analyzer<'_, '_> {
                     joined.clear_dead_locals(dead_locals);
                 }
                 if !joined.ord(next_state) {
-                    states.insert(next_location, joined);
+                    in_states.insert(next_location, joined);
                     work_list.push(next_location);
                 }
             }
         }
 
-        states
+        FnAnalysisResult {
+            in_states,
+            out_states,
+        }
     }
 
     pub fn resolve_indirect_call(&self, loc: Location) -> &[LocalDefId] {
