@@ -114,9 +114,6 @@ impl Analyzer<'_, '_> {
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
-            // println!("{:?}", state);
-            // println!("{:?}", self.body.source_info(location).span);
-            // println!("{:?} {:?}", location, self.body.stmt_at(location));
             let nexts = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
@@ -128,6 +125,9 @@ impl Analyzer<'_, '_> {
                     self.transfer_term(terminator, v, location, state)
                 },
             );
+            // println!("{:?}", state);
+            // println!("{:?}", self.body.source_info(location).span);
+            // println!("{:?} {:?}", location, self.body.stmt_at(location));
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {

@@ -11,8 +11,8 @@ use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
         visit::{MutatingUseContext, PlaceContext, Visitor},
-        AggregateKind, HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem, ProjectionElem,
-        Rvalue,
+        AggregateKind, ConstantKind, HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem,
+        ProjectionElem, Rvalue, Terminator, TerminatorKind,
     },
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -43,7 +43,6 @@ fn analyze_input(input: Input, conf: &Config) {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
-    let start = std::time::Instant::now();
     let hir = tcx.hir();
 
     let visitor = ty_finder::TyVisitor::new(tcx);
@@ -57,6 +56,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         .unwrap_or_else(|| points_to::analyze(&pre, &tss, tcx));
     let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
 
+    let mut structs = vec![];
     let mut unions = vec![];
     let mut ty_graph: HashMap<_, Vec<_>> = HashMap::new();
     for item_id in hir.items() {
@@ -93,6 +93,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         if !has_int_field && !tss.bitfields.contains_key(&local_def_id) {
             continue;
         }
+        let mut has_union = false;
         for f in &variant.fields {
             let TyKind::Adt(adt_def, _) = f.ty(tcx, List::empty()).kind() else { continue };
             if !adt_def.is_union() {
@@ -111,7 +112,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     .contains(&tcx.def_path(u.to_def_id()).to_string_no_crate_verbose())
             {
                 unions.push(u);
+                has_union = true;
             }
+        }
+        if has_union {
+            structs.push(local_def_id);
         }
     }
 
@@ -123,7 +128,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             (*u, ps)
         })
         .collect();
-    println!("{}", start.elapsed().as_millis());
 
     let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<u128>>> = HashMap::new();
     let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, Vec<_>>>>> =
@@ -136,8 +140,24 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
             _ => continue,
         };
+        let mut visitor = BodyVisitor::new(tcx, &body.local_decls, &structs, &unions);
+        visitor.visit_body(body);
+        if visitor.accesses.is_empty()
+            && visitor.struct_accesses.is_empty()
+            && visitor.aggregates.is_empty()
+        {
+            continue;
+        }
+        let locals: HashSet<_> = visitor
+            .accesses
+            .iter()
+            .map(|a| a.local)
+            .chain(visitor.struct_accesses.iter().copied())
+            .chain(visitor.aggregates.iter().copied())
+            .collect();
         let mut local_to_unions: HashMap<_, Vec<_>> = HashMap::new();
-        for (i, local) in body.local_decls.iter_enumerated() {
+        for i in locals {
+            let local = &body.local_decls[i];
             let (local_def_id, elems) = some_or!(ty_to_proj(local.ty), continue);
             for (u, paths) in &paths_to_unions {
                 let paths = some_or!(paths.get(&local_def_id), continue);
@@ -148,11 +168,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     local_to_unions.push((i, path));
                 }
             }
-        }
-        let mut visitor = BodyVisitor::new(tcx, &body.local_decls, &unions);
-        visitor.visit_body(body);
-        if visitor.accesses.is_empty() && local_to_unions.is_empty() {
-            continue;
         }
         println!("{:?}", local_def_id);
         let states = relational::analyze_fn(local_def_id, body, &tss, &may_points_to, true, tcx);
@@ -310,7 +325,7 @@ fn ty_to_proj(ty: Ty<'_>) -> Option<(LocalDefId, Vec<AccElem>)> {
             v.push(AccElem::Index);
             Some((def_id, v))
         }
-        TyKind::RawPtr(TypeAndMut { ty, .. }) => {
+        TyKind::Ref(_, ty, _) | TyKind::RawPtr(TypeAndMut { ty, .. }) => {
             let (def_id, mut v) = ty_to_proj(*ty)?;
             v.push(AccElem::Deref);
             Some((def_id, v))
@@ -374,23 +389,28 @@ fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
 struct BodyVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
+    structs: &'a Vec<LocalDefId>,
     unions: &'a Vec<LocalDefId>,
     accesses: Vec<FieldAccess<'tcx>>,
-    aggregate: bool,
+    struct_accesses: HashSet<Local>,
+    aggregates: HashSet<Local>,
 }
 
 impl<'tcx, 'a> BodyVisitor<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
         local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
+        structs: &'a Vec<LocalDefId>,
         unions: &'a Vec<LocalDefId>,
     ) -> Self {
         Self {
             tcx,
             local_decls,
+            structs,
             unions,
             accesses: vec![],
-            aggregate: false,
+            struct_accesses: HashSet::new(),
+            aggregates: HashSet::new(),
         }
     }
 }
@@ -408,37 +428,58 @@ impl<'tcx> Visitor<'tcx> for BodyVisitor<'tcx, '_> {
                 .ty;
                 let TyKind::Adt(adt_def, _) = ty.kind() else { continue };
                 let def_id = some_or!(adt_def.did().as_local(), continue);
-                if !self.unions.contains(&def_id) {
-                    continue;
+                if self.structs.contains(&def_id) {
+                    self.struct_accesses.insert(place.local);
+                } else if self.unions.contains(&def_id) {
+                    let ProjectionElem::Field(f, _) = place.projection[i + 1] else {
+                        unreachable!()
+                    };
+                    let access = FieldAccess {
+                        ty: def_id,
+                        local: place.local,
+                        projection: &place.projection[..=i],
+                        field: f,
+                        ctx: context,
+                        location,
+                    };
+                    self.accesses.push(access);
                 }
-                let ProjectionElem::Field(f, _) = place.projection[i + 1] else { unreachable!() };
-                let access = FieldAccess {
-                    ty: def_id,
-                    local: place.local,
-                    projection: &place.projection[..=i],
-                    field: f,
-                    ctx: context,
-                    location,
-                };
-                self.accesses.push(access);
             }
         }
         self.super_place(place, context, location);
     }
 
-    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+    fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         if let Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, _), _) = rvalue {
             if let Some(def_id) = def_id.as_local() {
-                if self.unions.contains(&def_id) {
-                    self.aggregate = true;
+                if self.structs.contains(&def_id) || self.unions.contains(&def_id) {
+                    self.aggregates.insert(place.local);
                 }
             }
         }
-        self.super_rvalue(rvalue, location);
+        self.super_assign(place, rvalue, location);
+    }
+
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        if let TerminatorKind::Call { func, args, .. } = &terminator.kind {
+            if let Some(constant) = func.constant() {
+                let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                if def_id.is_local() && self.tcx.impl_of_method(*def_id).is_some() {
+                    let ty = args[0].ty(self.local_decls, self.tcx);
+                    let TyKind::Ref(_, ty, _) = ty.kind() else { unreachable!() };
+                    let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
+                    let local_def_id = adt_def.did().expect_local();
+                    if self.structs.contains(&local_def_id) {
+                        self.struct_accesses.insert(args[0].place().unwrap().local);
+                    }
+                }
+            }
+        }
+        self.super_terminator(terminator, location);
     }
 }
 
-#[allow(unused)]
 #[derive(Debug, Clone, Copy)]
 struct FieldAccess<'tcx> {
     ty: LocalDefId,
