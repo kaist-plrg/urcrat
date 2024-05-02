@@ -64,12 +64,14 @@ pub fn analyze_fn<'a, 'tcx>(
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
+    let loop_heads: HashSet<_> = loop_blocks.keys().map(|bb| bb.start_location()).collect();
     let rpo_map = compute_rpo_map(body, &loop_blocks);
     let dead_locals = get_dead_locals(body, tcx);
     let discriminant_values = find_discriminant_values(body);
     let analyzer = Analyzer {
         tcx,
         body,
+        loop_heads,
         rpo_map,
         dead_locals,
         local_def_id,
@@ -90,6 +92,7 @@ pub struct AnalysisResults {
 pub struct Analyzer<'tcx, 'a> {
     pub tcx: TyCtxt<'tcx>,
     pub body: &'tcx Body<'tcx>,
+    pub loop_heads: HashSet<Location>,
     pub rpo_map: HashMap<BasicBlock, usize>,
     pub dead_locals: Vec<BitSet<Local>>,
     pub local_def_id: LocalDefId,
@@ -129,7 +132,11 @@ impl Analyzer<'_, '_> {
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
                 let next_state = states.get(&next_location).unwrap_or(&bot);
-                let mut joined = next_state.join(&new_next_state);
+                let mut joined = if self.loop_heads.contains(&next_location) {
+                    next_state.widen(&new_next_state)
+                } else {
+                    next_state.join(&new_next_state)
+                };
                 if self.gc && next_location.statement_index == 0 {
                     let dead_locals = &self.dead_locals[next_location.block.as_usize()];
                     joined.clear_dead_locals(dead_locals);

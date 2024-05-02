@@ -42,10 +42,17 @@ impl AbsMem {
     }
 
     #[inline]
+    pub fn widen(&self, other: &Self) -> Self {
+        let Self::Mem(g1) = self else { return other.clone() };
+        let Self::Mem(g2) = other else { return self.clone() };
+        Self::Mem(g1.join(g2, true))
+    }
+
+    #[inline]
     pub fn join(&self, other: &Self) -> Self {
         let Self::Mem(g1) = self else { return other.clone() };
         let Self::Mem(g2) = other else { return self.clone() };
-        Self::Mem(g1.join(g2))
+        Self::Mem(g1.join(g2, false))
     }
 
     #[inline]
@@ -228,9 +235,81 @@ impl AbsLoc {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub enum AbsInt {
+    Top,
+    Set(HashSet<u128>),
+}
+
+impl std::fmt::Debug for AbsInt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AbsInt::Top => write!(f, "T"),
+            AbsInt::Set(s) => write!(f, "{:?}", s),
+        }
+    }
+}
+
+impl AbsInt {
+    #[inline]
+    fn singleton(n: u128) -> Self {
+        Self::Set([n].into_iter().collect())
+    }
+
+    #[inline]
+    fn new(ns: HashSet<u128>) -> Self {
+        if ns.len() > 10 {
+            Self::Top
+        } else {
+            Self::Set(ns)
+        }
+    }
+
+    #[inline]
+    pub fn as_singleton(&self) -> Option<u128> {
+        match self {
+            Self::Set(s) if s.len() == 1 => Some(*s.iter().next().unwrap()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &u128> {
+        match self {
+            Self::Top => panic!(),
+            Self::Set(s) => s.iter(),
+        }
+    }
+
+    #[inline]
+    pub fn into_set(&self) -> HashSet<u128> {
+        match self {
+            Self::Top => HashSet::new(),
+            Self::Set(s) => s.clone(),
+        }
+    }
+
+    fn join(&self, other: &Self, widen: bool) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if !widen {
+                    Self::new(s1.union(s2).copied().collect())
+                } else if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum Obj {
     Top,
-    AtAddr(u128),
+    AtAddr(AbsInt),
     Ptr(AbsLoc),
     Struct(HashMap<u32, Obj>, bool),
     Array(HashMap<Index, Obj>),
@@ -240,7 +319,7 @@ impl std::fmt::Debug for Obj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Top => write!(f, "T"),
-            Self::AtAddr(n) => write!(f, "@{}", n),
+            Self::AtAddr(n) => write!(f, "@{:?}", n),
             Self::Ptr(l) => write!(f, "{:?}", l),
             Self::Struct(fs, is_union) => {
                 write!(f, "[")?;
@@ -275,6 +354,10 @@ impl std::fmt::Debug for Obj {
 }
 
 impl Obj {
+    fn at_addr(n: u128) -> Self {
+        Self::AtAddr(AbsInt::singleton(n))
+    }
+
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
         if let Some(elem) = proj.get(0) {
             let inner = match (self, elem) {
@@ -533,40 +616,35 @@ impl std::fmt::Debug for Graph {
 }
 
 impl Graph {
-    fn join(&self, other: &Self) -> Self {
-        let mut joined = Graph::default();
-        let mut id_map = HashMap::new();
-        let mut remaining = vec![];
+    fn join(&self, other: &Self, widen: bool) -> Self {
+        let mut ctx = JoinCtx {
+            joined: Graph::default(),
+            id_map: HashMap::new(),
+            remaining: vec![],
+            widen,
+        };
 
         for (l1, id1) in &self.locals {
             let (_, id2) = some_or!(other.locals.iter().find(|(l2, _)| l1 == *l2), continue);
-            let (id, _) = joined.get_local_node_mut(*l1);
+            let (id, _) = ctx.joined.get_local_node_mut(*l1);
             let idp = (AbsLoc::new_root(*id1), AbsLoc::new_root(*id2));
-            id_map.insert(idp.clone(), id);
-            remaining.push(idp);
+            ctx.id_map.insert(idp.clone(), id);
+            ctx.remaining.push(idp);
         }
 
-        while let Some((loc1, loc2)) = remaining.pop() {
+        while let Some((loc1, loc2)) = ctx.remaining.pop() {
             let obj1 = self.obj_at_location(&loc1);
             let obj2 = other.obj_at_location(&loc2);
-            let id = id_map[&(loc1, loc2)];
+            let id = ctx.id_map[&(loc1, loc2)];
 
             let mut obj = Obj::Top;
             if let (Some(obj1), Some(obj2)) = (obj1, obj2) {
-                join_objs(
-                    obj1,
-                    obj2,
-                    &mut obj,
-                    &mut joined,
-                    &mut id_map,
-                    &mut remaining,
-                    AbsLoc::new_root(id),
-                );
+                join_objs(obj1, obj2, &mut obj, AbsLoc::new_root(id), &mut ctx);
             }
-            joined.nodes[id].obj = obj;
+            ctx.joined.nodes[id].obj = obj;
         }
 
-        joined
+        ctx.joined
     }
 
     fn ord(&self, other: &Self) -> bool {
@@ -603,7 +681,7 @@ impl Graph {
             id.clone()
         } else {
             let id = self.nodes.len();
-            let node = Node::new(Obj::AtAddr(n));
+            let node = Node::new(Obj::at_addr(n));
             self.nodes.push(node);
             let loc = AbsLoc::new_root(id);
             self.ints.insert(n, loc.clone());
@@ -846,7 +924,7 @@ impl Graph {
             self.substitute(&ptr_loc, &n_loc);
         } else {
             let obj = self.obj_at_location_mut(&ptr_loc, false);
-            *obj = Obj::AtAddr(n);
+            *obj = Obj::at_addr(n);
             self.ints.insert(n, ptr_loc);
         }
     }
@@ -901,17 +979,7 @@ impl Graph {
         };
         let obj = self.obj_at_location(&loc)?;
         let Obj::AtAddr(n) = obj else { return None };
-        Some(*n)
-    }
-
-    pub fn get_deref_x_as_int(&self, x: &AccPath) -> Option<u128> {
-        let id = self.locals.get(&x.local)?;
-        let mut loc = self.get_pointed_loc(*id, &[])?;
-        loc.projection.extend(x.projection.to_owned());
-        let loc = self.get_pointed_loc(loc.root, &loc.projection)?;
-        let obj = self.obj_at_location(&loc)?;
-        let Obj::AtAddr(n) = obj else { return None };
-        Some(*n)
+        n.as_singleton()
     }
 
     pub fn invalidate_symbolic(&mut self, local: Local) {
@@ -1121,21 +1189,21 @@ fn invalidate_rec(
     }
 }
 
-fn join_objs(
-    obj1: &Obj,
-    obj2: &Obj,
-    obj: &mut Obj,
-    joined: &mut Graph,
-    id_map: &mut HashMap<(AbsLoc, AbsLoc), NodeId>,
-    remaining: &mut Vec<(AbsLoc, AbsLoc)>,
-    curr_loc: AbsLoc,
-) {
+struct JoinCtx {
+    joined: Graph,
+    id_map: HashMap<(AbsLoc, AbsLoc), NodeId>,
+    remaining: Vec<(AbsLoc, AbsLoc)>,
+    widen: bool,
+}
+
+fn join_objs(obj1: &Obj, obj2: &Obj, obj: &mut Obj, curr_loc: AbsLoc, ctx: &mut JoinCtx) {
     match (obj1, obj2) {
         (Obj::AtAddr(i1), Obj::AtAddr(i2)) => {
-            if i1 == i2 {
-                *obj = Obj::AtAddr(*i1);
+            let i = i1.join(i2, ctx.widen);
+            if let Some(i) = i.as_singleton() {
+                ctx.joined.ints.insert(i, curr_loc);
             }
-            joined.ints.insert(*i1, curr_loc);
+            *obj = Obj::AtAddr(i);
         }
         (Obj::Ptr(l1), Obj::Ptr(l2)) => {
             let (idp, l) = if let Some(l) = cmp_projection(&l1.projection, &l2.projection) {
@@ -1143,12 +1211,12 @@ fn join_objs(
             } else {
                 ((l1.clone(), l2.clone()), vec![])
             };
-            let nid = if let Some(id) = id_map.get(&idp) {
+            let nid = if let Some(id) = ctx.id_map.get(&idp) {
                 *id
             } else {
-                let (id, _) = joined.add_node();
-                id_map.insert(idp.clone(), id);
-                remaining.push(idp);
+                let (id, _) = ctx.joined.add_node();
+                ctx.id_map.insert(idp.clone(), id);
+                ctx.remaining.push(idp);
                 id
             };
             *obj = Obj::Ptr(AbsLoc::new(nid, l));
@@ -1160,15 +1228,7 @@ fn join_objs(
                 let obj2 = some_or!(fs2.get(f), continue);
                 let mut new_obj = Obj::Top;
                 let curr_loc = curr_loc.clone().push_field(*f, *u1);
-                join_objs(
-                    obj1,
-                    obj2,
-                    &mut new_obj,
-                    joined,
-                    id_map,
-                    remaining,
-                    curr_loc,
-                );
+                join_objs(obj1, obj2, &mut new_obj, curr_loc, ctx);
                 fs.insert(*f, new_obj);
             }
             *obj = Obj::Struct(fs, *u1);
@@ -1180,7 +1240,7 @@ fn join_objs(
                     let v = v1.join(v2);
                     let mut nobj = Obj::Top;
                     let curr_loc = curr_loc.clone().push_index(v.clone());
-                    join_objs(obj1, obj2, &mut nobj, joined, id_map, remaining, curr_loc);
+                    join_objs(obj1, obj2, &mut nobj, curr_loc, ctx);
                     fs.insert(v, nobj);
                 }
             }

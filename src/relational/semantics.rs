@@ -650,8 +650,12 @@ impl AccElem {
         match proj {
             ProjectionElem::Deref => unreachable!(),
             ProjectionElem::Field(i, _) => {
-                let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
-                AccElem::Field(i.as_u32(), adt_def.is_union())
+                let is_union = match ty.kind() {
+                    TyKind::Adt(adt_def, _) => adt_def.is_union(),
+                    TyKind::Tuple(_) => false,
+                    _ => unreachable!(),
+                };
+                AccElem::Field(i.as_u32(), is_union)
             }
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);

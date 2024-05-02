@@ -20,7 +20,7 @@ use rustc_session::config::Input;
 use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
 
-use self::relational::{AbsMem, AccPath};
+use self::relational::{AbsInt, AbsMem, AccPath};
 use crate::*;
 
 #[derive(Debug, Clone)]
@@ -43,6 +43,7 @@ fn analyze_input(input: Input, conf: &Config) {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
+    let start = std::time::Instant::now();
     let hir = tcx.hir();
 
     let visitor = ty_finder::TyVisitor::new(tcx);
@@ -122,8 +123,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             (*u, ps)
         })
         .collect();
+    println!("{}", start.elapsed().as_millis());
 
-    let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<_>>> = HashMap::new();
+    let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<u128>>> = HashMap::new();
     let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, Vec<_>>>>> =
         HashMap::new();
     for item_id in hir.items() {
@@ -163,17 +165,17 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
             let span = body.source_info(access.location).span;
             let tags = compute_tags(access, &states, &body.local_decls, tcx);
-            for (f, n) in tags {
-                variant_tag_values
+            for (f, ns) in tags {
+                let vs = variant_tag_values
                     .entry(access.ty)
                     .or_default()
                     .entry(f)
                     .or_default()
                     .entry(access.field.as_u32())
-                    .or_default()
-                    .entry(n)
-                    .or_default()
-                    .push(span);
+                    .or_default();
+                for n in ns.into_set() {
+                    vs.entry(n).or_default().push(span);
+                }
             }
         }
         for (loc, mem) in &states {
@@ -196,7 +198,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                 let Obj::Ptr(loc) = obj else { return None };
                                 let obj = g.obj_at_location(loc)?;
                                 let Obj::AtAddr(n) = obj else { return None };
-                                Some((*f, *n))
+                                Some((*f, n.clone()))
                             })
                             .collect();
                         for (f, n) in &v {
@@ -205,7 +207,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                 .or_default()
                                 .entry(*f)
                                 .or_default()
-                                .insert(*n);
+                                .extend(n.into_set());
                         }
                         if body.basic_blocks[block].statements.len() > statement_index {
                             continue;
@@ -219,17 +221,17 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                             .unwrap_or_default();
                         if uv.len() == 1 {
                             let variant = uv[0];
-                            for (f, n) in &v {
-                                variant_tag_values
+                            for (f, ns) in &v {
+                                let vs = variant_tag_values
                                     .entry(*u)
                                     .or_default()
                                     .entry(*f)
                                     .or_default()
                                     .entry(variant)
-                                    .or_default()
-                                    .entry(*n)
-                                    .or_default()
-                                    .push(span);
+                                    .or_default();
+                                for n in ns.into_set() {
+                                    vs.entry(n).or_default().push(span);
+                                }
                             }
                         }
                     }
@@ -240,9 +242,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
 
     for (u, vs) in &variant_tag_values {
         println!("Union {:?}", u);
+        let adt_def = tcx.adt_def(*u);
+        println!("{}", adt_def.variant(VariantIdx::from_u32(0)).fields.len());
         let tag_field = vs
             .iter()
             .filter_map(|(f, vs)| {
+                if vs.len() <= 1 {
+                    return None;
+                }
                 let mut tags = HashSet::new();
                 for vs in vs.values() {
                     for v in vs.keys() {
@@ -345,7 +352,7 @@ fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
     states: &HashMap<Location, AbsMem>,
     local_decls: &D,
     tcx: TyCtxt<'tcx>,
-) -> Vec<(u32, u128)> {
+) -> Vec<(u32, AbsInt)> {
     let state = some_or!(states.get(&access.location), return vec![]);
     let (path, is_deref) = access.get_path(state, local_decls, tcx);
     let g = state.g();
@@ -357,7 +364,7 @@ fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
             let Obj::Ptr(loc) = obj else { return None };
             let obj = g.obj_at_location(loc)?;
             let Obj::AtAddr(n) = obj else { return None };
-            Some((*f, *n))
+            Some((*f, n.clone()))
         })
         .collect();
     v.sort_by_key(|(f, _)| *f);
