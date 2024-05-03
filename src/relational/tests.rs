@@ -929,6 +929,27 @@ fn test_filter_if_ne() {
 }
 
 #[test]
+fn test_filter_twice() {
+    analyze_fn_with(
+        "",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        if x == 0 as libc::c_int || x == 1 as libc::c_int {
+            if x == 1 as libc::c_int {
+                y = 0 as libc::c_int;
+            } else {
+                y = x;
+            }
+        }
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(2), Some(0));
+        },
+    );
+}
+
+#[test]
 fn test_join_same() {
     // _2 = const 0_i32
     // _3 = _2

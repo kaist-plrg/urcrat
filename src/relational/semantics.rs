@@ -325,8 +325,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let mut ts = state.clone();
                         let mut fs = state.clone();
                         if let Some((v, local)) = v_local {
-                            let g = if dv.equal { ts.gm() } else { fs.gm() };
+                            let (g, gn) = if dv.equal {
+                                (ts.gm(), fs.gm())
+                            } else {
+                                (fs.gm(), ts.gm())
+                            };
                             g.filter_x_int(&AccPath::new(local, vec![]), false, v);
+                            gn.filter_x_not_int(&AccPath::new(local, vec![]), false, v);
                         }
                         vec![(tl, ts), (fl, fs)]
                     }

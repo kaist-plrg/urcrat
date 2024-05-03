@@ -929,6 +929,29 @@ impl Graph {
         }
     }
 
+    pub fn filter_x_not_int(&mut self, x: &AccPath, deref: bool, n: u128) {
+        let ptr_loc = self.set_obj_ptr(|this| this.lvalue(x, deref));
+        let obj = self.obj_at_location_mut(&ptr_loc, false);
+        let Obj::AtAddr(ns) = obj else { return };
+        let mut nset = ns.into_set();
+        if !nset.remove(&n) {
+            return;
+        }
+        if nset.len() == 1 {
+            let n = *nset.iter().next().unwrap();
+            if let Some(n_loc) = self.ints.get(&n) {
+                let n_loc = n_loc.clone();
+                self.substitute(&ptr_loc, &n_loc);
+            } else {
+                let obj = self.obj_at_location_mut(&ptr_loc, false);
+                *obj = Obj::at_addr(n);
+                self.ints.insert(n, ptr_loc);
+            }
+        } else {
+            *ns = AbsInt::new(nset);
+        }
+    }
+
     fn substitute(&mut self, old_loc: &AbsLoc, new_loc: &AbsLoc) {
         for node in &mut self.nodes {
             node.substitute(old_loc, new_loc);
