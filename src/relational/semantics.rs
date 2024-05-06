@@ -416,15 +416,15 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
                         assert!(matches!(value, ConstValue::ZeroSized));
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let name: Vec<_> = self
+                        let namev: Vec<_> = self
                             .tcx
                             .def_path(*def_id)
                             .data
                             .into_iter()
                             .map(|data| data.to_string())
                             .collect();
-                        let is_extern = name.iter().any(|s| s.starts_with("{extern#"));
-                        let seg = |i: usize| name.get(i).map(|s| s.as_str()).unwrap_or_default();
+                        let is_extern = namev.iter().any(|s| s.starts_with("{extern#"));
+                        let seg = |i: usize| namev.get(i).map(|s| s.as_str()).unwrap_or_default();
                         let name = (seg(0), seg(1), seg(2), seg(3));
                         let sig = self.tcx.fn_sig(def_id).skip_binder();
                         let inputs = sig.inputs().skip_binder();
@@ -439,7 +439,12 @@ impl<'tcx> Analyzer<'tcx, '_> {
                                 );
                                 false
                             } else if is_extern {
-                                self.transfer_c_call(name.1, inputs, args, &mut state);
+                                self.transfer_c_call(
+                                    namev.last().unwrap(),
+                                    inputs,
+                                    args,
+                                    &mut state,
+                                );
                                 true
                             } else {
                                 self.transfer_intra_call(&[local_def_id], &mut state);

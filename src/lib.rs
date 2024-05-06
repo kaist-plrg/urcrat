@@ -52,6 +52,7 @@ extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 
+pub mod alloc_finder;
 pub mod analysis;
 pub mod andersen;
 pub mod compile_util;
