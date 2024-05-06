@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{hash_map::Entry, HashMap, HashSet},
     path::Path,
 };
@@ -83,12 +84,54 @@ pub struct AnalysisResults {
 
     pub solutions: Solutions,
 
-    pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
     pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
+    pub call_graph_sccs: HashMap<usize, HashSet<usize>>,
+    pub scc_elems: HashMap<usize, HashSet<LocalDefId>>,
+    pub fn_sccs: HashMap<LocalDefId, usize>,
+    pub reachables: RefCell<HashMap<usize, HashSet<usize>>>,
 
     pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
     pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub call_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+    pub fn_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+}
+
+impl AnalysisResults {
+    pub fn call_writes(&self, def_id: LocalDefId) -> HybridBitSet<usize> {
+        self.with_reachables(self.fn_sccs[&def_id], |sccs| {
+            let mut writes = HybridBitSet::new_empty(self.ends.len());
+            for scc in sccs {
+                for f in &self.scc_elems[scc] {
+                    writes.union(&self.fn_writes[f]);
+                }
+            }
+            writes
+        })
+    }
+
+    #[inline]
+    fn with_reachables<R, F: FnOnce(&HashSet<usize>) -> R>(&self, scc: usize, f: F) -> R {
+        if let Some(rs) = self.reachables.borrow().get(&scc) {
+            return f(rs);
+        }
+        let mut reachables = HashSet::new();
+        self.reachables_from_scc(scc, &mut reachables);
+        let r = f(&reachables);
+        self.reachables.borrow_mut().insert(scc, reachables.clone());
+        r
+    }
+
+    fn reachables_from_scc(&self, scc: usize, reachables: &mut HashSet<usize>) {
+        if let Some(rs) = self.reachables.borrow().get(&scc) {
+            reachables.extend(rs);
+            return;
+        }
+        let mut this_reachables: HashSet<_> = [scc].into_iter().collect();
+        for succ in &self.call_graph_sccs[&scc] {
+            self.reachables_from_scc(*succ, &mut this_reachables);
+        }
+        reachables.extend(this_reachables.iter());
+        self.reachables.borrow_mut().insert(scc, this_reachables);
+    }
 }
 
 pub fn pre_analyze<'a, 'tcx>(
@@ -441,19 +484,10 @@ pub fn post_analyze<'a, 'tcx>(
         let callees = pre.call_graph.get_mut(caller).unwrap();
         callees.extend(calls.values().flatten());
     }
-    let mut reachability = graph::transitive_closure(&pre.call_graph);
-    for (func, reachables) in &mut reachability {
-        reachables.insert(*func);
-    }
-    let call_writes: HashMap<_, _> = reachability
+    let (call_graph_sccs, scc_elems) = graph::compute_sccs(&pre.call_graph);
+    let fn_sccs = scc_elems
         .iter()
-        .map(|(func, reachables)| {
-            let mut writes = HybridBitSet::new_empty(pre.ends.len());
-            for reachable in reachables {
-                writes.union(&fn_writes[reachable]);
-            }
-            (*func, writes)
-        })
+        .flat_map(|(id, fs)| fs.iter().map(|f| (*f, *id)))
         .collect();
 
     AnalysisResults {
@@ -462,11 +496,14 @@ pub fn post_analyze<'a, 'tcx>(
         graph: pre.graph,
         var_nodes: pre.var_nodes,
         solutions,
-        call_graph: pre.call_graph,
         indirect_calls,
+        call_graph_sccs,
+        scc_elems,
+        fn_sccs,
+        reachables: RefCell::new(HashMap::new()),
         writes,
         bitfield_writes,
-        call_writes,
+        fn_writes,
     }
 }
 

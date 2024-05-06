@@ -2688,11 +2688,6 @@ fn test_call_graph() {
         ",
         |res, tcx| {
             let def_id = find("f", tcx);
-            let callees = &res.call_graph[&def_id];
-            assert_eq!(callees.len(), 3);
-            assert!(callees.contains(&find("g", tcx)));
-            assert!(callees.contains(&find("h", tcx)));
-            assert!(callees.contains(&find("i", tcx)));
             let indirect_calls = &res.indirect_calls[&def_id];
             assert_eq!(indirect_calls.len(), 1);
             let callees = &indirect_calls[&BasicBlock::new(5)];

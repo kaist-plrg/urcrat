@@ -4,7 +4,7 @@ use std::{
 };
 
 use rustc_data_structures::graph::WithSuccessors;
-use rustc_hir::def_id::DefId;
+use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::{
     mir::{BasicBlock, BinOp, Body, Local, Location, Rvalue, StatementKind, TerminatorKind},
@@ -38,15 +38,21 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
     let pre = points_to::pre_analyze(&tss, tcx);
     let solutions = points_to::analyze(&pre, &tss, tcx);
     let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
-    let functions = may_points_to
-        .call_graph
-        .keys()
-        .map(|def_id| {
-            let body = tcx.optimized_mir(*def_id);
-            (
-                *def_id,
-                analyze_fn(*def_id, body, &tss, &may_points_to, gc, tcx).in_states,
-            )
+    let hir = tcx.hir();
+    let functions = hir
+        .items()
+        .filter_map(|item_id| {
+            let item = hir.item(item_id);
+            let local_def_id = item.owner_id.def_id;
+            let body = match item.kind {
+                ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+                    tcx.optimized_mir(local_def_id)
+                }
+                ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+                _ => return None,
+            };
+            let res = analyze_fn(local_def_id, body, &tss, &may_points_to, gc, tcx).in_states;
+            Some((local_def_id, res))
         })
         .collect();
     AnalysisResults { functions }
@@ -189,9 +195,9 @@ impl Analyzer<'_, '_> {
 
     pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<HybridBitSet<usize>> {
         let c0 = callees.get(0)?;
-        let mut writes = self.may_points_to.call_writes[c0].clone();
+        let mut writes = self.may_points_to.call_writes(*c0);
         for c in &callees[1..] {
-            writes.union(&self.may_points_to.call_writes[c]);
+            writes.union(&self.may_points_to.call_writes(*c));
         }
         if writes.is_empty() {
             None
