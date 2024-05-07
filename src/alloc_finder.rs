@@ -9,28 +9,30 @@ use rustc_middle::{
     mir::{
         ConstantKind, Local, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{IntTy, TyCtxt, TyKind, TypeAndMut, UintTy},
+    ty::{TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
 
 use crate::*;
 
-pub fn analyze_path(path: &Path) {
+pub fn analyze_path(path: &Path) -> HashSet<LocalDefId> {
     analyze_input(compile_util::path_to_input(path))
 }
 
-pub fn analyze_str(code: &str) {
+pub fn analyze_str(code: &str) -> HashSet<LocalDefId> {
     analyze_input(compile_util::str_to_input(code))
 }
 
-fn analyze_input(input: Input) {
+fn analyze_input(input: Input) -> HashSet<LocalDefId> {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, analyze).unwrap()
 }
 
-pub fn analyze(tcx: TyCtxt<'_>) {
+pub fn analyze(tcx: TyCtxt<'_>) -> HashSet<LocalDefId> {
     let hir = tcx.hir();
 
+    let mut call_graph = HashMap::new();
+    let mut assigns = HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
@@ -44,30 +46,56 @@ pub fn analyze(tcx: TyCtxt<'_>) {
             continue;
         }
         let body = tcx.optimized_mir(local_def_id);
-        let mut analyzer = Analyzer {
-            tcx,
-            assigns: HashMap::new(),
-            address_takens: HashSet::new(),
-        };
+        let mut analyzer = Analyzer::new(tcx);
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
                 analyzer.transfer_stmt(stmt);
             }
             analyzer.transfer_term(bbd.terminator());
         }
-
-        println!("{:?}", local_def_id);
-        println!("{:?}", analyzer.assigns);
-        println!("{:?}", analyzer.address_takens);
+        analyzer.remove_address_takens();
+        assigns.insert(local_def_id, analyzer.assigns);
+        call_graph.insert(local_def_id, analyzer.calls);
     }
+    let fns: HashSet<_> = call_graph.keys().copied().collect();
+    for callees in call_graph.values_mut() {
+        callees.retain(|callee| fns.contains(callee));
+    }
+    let (call_graph_sccs, scc_elems) = graph::compute_sccs(&call_graph);
+    let inv_call_graph_sccs = graph::inverse(&call_graph_sccs);
+    let po = graph::post_order(&call_graph_sccs, &inv_call_graph_sccs);
+    let mut alloc_fns = HashSet::new();
+    for f in po.iter().flatten().flat_map(|scc| &scc_elems[scc]) {
+        let assigns = &assigns[f];
+        if is_alloc(Local::from_u32(0), assigns, &alloc_fns) {
+            alloc_fns.insert(*f);
+        }
+    }
+    alloc_fns
+}
 
-    assert_eq!(hir.items().count(), 1);
+fn is_alloc(
+    local: Local,
+    assigns: &HashMap<Local, HashSet<Value>>,
+    alloc_fns: &HashSet<LocalDefId>,
+) -> bool {
+    let vs = some_or!(assigns.get(&local), return false);
+    for v in vs {
+        let b = match v {
+            Value::Local(l) => is_alloc(*l, assigns, alloc_fns),
+            Value::IntraCall(def_id) => alloc_fns.contains(def_id),
+            Value::CCall => true,
+        };
+        if b {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Value {
     Local(Local),
-    Zero,
     IntraCall(LocalDefId),
     CCall,
 }
@@ -76,9 +104,26 @@ struct Analyzer<'tcx> {
     tcx: TyCtxt<'tcx>,
     assigns: HashMap<Local, HashSet<Value>>,
     address_takens: HashSet<Local>,
+    calls: HashSet<LocalDefId>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
+    #[inline]
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            assigns: HashMap::new(),
+            address_takens: HashSet::new(),
+            calls: HashSet::new(),
+        }
+    }
+
+    #[inline]
+    fn remove_address_takens(&mut self) {
+        self.assigns
+            .retain(|local, _| !self.address_takens.contains(local));
+    }
+
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         if !l.projection.is_empty() {
@@ -98,38 +143,11 @@ impl<'tcx> Analyzer<'tcx> {
     }
 
     fn transfer_op(&self, op: &Operand<'tcx>) -> Option<Value> {
-        match op {
-            Operand::Copy(place) | Operand::Move(place) => {
-                if place.projection.is_empty() {
-                    Some(Value::Local(place.local))
-                } else {
-                    None
-                }
-            }
-            Operand::Constant(box constant) => {
-                let ConstantKind::Val(val, ty) = constant.literal else { return None };
-                let v = val.try_to_scalar_int()?;
-                let is_zero = match ty.kind() {
-                    TyKind::Int(IntTy::I8) => v.try_to_i8().ok()? == 0,
-                    TyKind::Int(IntTy::I16) => v.try_to_i16().ok()? == 0,
-                    TyKind::Int(IntTy::I32) => v.try_to_i32().ok()? == 0,
-                    TyKind::Int(IntTy::I64) => v.try_to_i64().ok()? == 0,
-                    TyKind::Int(IntTy::I128) => v.try_to_i128().ok()? == 0,
-                    TyKind::Int(IntTy::Isize) => v.try_to_i128().ok()? == 0,
-                    TyKind::Uint(UintTy::U8) => v.try_to_u8().ok()? == 0,
-                    TyKind::Uint(UintTy::U16) => v.try_to_u16().ok()? == 0,
-                    TyKind::Uint(UintTy::U32) => v.try_to_u32().ok()? == 0,
-                    TyKind::Uint(UintTy::U64) => v.try_to_u64().ok()? == 0,
-                    TyKind::Uint(UintTy::U128) => v.try_to_u128().ok()? == 0,
-                    TyKind::Uint(UintTy::Usize) => v.try_to_u128().ok()? == 0,
-                    _ => return None,
-                };
-                if is_zero {
-                    Some(Value::Zero)
-                } else {
-                    None
-                }
-            }
+        let place = op.place()?;
+        if place.projection.is_empty() {
+            Some(Value::Local(place.local))
+        } else {
+            None
         }
     }
 
@@ -168,6 +186,7 @@ impl<'tcx> Analyzer<'tcx> {
                 .entry(destination.local)
                 .or_default()
                 .insert(Value::IntraCall(local_def_id));
+            self.calls.insert(local_def_id);
         }
     }
 }

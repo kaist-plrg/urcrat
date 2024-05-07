@@ -115,6 +115,56 @@ pub fn inverse<T: Clone + Eq + std::hash::Hash>(
     inv
 }
 
+/// `map` must not have a cycle.
+pub fn post_order<T: Clone + Eq + std::hash::Hash>(
+    map: &HashMap<T, HashSet<T>>,
+    inv_map: &HashMap<T, HashSet<T>>,
+) -> Vec<Vec<T>> {
+    let mut res = vec![];
+    let clo = symmetric_closure(map);
+    let (_, components) = compute_sccs(&clo);
+
+    for (_, component) in components {
+        let mut v = vec![];
+        let mut reached = HashSet::new();
+        for node in component {
+            if inv_map.get(&node).unwrap().is_empty() {
+                dfs_walk(&node, &mut v, &mut reached, map);
+            }
+        }
+        res.push(v);
+    }
+
+    res
+}
+
+fn symmetric_closure<T: Clone + Eq + std::hash::Hash>(
+    map: &HashMap<T, HashSet<T>>,
+) -> HashMap<T, HashSet<T>> {
+    let mut clo = map.clone();
+    for (node, succs) in map {
+        for succ in succs {
+            clo.get_mut(succ).unwrap().insert(node.clone());
+        }
+    }
+    clo
+}
+
+fn dfs_walk<T: Clone + Eq + std::hash::Hash>(
+    node: &T,
+    v: &mut Vec<T>,
+    reached: &mut HashSet<T>,
+    map: &HashMap<T, HashSet<T>>,
+) {
+    reached.insert(node.clone());
+    for succ in map.get(node).unwrap() {
+        if !reached.contains(succ) {
+            dfs_walk(succ, v, reached, map);
+        }
+    }
+    v.push(node.clone());
+}
+
 pub fn compute_sccs<T: Clone + Eq + std::hash::Hash>(
     map: &HashMap<T, HashSet<T>>,
 ) -> (HashMap<usize, HashSet<usize>>, HashMap<usize, HashSet<T>>) {

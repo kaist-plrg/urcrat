@@ -53,7 +53,6 @@ fn main() {
             elapsed
         }
         Command::Must { may, r#union } => {
-            alloc_finder::analyze_path(&file);
             let solutions = may.map(|file| {
                 let arr = std::fs::read(file).unwrap();
                 points_to::deserialize_solutions(&arr)

@@ -58,6 +58,7 @@ pub struct BodyItem<'tcx> {
 #[derive(Debug)]
 pub struct PreAnalysisData<'tcx> {
     bodies: Vec<BodyItem<'tcx>>,
+    alloc_fns: HashSet<LocalDefId>,
 
     pub call_graph: HashMap<LocalDefId, HashSet<LocalDefId>>,
     indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, usize>>,
@@ -139,6 +140,7 @@ pub fn pre_analyze<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> PreAnalysisData<'tcx> {
     let hir = tcx.hir();
+    let alloc_fns = alloc_finder::analyze(tcx);
 
     let mut bodies = vec![];
     let mut fn_def_ids = HashSet::new();
@@ -256,17 +258,18 @@ pub fn pre_analyze<'a, 'tcx>(
                 }
                 _ => {
                     let def_id = some_or!(operand_to_fn(func), continue);
+                    let local_def_id = some_or!(def_id.as_local(), continue);
                     let ty = destination.ty(&item.body.local_decls, tcx).ty;
-                    if ty.is_unsafe_ptr() && is_c_fn(def_id, tcx) {
+                    if ty.is_unsafe_ptr()
+                        && (is_c_fn(def_id, tcx) || alloc_fns.contains(&local_def_id))
+                    {
                         allocs.push(Var::Alloc(item.local_def_id, bb));
                     }
-                    if let Some(callee) = def_id.as_local() {
-                        if fn_def_ids.contains(&callee) {
-                            call_graph
-                                .get_mut(&item.local_def_id)
-                                .unwrap()
-                                .insert(callee);
-                        }
+                    if fn_def_ids.contains(&local_def_id) {
+                        call_graph
+                            .get_mut(&item.local_def_id)
+                            .unwrap()
+                            .insert(local_def_id);
                     }
                 }
             }
@@ -283,6 +286,7 @@ pub fn pre_analyze<'a, 'tcx>(
 
     PreAnalysisData {
         bodies,
+        alloc_fns,
         call_graph,
         indirect_calls,
         ends,
@@ -308,7 +312,7 @@ pub fn analyze<'a, 'tcx>(
         graph: Graph::new(pre.ends.len()),
     };
     for item in &pre.bodies {
-        // println!("{}", compile_util::body_to_str(body));
+        // println!("{}", compile_util::body_to_str(item.body));
         for (block, bbd) in item.body.basic_blocks.iter_enumerated() {
             for stmt in bbd.statements.iter() {
                 let ctx = Context::new(&item.body.local_decls, item.local_def_id);
@@ -944,6 +948,10 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                             let loc = Loc::new_root(self.pre.vars[&var]);
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                         }
+                    } else if self.pre.alloc_fns.contains(&local_def_id) {
+                        let var = Var::Alloc(ctx.owner, block);
+                        let loc = Loc::new_root(self.pre.vars[&var]);
+                        self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                     } else {
                         let mut index = self.pre.globals[&local_def_id];
                         for (arg, arg_loc) in args.iter().zip(arg_locs) {

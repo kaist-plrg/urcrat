@@ -2141,6 +2141,59 @@ fn test_malloc_struct() {
     );
 }
 
+#[test]
+fn test_custom_malloc() {
+    // _2 = _1 as u64 (IntToInt)
+    // _0 = malloc(move _2) -> [return: bb1, unwind continue]
+    //
+    // _5 = std::mem::size_of::<i32>() -> [return: bb1, unwind continue]
+    // _4 = move _5 as u64 (IntToInt)
+    // _3 = move _4 as i32 (IntToInt)
+    // _2 = g(move _3) -> [return: bb2, unwind continue]
+    // _1 = move _2 as *mut i32 (PtrToPtr)
+    // _10 = std::mem::size_of::<i32>() -> [return: bb3, unwind continue]
+    // _9 = move _10 as u64 (IntToInt)
+    // _8 = move _9 as i32 (IntToInt)
+    // _7 = g(move _8) -> [return: bb4, unwind continue]
+    // _6 = move _7 as *mut i32 (PtrToPtr)
+    analyze_fn_with(
+        "
+        pub unsafe extern \"C\" fn g(mut x: libc::c_int) -> *mut libc::c_void {
+            return malloc(x as libc::c_ulong);
+        }
+        ",
+        "",
+        "
+        let mut x: *mut libc::c_int = g(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong as libc::c_int,
+        ) as *mut libc::c_int;
+        let mut y: *mut libc::c_int = g(
+            ::std::mem::size_of::<libc::c_int>() as libc::c_ulong as libc::c_int,
+        ) as *mut libc::c_int;
+        ",
+        |res, _| {
+            assert_eq!(res.ends, v(16));
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), vec![14]);
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), vec![15]);
+            assert_eq!(sol(&res, 5), vec![15]);
+            assert_eq!(sol(&res, 6), e());
+            assert_eq!(sol(&res, 7), e());
+            assert_eq!(sol(&res, 8), e());
+            assert_eq!(sol(&res, 9), vec![16]);
+            assert_eq!(sol(&res, 10), vec![16]);
+            assert_eq!(sol(&res, 11), e());
+            assert_eq!(sol(&res, 12), e());
+            assert_eq!(sol(&res, 13), e());
+            assert_eq!(sol(&res, 14), e());
+            assert_eq!(sol(&res, 15), e());
+            assert_eq!(sol(&res, 16), e());
+        },
+    );
+}
+
 fn l(block: usize, statement_index: usize) -> Location {
     Location {
         block: BasicBlock::new(block),
