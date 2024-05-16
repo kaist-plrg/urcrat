@@ -6,7 +6,7 @@ use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
 
 use super::*;
-use crate::{points_to, tag_analysis, ty_shape::TyShape};
+use crate::{may_analysis, tag_analysis, ty_shape::TyShape};
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -1099,7 +1099,7 @@ impl Graph {
         func: LocalDefId,
         strong_update: Option<&AbsLoc>,
         strong_local: bool,
-        may_points_to: &points_to::AnalysisResults,
+        may_points_to: &may_analysis::AnalysisResults,
         writes: &HybridBitSet<usize>,
     ) {
         let mut no_update_locals = HashSet::new();
@@ -1135,17 +1135,17 @@ impl Graph {
 struct InvalidateCtx<'a> {
     strong_update: Option<&'a AbsLoc>,
     no_update_locals: &'a HashSet<NodeId>,
-    may_points_to: &'a points_to::AnalysisResults,
+    may_points_to: &'a may_analysis::AnalysisResults,
     writes: &'a HybridBitSet<usize>,
 }
 
 fn invalidate_rec(
     loc: AbsLoc,
     obj: &mut Obj,
-    node: points_to::LocNode,
-    visited: &mut HashSet<(AbsLoc, points_to::LocNode)>,
+    node: may_analysis::LocNode,
+    visited: &mut HashSet<(AbsLoc, may_analysis::LocNode)>,
     ctx: InvalidateCtx<'_>,
-) -> Vec<(AbsLoc, points_to::LocNode)> {
+) -> Vec<(AbsLoc, may_analysis::LocNode)> {
     if !visited.insert((loc.clone(), node)) {
         return vec![];
     }
@@ -1153,7 +1153,7 @@ fn invalidate_rec(
     match obj {
         Obj::Top | Obj::AtAddr(_) => vec![],
         Obj::Ptr(ptr_loc) => {
-            let v = if let points_to::LocEdges::Deref(nodes) = edges {
+            let v = if let may_analysis::LocEdges::Deref(nodes) = edges {
                 nodes.iter().map(|node| (ptr_loc.clone(), *node)).collect()
             } else {
                 vec![]
@@ -1174,7 +1174,7 @@ fn invalidate_rec(
         }
         Obj::Struct(fs, is_union) => {
             let mut v = vec![];
-            if let points_to::LocEdges::Fields(fs2) = edges {
+            if let may_analysis::LocEdges::Fields(fs2) = edges {
                 for (index, node) in fs2.iter().enumerate() {
                     let index = index as u32;
                     let obj = some_or!(fs.get_mut(&index), continue);
@@ -1201,7 +1201,7 @@ fn invalidate_rec(
         }
         Obj::Array(vs) => {
             let mut v = vec![];
-            if let points_to::LocEdges::Index(node) = edges {
+            if let may_analysis::LocEdges::Index(node) = edges {
                 for (elem, obj) in vs {
                     let loc = loc.clone().push_index(elem.clone());
                     v.extend(invalidate_rec(loc, obj, *node, visited, ctx));

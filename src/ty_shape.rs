@@ -117,7 +117,7 @@ fn compute_ty_shapes<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
         };
         for local_decl in body.local_decls.iter() {
             compute_ty_shape(local_decl.ty, def_id, tss, tcx);
-            if let Some(ty) = points_to::unwrap_ptr(local_decl.ty) {
+            if let Some(ty) = may_analysis::unwrap_ptr(local_decl.ty) {
                 compute_ty_shape(ty, def_id, tss, tcx);
             }
         }

@@ -508,7 +508,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             );
         }
 
-        let (ty, method) = points_to::receiver_and_method(f, self.tcx).unwrap();
+        let (ty, method) = may_analysis::receiver_and_method(f, self.tcx).unwrap();
         match args.len() {
             1 => {
                 let offset = self.ctx.tss.bitfields[&ty][&method];

@@ -49,10 +49,10 @@ fn main() {
     let elapsed = match args.command {
         Command::May { dump } => {
             let start = std::time::Instant::now();
-            let solutions = points_to::analyze_path(&file);
+            let solutions = may_analysis::analyze_path(&file);
             let elapsed = start.elapsed();
             if let Some(dump) = dump {
-                let arr = points_to::serialize_solutions(&solutions);
+                let arr = may_analysis::serialize_solutions(&solutions);
                 std::fs::write(dump, arr).unwrap();
             }
             elapsed
@@ -64,7 +64,7 @@ fn main() {
         } => {
             let solutions = may.map(|file| {
                 let arr = std::fs::read(file).unwrap();
-                points_to::deserialize_solutions(&arr)
+                may_analysis::deserialize_solutions(&arr)
             });
             let conf = tag_analysis::Config {
                 solutions,

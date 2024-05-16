@@ -4,7 +4,7 @@ use std::{
 };
 
 use etrace::some_or;
-use relational::Obj;
+use must_analysis::Obj;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_hir::{
     def::Res,
@@ -26,12 +26,12 @@ use rustc_session::config::Input;
 use rustc_span::def_id::LocalDefId;
 use typed_arena::Arena;
 
-use self::relational::{AbsInt, AbsMem, AccPath};
+use self::must_analysis::{AbsInt, AbsMem, AccPath};
 use crate::*;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub solutions: Option<points_to::Solutions>,
+    pub solutions: Option<may_analysis::Solutions>,
     pub unions: HashSet<String>,
 }
 
@@ -55,12 +55,12 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let (local_tys, foreign_tys) = visitor.find_foreign_tys(tcx);
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = points_to::pre_analyze(&tss, tcx);
+    let pre = may_analysis::pre_analyze(&tss, tcx);
     let solutions = conf
         .solutions
         .clone()
-        .unwrap_or_else(|| points_to::analyze(&pre, &tss, tcx));
-    let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
+        .unwrap_or_else(|| may_analysis::analyze(&pre, &tss, tcx));
+    let may_points_to = may_analysis::post_analyze(pre, solutions, &tss, tcx);
 
     let mut structs = vec![];
     let mut unions = vec![];
@@ -192,14 +192,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
         }
         println!("{:?}", local_def_id);
-        let ctx = relational::AnalysisContext {
+        let ctx = must_analysis::AnalysisContext {
             local_def_id,
             tss: &tss,
             may_points_to: &may_points_to,
             no_gc_locals: Some(&locals),
             gc: true,
         };
-        let states = relational::analyze_body(body, ctx, tcx);
+        let states = must_analysis::analyze_body(body, ctx, tcx);
         for access in visitor.accesses {
             if matches!(
                 access.ctx,

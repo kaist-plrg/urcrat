@@ -35,9 +35,9 @@ fn analyze_input(input: Input, gc: bool) -> AnalysisResults {
 pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
     let arena = Arena::new();
     let tss = get_ty_shapes(&arena, tcx);
-    let pre = points_to::pre_analyze(&tss, tcx);
-    let solutions = points_to::analyze(&pre, &tss, tcx);
-    let may_points_to = points_to::post_analyze(pre, solutions, &tss, tcx);
+    let pre = may_analysis::pre_analyze(&tss, tcx);
+    let solutions = may_analysis::analyze(&pre, &tss, tcx);
+    let may_points_to = may_analysis::post_analyze(pre, solutions, &tss, tcx);
     let hir = tcx.hir();
     let functions = hir
         .items()
@@ -69,7 +69,7 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
 pub struct AnalysisContext<'a, 'b, 'tcx> {
     pub local_def_id: LocalDefId,
     pub tss: &'a TyShapes<'a, 'tcx>,
-    pub may_points_to: &'b points_to::AnalysisResults,
+    pub may_points_to: &'b may_analysis::AnalysisResults,
     pub no_gc_locals: Option<&'b BitSet<Local>>,
     pub gc: bool,
 }
