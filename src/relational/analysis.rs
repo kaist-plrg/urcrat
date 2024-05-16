@@ -51,40 +51,55 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
                 ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
                 _ => return None,
             };
-            let res = analyze_fn(local_def_id, body, &tss, &may_points_to, gc, tcx).in_states;
-            Some((local_def_id, res))
+            let ctx = AnalysisContext {
+                local_def_id,
+                tss: &tss,
+                may_points_to: &may_points_to,
+                no_gc_locals: None,
+                gc,
+            };
+            Some((local_def_id, analyze_body(body, ctx, tcx)))
         })
         .collect();
     AnalysisResults { functions }
 }
 
-pub fn analyze_fn<'a, 'tcx>(
-    local_def_id: LocalDefId,
+#[allow(missing_debug_implementations)]
+#[derive(Clone, Copy)]
+pub struct AnalysisContext<'a, 'b, 'tcx> {
+    pub local_def_id: LocalDefId,
+    pub tss: &'a TyShapes<'a, 'tcx>,
+    pub may_points_to: &'b points_to::AnalysisResults,
+    pub no_gc_locals: Option<&'b BitSet<Local>>,
+    pub gc: bool,
+}
+
+pub fn analyze_body<'tcx>(
     body: &'tcx Body<'tcx>,
-    tss: &'a TyShapes<'a, 'tcx>,
-    may_points_to: &'a points_to::AnalysisResults,
-    gc: bool,
+    ctx: AnalysisContext<'_, '_, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> FnAnalysisResult {
+) -> HashMap<Location, AbsMem> {
     // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let loop_heads: HashSet<_> = loop_blocks.keys().map(|bb| bb.start_location()).collect();
     let rpo_map = compute_rpo_map(body, &loop_blocks);
-    let dead_locals = get_dead_locals(body, tcx);
+    let mut dead_locals = get_dead_locals(body, tcx);
+    if let Some(no_gc) = ctx.no_gc_locals {
+        for dead in &mut dead_locals {
+            dead.subtract(no_gc);
+        }
+    }
     let discriminant_values = find_discriminant_values(body);
     let analyzer = Analyzer {
+        ctx,
         tcx,
         body,
         loop_heads,
         rpo_map,
         dead_locals,
-        local_def_id,
         discriminant_values,
-        tss,
-        may_points_to,
-        gc,
     };
     analyzer.analyze()
 }
@@ -95,38 +110,28 @@ pub struct AnalysisResults {
 }
 
 #[allow(missing_debug_implementations)]
-pub struct Analyzer<'tcx, 'a> {
+pub struct Analyzer<'tcx, 'a, 'b> {
+    pub ctx: AnalysisContext<'a, 'b, 'tcx>,
     pub tcx: TyCtxt<'tcx>,
     pub body: &'tcx Body<'tcx>,
     pub loop_heads: HashSet<Location>,
     pub rpo_map: HashMap<BasicBlock, usize>,
     pub dead_locals: Vec<BitSet<Local>>,
-    pub local_def_id: LocalDefId,
     pub discriminant_values: HashMap<BasicBlock, DiscrVal>,
-    pub tss: &'a TyShapes<'a, 'tcx>,
-    pub may_points_to: &'a points_to::AnalysisResults,
-    pub gc: bool,
 }
 
-#[derive(Debug)]
-pub struct FnAnalysisResult {
-    pub in_states: HashMap<Location, AbsMem>,
-    pub out_states: HashMap<(Location, Location), AbsMem>,
-}
-
-impl Analyzer<'_, '_> {
-    fn analyze(&self) -> FnAnalysisResult {
+impl Analyzer<'_, '_, '_> {
+    fn analyze(&self) -> HashMap<Location, AbsMem> {
         let bot = AbsMem::bot();
 
         let mut work_list = WorkList::new(&self.rpo_map);
         work_list.push(Location::START);
 
-        let mut in_states = HashMap::new();
-        in_states.insert(Location::START, AbsMem::top());
-        let mut out_states: HashMap<(Location, Location), AbsMem> = HashMap::new();
+        let mut states = HashMap::new();
+        states.insert(Location::START, AbsMem::top());
 
         while let Some(location) = work_list.pop() {
-            let state = in_states.get(&location).unwrap_or(&bot);
+            let state = states.get(&location).unwrap_or(&bot);
             let nexts = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
@@ -144,39 +149,32 @@ impl Analyzer<'_, '_> {
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
-                let out_state = out_states.get(&(location, next_location)).unwrap_or(&bot);
-                let new_out_state = out_state.join(&new_next_state);
-                out_states.insert((location, next_location), new_out_state);
-
-                let next_state = in_states.get(&next_location).unwrap_or(&bot);
+                let next_state = states.get(&next_location).unwrap_or(&bot);
                 let mut joined = if self.loop_heads.contains(&next_location) {
                     next_state.widen(&new_next_state)
                 } else {
                     next_state.join(&new_next_state)
                 };
-                if self.gc && next_location.statement_index == 0 {
+                if self.ctx.gc && next_location.statement_index == 0 {
                     let dead_locals = &self.dead_locals[next_location.block.as_usize()];
                     joined.clear_dead_locals(dead_locals);
                 }
                 if !joined.ord(next_state) {
-                    in_states.insert(next_location, joined);
+                    states.insert(next_location, joined);
                     work_list.push(next_location);
                 }
             }
         }
 
-        FnAnalysisResult {
-            in_states,
-            out_states,
-        }
+        states
     }
 
     pub fn resolve_indirect_call(&self, loc: Location) -> &[LocalDefId] {
-        &self.may_points_to.indirect_calls[&self.local_def_id][&loc.block]
+        &self.ctx.may_points_to.indirect_calls[&self.ctx.local_def_id][&loc.block]
     }
 
     pub fn get_assign_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
-        let w = &self.may_points_to.writes[&self.local_def_id][&loc];
+        let w = &self.ctx.may_points_to.writes[&self.ctx.local_def_id][&loc];
         if w.is_empty() {
             None
         } else {
@@ -185,7 +183,7 @@ impl Analyzer<'_, '_> {
     }
 
     pub fn get_bitfield_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
-        let w = self.may_points_to.bitfield_writes[&self.local_def_id].get(&loc)?;
+        let w = self.ctx.may_points_to.bitfield_writes[&self.ctx.local_def_id].get(&loc)?;
         if w.is_empty() {
             None
         } else {
@@ -195,9 +193,9 @@ impl Analyzer<'_, '_> {
 
     pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<HybridBitSet<usize>> {
         let c0 = callees.get(0)?;
-        let mut writes = self.may_points_to.call_writes(*c0);
+        let mut writes = self.ctx.may_points_to.call_writes(*c0);
         for c in &callees[1..] {
-            writes.union(&self.may_points_to.call_writes(*c));
+            writes.union(&self.ctx.may_points_to.call_writes(*c));
         }
         if writes.is_empty() {
             None
@@ -212,11 +210,11 @@ impl Analyzer<'_, '_> {
     ) -> Option<HybridBitSet<usize>> {
         let mut writes = locals
             .flat_map(|local| {
-                let start = self.may_points_to.var_nodes[&(self.local_def_id, local)].index;
-                let end = self.may_points_to.ends[start];
+                let start = self.ctx.may_points_to.var_nodes[&(self.ctx.local_def_id, local)].index;
+                let end = self.ctx.may_points_to.ends[start];
                 start..=end
             })
-            .map(|index| &self.may_points_to.solutions[index]);
+            .map(|index| &self.ctx.may_points_to.solutions[index]);
         let mut w = writes.next()?.clone();
         for write in writes {
             w.union(write);

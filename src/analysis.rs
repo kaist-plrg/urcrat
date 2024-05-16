@@ -12,7 +12,7 @@ use rustc_hir::{
     intravisit::{self, Visitor as HVisitor},
     Expr, ExprKind, ItemKind, Node, QPath, VariantData,
 };
-use rustc_index::IndexVec;
+use rustc_index::{bit_set::BitSet, IndexVec};
 use rustc_middle::{
     hir::nested_filter,
     mir::{
@@ -160,7 +160,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         for a in &visitor.accesses {
             fields.entry(a.ty).or_default().insert(a.field);
         }
-        let locals: HashSet<_> = visitor
+        let local_set: HashSet<_> = visitor
             .accesses
             .iter()
             .map(|a| a.local)
@@ -173,8 +173,12 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     .map(|(local, _)| *local),
             )
             .collect();
+        let mut locals = BitSet::new_empty(body.local_decls.len());
+        for l in local_set {
+            locals.insert(l);
+        }
         let mut local_to_unions: HashMap<_, Vec<_>> = HashMap::new();
-        for i in locals {
+        for i in locals.iter() {
             let local = &body.local_decls[i];
             let (local_def_id, elems) = some_or!(ty_to_proj(local.ty), continue);
             for (u, paths) in &paths_to_unions {
@@ -188,7 +192,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
         }
         println!("{:?}", local_def_id);
-        let states = relational::analyze_fn(local_def_id, body, &tss, &may_points_to, true, tcx);
+        let ctx = relational::AnalysisContext {
+            local_def_id,
+            tss: &tss,
+            may_points_to: &may_points_to,
+            no_gc_locals: Some(&locals),
+            gc: true,
+        };
+        let states = relational::analyze_body(body, ctx, tcx);
         for access in visitor.accesses {
             if matches!(
                 access.ctx,
@@ -197,7 +208,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 continue;
             }
             let span = body.source_info(access.location).span;
-            let tags = compute_tags(access, &states.in_states, &body.local_decls, tcx);
+            let tags = compute_tags(access, &states, &body.local_decls, tcx);
             for (f, ns) in tags {
                 let vs = variant_tag_values
                     .entry(access.ty)
@@ -211,11 +222,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 }
             }
         }
-        for (loc, mem) in states
-            .in_states
-            .iter()
-            .chain(states.out_states.iter().map(|((l, _), m)| (l, m)))
-        {
+        for (loc, mem) in &states {
             let Location {
                 block,
                 statement_index,

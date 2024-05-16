@@ -13,7 +13,7 @@ use rustc_span::def_id::LocalDefId;
 use super::*;
 use crate::*;
 
-impl<'tcx> Analyzer<'tcx, '_> {
+impl<'tcx> Analyzer<'tcx, '_, '_> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, stmt_loc: Location, state: &mut AbsMem) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         if l.projection.is_empty() {
@@ -24,10 +24,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if let Some(writes) = self.get_assign_writes(stmt_loc) {
             let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
             state.gm().invalidate(
-                self.local_def_id,
+                self.ctx.local_def_id,
                 strong_update.as_ref(),
                 !l_deref,
-                self.may_points_to,
+                self.ctx.may_points_to,
                 writes,
             );
         }
@@ -36,7 +36,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 let r = self.transfer_op(r, state);
                 state
                     .gm()
-                    .assign_with_ty(&l, l_deref, &r, self.tss.tys[&lty]);
+                    .assign_with_ty(&l, l_deref, &r, self.ctx.tss.tys[&lty]);
             }
             Rvalue::Cast(kind, r, ty) => match kind {
                 CastKind::IntToInt => {
@@ -72,21 +72,24 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     | PointerCoercion::UnsafeFnPointer
                     | PointerCoercion::ClosureFnPointer(_)
                     | PointerCoercion::ArrayToPointer => {
-                        state
-                            .gm()
-                            .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&lty]);
+                        state.gm().assign_with_ty(
+                            &l,
+                            l_deref,
+                            &OpVal::Other,
+                            self.ctx.tss.tys[&lty],
+                        );
                     }
                     PointerCoercion::MutToConstPointer | PointerCoercion::Unsize => {
                         let r = self.transfer_op(r, state);
                         state
                             .gm()
-                            .assign_with_ty(&l, l_deref, &r, self.tss.tys[&lty]);
+                            .assign_with_ty(&l, l_deref, &r, self.ctx.tss.tys[&lty]);
                     }
                 },
                 _ => {
                     state
                         .gm()
-                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&lty]);
+                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.ctx.tss.tys[&lty]);
                 }
             },
             Rvalue::Repeat(r, len) => {
@@ -95,7 +98,9 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 let TyKind::Array(ty, _) = lty.kind() else { unreachable!() };
                 for i in 0..len.min(10) {
                     let l = l.extended(&[AccElem::num_index(i as _)]);
-                    state.gm().assign_with_ty(&l, l_deref, &r, self.tss.tys[ty]);
+                    state
+                        .gm()
+                        .assign_with_ty(&l, l_deref, &r, self.ctx.tss.tys[ty]);
                 }
             }
             Rvalue::Ref(_, _, r) => {
@@ -177,7 +182,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     let ty = variant.fields[*field].ty(self.tcx, gargs);
                     state
                         .gm()
-                        .assign_with_ty(&l, l_deref, &v, self.tss.tys[&ty]);
+                        .assign_with_ty(&l, l_deref, &v, self.ctx.tss.tys[&ty]);
                 } else {
                     let tys = match lty.kind() {
                         TyKind::Adt(adt_def, gargs) => {
@@ -199,7 +204,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                         let l = l.extended(&[AccElem::Field(field.as_u32(), false)]);
                         state
                             .gm()
-                            .assign_with_ty(&l, l_deref, &v, self.tss.tys[&ty]);
+                            .assign_with_ty(&l, l_deref, &v, self.ctx.tss.tys[&ty]);
                     }
                 }
             }
@@ -398,10 +403,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
                 if let Some(writes) = self.get_assign_writes(term_loc) {
                     let strong_update = state.g().strong_update_loc(l.clone(), l_deref);
                     state.gm().invalidate(
-                        self.local_def_id,
+                        self.ctx.local_def_id,
                         strong_update.as_ref(),
                         !l_deref,
-                        self.may_points_to,
+                        self.ctx.may_points_to,
                         writes,
                     );
                 }
@@ -460,7 +465,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
                     let ty = Place::ty(destination, &self.body.local_decls, self.tcx).ty;
                     state
                         .gm()
-                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.tss.tys[&ty]);
+                        .assign_with_ty(&l, l_deref, &OpVal::Other, self.ctx.tss.tys[&ty]);
                 }
                 vec![(location, state)]
             }
@@ -470,9 +475,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
 
     fn transfer_intra_call(&self, callees: &[LocalDefId], state: &mut AbsMem) {
         if let Some(writes) = self.get_call_writes(callees) {
-            state
-                .gm()
-                .invalidate(self.local_def_id, None, false, self.may_points_to, &writes);
+            state.gm().invalidate(
+                self.ctx.local_def_id,
+                None,
+                false,
+                self.ctx.may_points_to,
+                &writes,
+            );
         }
     }
 
@@ -491,10 +500,10 @@ impl<'tcx> Analyzer<'tcx, '_> {
         if let Some(writes) = self.get_bitfield_writes(loc) {
             let strong_update = state.g().strong_update_loc(l.clone(), true);
             state.gm().invalidate(
-                self.local_def_id,
+                self.ctx.local_def_id,
                 strong_update.as_ref(),
                 false,
-                self.may_points_to,
+                self.ctx.may_points_to,
                 writes,
             );
         }
@@ -502,7 +511,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
         let (ty, method) = points_to::receiver_and_method(f, self.tcx).unwrap();
         match args.len() {
             1 => {
-                let offset = self.tss.bitfields[&ty][&method];
+                let offset = self.ctx.tss.bitfields[&ty][&method];
                 let mut r = l;
                 r.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = OpVal::Place(r, true);
@@ -510,7 +519,7 @@ impl<'tcx> Analyzer<'tcx, '_> {
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
-                let offset = self.tss.bitfields[&ty][field];
+                let offset = self.ctx.tss.bitfields[&ty][field];
                 l.extend_projection(&[AccElem::Field(offset as _, false)]);
                 let r = self.transfer_op(&args[1], state);
                 state.gm().assign(&l, true, &r);
@@ -539,9 +548,13 @@ impl<'tcx> Analyzer<'tcx, '_> {
             None
         });
         if let Some(writes) = self.get_arg_writes(args) {
-            state
-                .gm()
-                .invalidate(self.local_def_id, None, false, self.may_points_to, &writes);
+            state.gm().invalidate(
+                self.ctx.local_def_id,
+                None,
+                false,
+                self.ctx.may_points_to,
+                &writes,
+            );
         }
     }
 
