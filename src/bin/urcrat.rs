@@ -66,12 +66,12 @@ fn main() {
                 let arr = std::fs::read(file).unwrap();
                 points_to::deserialize_solutions(&arr)
             });
-            let conf = analysis::Config {
+            let conf = tag_analysis::Config {
                 solutions,
                 unions: r#union.into_iter().collect(),
             };
             let start = std::time::Instant::now();
-            analysis::analyze_path(&file, &conf);
+            tag_analysis::analyze_path(&file, &conf);
 
             if let Some(mut output) = output {
                 output.push(args.input.file_name().unwrap());

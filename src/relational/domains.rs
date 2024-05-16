@@ -6,7 +6,7 @@ use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
 
 use super::*;
-use crate::{points_to, ty_shape::TyShape};
+use crate::{points_to, tag_analysis, ty_shape::TyShape};
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -766,26 +766,26 @@ impl Graph {
         }
     }
 
-    pub fn objs_at(&self, l: Local, proj: &[crate::analysis::AccElem]) -> Vec<&Obj> {
+    pub fn objs_at(&self, l: Local, proj: &[tag_analysis::AccElem]) -> Vec<&Obj> {
         let id = some_or!(self.locals.get(&l), return vec![]);
         self.obj_at_rec(&self.nodes[*id].obj, proj)
     }
 
-    fn obj_at_rec<'a>(&'a self, obj: &'a Obj, proj: &[crate::analysis::AccElem]) -> Vec<&'a Obj> {
+    fn obj_at_rec<'a>(&'a self, obj: &'a Obj, proj: &[tag_analysis::AccElem]) -> Vec<&'a Obj> {
         if let Some(elem) = proj.get(0) {
             match elem {
-                crate::analysis::AccElem::Field(f) => {
+                tag_analysis::AccElem::Field(f) => {
                     let Obj::Struct(fs, _) = obj else { return vec![] };
                     let obj = some_or!(fs.get(f), return vec![]);
                     self.obj_at_rec(obj, &proj[1..])
                 }
-                crate::analysis::AccElem::Index => {
+                tag_analysis::AccElem::Index => {
                     let Obj::Array(vs) = obj else { return vec![] };
                     vs.values()
                         .flat_map(|obj| self.obj_at_rec(obj, &proj[1..]))
                         .collect()
                 }
-                crate::analysis::AccElem::Deref => {
+                tag_analysis::AccElem::Deref => {
                     let Obj::Ptr(loc) = obj else { return vec![] };
                     let obj = some_or!(self.obj_at_location(loc), return vec![]);
                     self.obj_at_rec(obj, &proj[1..])

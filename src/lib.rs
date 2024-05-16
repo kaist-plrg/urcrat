@@ -53,7 +53,6 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 pub mod alloc_finder;
-pub mod analysis;
 pub mod andersen;
 pub mod compile_util;
 pub mod disjoint_set;
@@ -61,5 +60,6 @@ pub mod graph;
 pub mod points_to;
 pub mod relational;
 pub mod steensgaard;
+pub mod tag_analysis;
 pub mod ty_finder;
 pub mod ty_shape;
