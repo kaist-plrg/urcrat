@@ -23,7 +23,7 @@ use rustc_middle::{
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{def_id::LocalDefId, Span};
 use typed_arena::Arena;
 
 use self::must_analysis::{AbsInt, AbsMem, AccPath};
@@ -62,7 +62,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         .unwrap_or_else(|| may_analysis::analyze(&pre, &tss, tcx));
     let may_points_to = may_analysis::post_analyze(pre, solutions, &tss, tcx);
 
-    let mut structs = vec![];
+    let mut structs = HashMap::new();
     let mut unions = vec![];
     let mut union_to_struct = HashMap::new();
     let mut ty_graph: HashMap<_, Vec<_>> = HashMap::new();
@@ -100,7 +100,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         if !has_int_field && !tss.bitfields.contains_key(&local_def_id) {
             continue;
         }
-        let mut has_union = false;
+        let mut struct_unions = vec![];
         for (i, f) in variant.fields.iter_enumerated() {
             let TyKind::Adt(adt_def, _) = f.ty(tcx, List::empty()).kind() else { continue };
             if !adt_def.is_union() {
@@ -120,11 +120,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             {
                 unions.push(u);
                 union_to_struct.insert(u, (i, local_def_id));
-                has_union = true;
+                struct_unions.push((i, u));
             }
         }
-        if has_union {
-            structs.push(local_def_id);
+        if !struct_unions.is_empty() {
+            structs.insert(local_def_id, struct_unions);
         }
     }
 
@@ -141,6 +141,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<u128>>> = HashMap::new();
     let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, BTreeSet<_>>>>> =
         HashMap::new();
+    let mut aggregates: HashMap<_, _> = HashMap::new();
+    let mut field_values: HashMap<FieldAt, BTreeSet<u128>> = HashMap::new();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let local_def_id = item_id.owner_id.def_id;
@@ -156,6 +158,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             && visitor.aggregates.is_empty()
         {
             continue;
+        }
+        for vs in visitor.aggregates.values() {
+            for (local, location) in vs {
+                let span = body
+                    .stmt_at(*location)
+                    .either(|stmt| stmt.source_info.span, |term| term.source_info.span);
+                aggregates.insert(span, (*local, *location));
+            }
         }
         for a in &visitor.accesses {
             fields.entry(a.ty).or_default().insert(a.field);
@@ -250,6 +260,16 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                                 .entry(*u)
                                 .or_default()
                                 .entry(*f)
+                                .or_default()
+                                .extend(n.into_set());
+                            let field_at = FieldAt {
+                                func: local_def_id,
+                                location: *loc,
+                                local: *l,
+                                field: *f,
+                            };
+                            field_values
+                                .entry(field_at)
                                 .or_default()
                                 .extend(n.into_set());
                         }
@@ -447,12 +467,23 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         let (ItemKind::Fn(_, _, body_id) | ItemKind::Static(_, _, body_id)) = item.kind else {
             continue;
         };
-        let body = hir.body(body_id);
+        let hir_body = hir.body(body_id);
+        let local_def_id = item_id.owner_id.def_id;
+        // let mir_body = if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+        //     tcx.optimized_mir(local_def_id)
+        // } else {
+        //     tcx.mir_for_ctfe(local_def_id)
+        // };
         let mut visitor = HBodyVisitor {
             tcx,
+            // mir_body,
+            func: local_def_id,
+            structs: &structs,
             struct_tag_fields: &struct_tag_fields,
+            aggregates: &aggregates,
+            field_values: &field_values,
         };
-        visitor.visit_body(body);
+        visitor.visit_body(hir_body);
     }
 }
 
@@ -538,7 +569,7 @@ fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
 struct MBodyVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
-    structs: &'a Vec<LocalDefId>,
+    structs: &'a HashMap<LocalDefId, Vec<(FieldIdx, LocalDefId)>>,
     unions: &'a Vec<LocalDefId>,
     accesses: Vec<FieldAccess<'tcx>>,
     struct_accesses: HashSet<Local>,
@@ -549,7 +580,7 @@ impl<'tcx, 'a> MBodyVisitor<'tcx, 'a> {
     fn new(
         tcx: TyCtxt<'tcx>,
         local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
-        structs: &'a Vec<LocalDefId>,
+        structs: &'a HashMap<LocalDefId, Vec<(FieldIdx, LocalDefId)>>,
         unions: &'a Vec<LocalDefId>,
     ) -> Self {
         Self {
@@ -577,7 +608,7 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
                 .ty;
                 let TyKind::Adt(adt_def, _) = ty.kind() else { continue };
                 let def_id = some_or!(adt_def.did().as_local(), continue);
-                if self.structs.contains(&def_id) {
+                if self.structs.contains_key(&def_id) {
                     self.struct_accesses.insert(place.local);
                 } else if self.unions.contains(&def_id) {
                     let ProjectionElem::Field(f, _) = place.projection[i + 1] else {
@@ -601,7 +632,7 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         if let Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, _), _) = rvalue {
             if let Some(def_id) = def_id.as_local() {
-                if self.structs.contains(&def_id) || self.unions.contains(&def_id) {
+                if self.structs.contains_key(&def_id) || self.unions.contains(&def_id) {
                     self.aggregates
                         .entry(def_id)
                         .or_default()
@@ -622,7 +653,7 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
                     let TyKind::Ref(_, ty, _) = ty.kind() else { unreachable!() };
                     let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
                     let local_def_id = adt_def.did().expect_local();
-                    if self.structs.contains(&local_def_id) {
+                    if self.structs.contains_key(&local_def_id) {
                         self.struct_accesses.insert(args[0].place().unwrap().local);
                     }
                 }
@@ -660,27 +691,68 @@ impl<'tcx> FieldAccess<'tcx> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FieldAt {
+    func: LocalDefId,
+    location: Location,
+    local: Local,
+    field: u32,
+}
+
 struct HBodyVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    // mir_body: &'a rustc_middle::mir::Body<'tcx>,
+    func: LocalDefId,
+    structs: &'a HashMap<LocalDefId, Vec<(FieldIdx, LocalDefId)>>,
     struct_tag_fields: &'a HashMap<LocalDefId, u32>,
+    aggregates: &'a HashMap<Span, (Local, Location)>,
+    field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
 }
 
 impl<'tcx> HBodyVisitor<'_, 'tcx> {
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let source_map = self.tcx.sess.source_map();
         match expr.kind {
-            ExprKind::Struct(path, _fs, _) => {
+            ExprKind::Struct(path, fs, _) => {
                 let QPath::Resolved(_, path) = path else { return };
                 let Res::Def(_, def_id) = path.res else { return };
                 let def_id = some_or!(def_id.as_local(), return);
-                let _tag_field_idx = *some_or!(self.struct_tag_fields.get(&def_id), return);
-                println!(
-                    "{}",
-                    self.tcx
-                        .sess
-                        .source_map()
-                        .span_to_snippet(expr.span)
-                        .unwrap()
-                );
+                let tag_field_idx = *some_or!(self.struct_tag_fields.get(&def_id), return);
+                let unions = some_or!(self.structs.get(&def_id), return);
+
+                let span = fs[tag_field_idx as usize].span;
+                let span = source_map.span_extend_to_line(span);
+                println!("{}", source_map.span_to_snippet(span).unwrap());
+
+                let (local, mut location) = self.aggregates[&expr.span];
+                location.statement_index += 1;
+                let field_at = FieldAt {
+                    func: self.func,
+                    location,
+                    local,
+                    field: tag_field_idx,
+                };
+                let values = &self.field_values[&field_at];
+                println!("{:?}", values);
+                assert_eq!(values.len(), 1);
+                let tag = values.iter().next().unwrap();
+
+                for (i, u) in unions {
+                    let expr = fs[i.as_usize()].expr;
+                    println!("{}", source_map.span_to_snippet(expr.span).unwrap());
+
+                    let ExprKind::Struct(path, ufs, _) = expr.kind else { unreachable!() };
+                    let union_name = source_map.span_to_snippet(path.span()).unwrap();
+                    let QPath::Resolved(_, path) = path else { unreachable!() };
+                    let Res::Def(_, def_id) = path.res else { unreachable!() };
+                    assert_eq!(def_id.expect_local(), *u);
+                    assert_eq!(ufs.len(), 1);
+                    let name = ufs[0].ident.name.to_ident_string();
+                    let span = ufs[0].expr.span;
+                    let init = source_map.span_to_snippet(span).unwrap();
+                    let v = format!("{}::{}{}({})", union_name, name, tag, init);
+                    println!("{}", v);
+                }
             }
             ExprKind::Field(_, _) => {}
             _ => {}
