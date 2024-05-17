@@ -99,8 +99,11 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
     }
 }
 
-pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &HashMap<P, Vec<Suggestion>>) {
+pub type Suggestions = HashMap<PathBuf, Vec<Suggestion>>;
+
+pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &mut Suggestions) {
     for (path, suggestions) in suggestions {
+        suggestions.sort_by_key(|s| s.snippets[0].range.start);
         let code = String::from_utf8(fs::read(path).unwrap()).unwrap();
         let fixed = rustfix::apply_suggestions(&code, suggestions).unwrap();
         fs::write(path, fixed.as_bytes()).unwrap();

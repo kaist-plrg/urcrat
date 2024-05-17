@@ -368,17 +368,22 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let source_map = tcx.sess.source_map();
 
     let mut struct_tag_fields = HashMap::new();
+    let mut suggestions: HashMap<_, Vec<_>> = HashMap::new();
     for (s, us) in rewrite_structs {
         let fs = us.iter().map(|(_, f, _)| *f).collect::<HashSet<_>>();
         assert_eq!(fs.len(), 1);
         let field_idx = fs.into_iter().next().unwrap();
         struct_tag_fields.insert(s, field_idx);
         let Node::Item(item) = hir.get_if_local(s.to_def_id()).unwrap() else { unreachable!() };
+        let file = compile_util::span_to_path(item.span, source_map).unwrap();
+        let v = suggestions.entry(file.clone()).or_default();
         let struct_name = item.ident.name.to_ident_string();
         let ItemKind::Struct(VariantData::Struct(sfs, _), _) = item.kind else { unreachable!() };
         let field = &sfs[field_idx.as_usize()];
         let span = source_map.span_extend_to_line(field.span);
-        println!("{}", source_map.span_to_snippet(span).unwrap());
+        let snippet = compile_util::span_to_snippet(span, source_map);
+        let suggestion = compile_util::make_suggestion(snippet, "".to_string());
+        v.push(suggestion);
         let field_name = field.ident.name.to_ident_string();
         let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
 
@@ -386,7 +391,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             let struct_field_name = sfs[i.as_usize()].ident.name.to_ident_string();
             let Node::Item(item) = hir.get_if_local(u.to_def_id()).unwrap() else { unreachable!() };
             let union_name = item.ident.name.to_ident_string();
-            println!("{}", source_map.span_to_snippet(item.span).unwrap());
             let ItemKind::Union(VariantData::Struct(ufs, _), _) = item.kind else { unreachable!() };
             let tys: Vec<_> = ufs
                 .iter()
@@ -462,9 +466,10 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
             enum_str.push('}');
             get_tag_method.push_str("}}}");
-            println!("{}", enum_str);
-            println!("{}", get_tag_method);
-            println!("{}", field_methods);
+            let snippet = compile_util::span_to_snippet(item.span, source_map);
+            let code = format!("{}\n{}\n{}", enum_str, field_methods, get_tag_method);
+            let suggestion = compile_util::make_suggestion(snippet, code);
+            v.push(suggestion);
         }
     }
 
@@ -493,6 +498,13 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             unions: &unions,
         };
         visitor.visit_body(hir_body);
+    }
+
+    for (path, suggestions) in &suggestions {
+        println!("{:?}", path);
+        for suggestion in suggestions {
+            println!("{:?}", suggestion);
+        }
     }
 }
 

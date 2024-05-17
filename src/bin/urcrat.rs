@@ -62,6 +62,19 @@ fn main() {
             r#union,
             output,
         } => {
+            let file = if let Some(mut output) = output {
+                output.push(args.input.file_name().unwrap());
+                if output.exists() {
+                    assert!(output.is_dir());
+                    clear_dir(&output);
+                } else {
+                    fs::create_dir(&output).unwrap();
+                }
+                copy_dir(&args.input, &output, true);
+                output.join("c2rust-lib.rs")
+            } else {
+                file
+            };
             let solutions = may.map(|file| {
                 let arr = std::fs::read(file).unwrap();
                 may_analysis::deserialize_solutions(&arr)
@@ -72,17 +85,6 @@ fn main() {
             };
             let start = std::time::Instant::now();
             tag_analysis::analyze_path(&file, &conf);
-
-            if let Some(mut output) = output {
-                output.push(args.input.file_name().unwrap());
-                if output.exists() {
-                    assert!(output.is_dir());
-                    clear_dir(&output);
-                } else {
-                    fs::create_dir(&output).unwrap();
-                }
-                copy_dir(&args.input, &output, true);
-            }
             start.elapsed()
         }
     };
