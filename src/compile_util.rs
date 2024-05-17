@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -99,7 +99,7 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
     }
 }
 
-pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &BTreeMap<P, Vec<Suggestion>>) {
+pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &HashMap<P, Vec<Suggestion>>) {
     for (path, suggestions) in suggestions {
         let code = String::from_utf8(fs::read(path).unwrap()).unwrap();
         let fixed = rustfix::apply_suggestions(&code, suggestions).unwrap();

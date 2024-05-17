@@ -417,7 +417,13 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     format!("({})", pattern)
                 };
                 let method = format!(
-                    "impl {}{{pub fn get_{}(&mut self)->*mut {}{{let {}=self else{{panic!()}};v as _}}}}",
+                    "impl {}{{pub fn get_{}(self)->{}{{let {}=self else{{panic!()}};v}}}}",
+                    union_name, field_name, ty, pattern,
+                );
+                field_methods.push_str(&method);
+                field_methods.push('\n');
+                let method = format!(
+                    "impl {}{{pub fn deref_{}_mut(&mut self)->*mut {}{{let {}=self else{{panic!()}};v as _}}}}",
                     union_name, field_name, ty, pattern,
                 );
                 field_methods.push_str(&method);
@@ -436,7 +442,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
             let mut enum_str = format!("pub enum {}{{", union_name);
             let mut get_tag_method = format!(
-                "impl {}{{pub fn get_{}(self)->{}{{match self.{}{{",
+                "impl {}{{pub fn {}(self)->{}{{match self.{}{{",
                 struct_name, field_name, field_ty, struct_field_name
             );
             for (f, t) in enum_variants {
@@ -484,6 +490,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             struct_tag_fields: &struct_tag_fields,
             aggregates: &aggregates,
             field_values: &field_values,
+            unions: &unions,
         };
         visitor.visit_body(hir_body);
     }
@@ -710,6 +717,7 @@ struct HBodyVisitor<'a, 'tcx> {
     struct_tag_fields: &'a HashMap<LocalDefId, FieldIdx>,
     aggregates: &'a HashMap<Span, (Local, Location)>,
     field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
+    unions: &'a Vec<LocalDefId>,
 }
 
 impl<'tcx> HBodyVisitor<'_, 'tcx> {
@@ -757,13 +765,27 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     println!("{}", v);
                 }
             }
-            ExprKind::Field(expr, _field) => {
-                let ty = self.typeck.expr_ty(expr);
+            ExprKind::Field(e, field) => {
+                let ty = self.typeck.expr_ty(e);
                 let TyKind::Adt(adt_def, _) = ty.kind() else { return };
                 let did = some_or!(adt_def.did().as_local(), return);
-                if let Some(_tag_field_idx) = self.struct_tag_fields.get(&did) {
-                    let _variant = adt_def.variant(VariantIdx::from_u32(0));
-                    // variant.fields[tag_field_idx];
+
+                if let Some(tag_field_idx) = self.struct_tag_fields.get(&did) {
+                    let variant = adt_def.variant(VariantIdx::from_u32(0));
+                    let field_def = &variant.fields[*tag_field_idx];
+                    if field_def.ident(self.tcx).name == field.name {
+                        println!("{}", source_map.span_to_snippet(expr.span).unwrap(),);
+                    }
+                } else if self.unions.contains(&did) {
+                    let (ctx, _) = get_expr_context(expr, self.tcx);
+                    match ctx {
+                        ExprContext::Value => {
+                            let span = field.span;
+                            let call = format!("get_{}()", field.name);
+                            println!("{}: {}", source_map.span_to_snippet(span).unwrap(), call);
+                        }
+                        ExprContext::Store | ExprContext::Address => {}
+                    }
                 }
             }
             _ => {}
@@ -781,5 +803,35 @@ impl<'tcx> HVisitor<'tcx> for HBodyVisitor<'_, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         self.handle_expr(expr);
         intravisit::walk_expr(self, expr);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExprContext {
+    Value,
+    Address,
+    Store,
+}
+
+fn get_expr_context<'tcx>(
+    expr: &'tcx Expr<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> (ExprContext, &'tcx Expr<'tcx>) {
+    let parent = tcx.hir().get_parent(expr.hir_id);
+    match parent {
+        Node::Expr(e) => match e.kind {
+            ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) => {
+                if expr.hir_id == l.hir_id {
+                    (ExprContext::Store, e)
+                } else {
+                    (ExprContext::Value, expr)
+                }
+            }
+            ExprKind::AddrOf(_, _, _) => (ExprContext::Address, e),
+            ExprKind::Field(e, _) | ExprKind::DropTemps(e) => get_expr_context(e, tcx),
+            _ => (ExprContext::Value, e),
+        },
+        Node::ExprField(_) | Node::Stmt(_) => (ExprContext::Value, expr),
+        _ => unreachable!(),
     }
 }
