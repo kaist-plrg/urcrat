@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rustc_abi::FieldIdx;
 use rustc_middle::{
     mir::{Location, TerminatorKind},
     ty::TyCtxt,
@@ -324,11 +325,11 @@ fn test_eq_ref_struct() {
 
             assert_eq!(
                 n[&5].as_ptr(),
-                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+                &AbsLoc::new(i[&1], vec![AccElem::Field(FieldIdx::from_u32(0), false)])
             );
             assert_eq!(
                 n[&6].as_ptr(),
-                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+                &AbsLoc::new(i[&1], vec![AccElem::Field(FieldIdx::from_u32(0), false)])
             );
         },
     );
@@ -479,11 +480,11 @@ fn test_eq_ref_deref() {
 
             assert_eq!(
                 n[&7].as_ptr(),
-                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+                &AbsLoc::new(i[&1], vec![AccElem::Field(FieldIdx::from_u32(0), false)])
             );
             assert_eq!(
                 n[&8].as_ptr(),
-                &AbsLoc::new(i[&1], vec![AccElem::Field(0, false)])
+                &AbsLoc::new(i[&1], vec![AccElem::Field(FieldIdx::from_u32(0), false)])
             );
         },
     );
@@ -513,9 +514,15 @@ fn test_eq_union_first() {
             let Obj::Struct(fs, is_union) = &n[&1].obj else { unreachable!() };
             assert!(is_union);
             assert_eq!(fs.len(), 1);
-            assert_eq!(fs.get(&0).unwrap().as_ptr(), n[&2].as_ptr());
-            assert_eq!(fs.get(&0).unwrap().as_ptr(), n[&3].as_ptr());
-            assert_eq!(fs.get(&1), None);
+            assert_eq!(
+                fs.get(&FieldIdx::from_u32(0)).unwrap().as_ptr(),
+                n[&2].as_ptr()
+            );
+            assert_eq!(
+                fs.get(&FieldIdx::from_u32(0)).unwrap().as_ptr(),
+                n[&3].as_ptr()
+            );
+            assert_eq!(fs.get(&FieldIdx::from_u32(1)), None);
         },
     );
 }
@@ -548,9 +555,15 @@ fn test_eq_union_second() {
             let Obj::Struct(fs, is_union) = &n[&2].obj else { unreachable!() };
             assert!(is_union);
             assert_eq!(fs.len(), 1);
-            assert_eq!(fs.get(&0), None);
-            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&1].as_ptr());
-            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&3].as_ptr());
+            assert_eq!(fs.get(&FieldIdx::from_u32(0)), None);
+            assert_eq!(
+                fs.get(&FieldIdx::from_u32(1)).unwrap().as_ptr(),
+                n[&1].as_ptr()
+            );
+            assert_eq!(
+                fs.get(&FieldIdx::from_u32(1)).unwrap().as_ptr(),
+                n[&3].as_ptr()
+            );
         },
     );
 }
@@ -580,8 +593,11 @@ fn test_union_field_eq() {
             let Obj::Struct(fs, is_union) = &n[&1].obj else { unreachable!() };
             assert!(is_union);
             assert_eq!(fs.len(), 1);
-            assert_eq!(fs.get(&0), None);
-            assert_eq!(fs.get(&1).unwrap().as_ptr(), n[&3].as_ptr());
+            assert_eq!(fs.get(&FieldIdx::from_u32(0)), None);
+            assert_eq!(
+                fs.get(&FieldIdx::from_u32(1)).unwrap().as_ptr(),
+                n[&3].as_ptr()
+            );
         },
     );
 }

@@ -176,7 +176,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     assert_eq!(rs.len(), 1);
                     let op = &rs[FieldIdx::from_usize(0)];
                     let v = self.transfer_op(op, state);
-                    let l = l.extended(&[AccElem::Field(field.as_u32(), true)]);
+                    let l = l.extended(&[AccElem::Field(*field, true)]);
                     let TyKind::Adt(adt_def, gargs) = lty.kind() else { unreachable!() };
                     let variant = adt_def.variant(VariantIdx::from_u32(0));
                     let ty = variant.fields[*field].ty(self.tcx, gargs);
@@ -201,7 +201,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     };
                     for ((field, op), ty) in rs.iter_enumerated().zip(tys) {
                         let v = self.transfer_op(op, state);
-                        let l = l.extended(&[AccElem::Field(field.as_u32(), false)]);
+                        let l = l.extended(&[AccElem::Field(field, false)]);
                         state
                             .gm()
                             .assign_with_ty(&l, l_deref, &v, self.ctx.tss.tys[&ty]);
@@ -513,14 +513,14 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             1 => {
                 let offset = self.ctx.tss.bitfields[&ty][&method];
                 let mut r = l;
-                r.extend_projection(&[AccElem::Field(offset as _, false)]);
+                r.extend_projection(&[AccElem::Field(offset, false)]);
                 let r = OpVal::Place(r, true);
                 state.gm().assign(dst, false, &r);
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
                 let offset = self.ctx.tss.bitfields[&ty][field];
-                l.extend_projection(&[AccElem::Field(offset as _, false)]);
+                l.extend_projection(&[AccElem::Field(offset, false)]);
                 let r = self.transfer_op(&args[1], state);
                 state.gm().assign(&l, true, &r);
             }
@@ -678,7 +678,7 @@ impl AccElem {
                     TyKind::Tuple(_) => false,
                     _ => unreachable!(),
                 };
-                AccElem::Field(i.as_u32(), is_union)
+                AccElem::Field(i, is_union)
             }
             ProjectionElem::Index(local) => {
                 let path = AccPath::new(local, vec![]);

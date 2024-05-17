@@ -20,7 +20,7 @@ use rustc_middle::{
         AggregateKind, ConstantKind, HasLocalDecls, Local, LocalDecl, Location, Place, PlaceElem,
         ProjectionElem, Rvalue, Terminator, TerminatorKind,
     },
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::LocalDefId, Span};
@@ -79,7 +79,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 let ty = field.ty(tcx, List::empty());
                 let (ty, mut v) = some_or!(ty_to_proj(ty), continue);
                 if local_tys.contains(&ty) {
-                    v.push(AccElem::Field(i.as_u32()));
+                    v.push(AccElem::Field(i));
                     ty_graph.entry(ty).or_default().push((local_def_id, v));
                 }
             }
@@ -225,7 +225,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     .or_default()
                     .entry(f)
                     .or_default()
-                    .entry(access.field.as_u32())
+                    .entry(access.field)
                     .or_default();
                 for n in ns.into_set() {
                     vs.entry(n).or_default().insert(span);
@@ -334,7 +334,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     all_tags.remove(v);
                 }
                 let tags: Vec<_> = vs.keys().copied().collect();
-                println!("  {}: {:?}", variant, tags);
+                println!("  {}: {:?}", variant.as_u32(), tags);
             }
             if !all_tags.is_empty() {
                 println!("  *: {:?}", all_tags);
@@ -342,9 +342,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         } else {
             println!("  {:?}", tag_values[u]);
             for (f, vs) in vs {
-                println!("  {}", f);
+                println!("  {}", f.as_u32());
                 for (variant, vs) in vs {
-                    println!("    {}", variant);
+                    println!("    {}", variant.as_u32());
                     for (n, spans) in vs {
                         println!("      {}", n);
                         for span in spans {
@@ -376,7 +376,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         let Node::Item(item) = hir.get_if_local(s.to_def_id()).unwrap() else { unreachable!() };
         let struct_name = item.ident.name.to_ident_string();
         let ItemKind::Struct(VariantData::Struct(sfs, _), _) = item.kind else { unreachable!() };
-        let field = &sfs[field_idx as usize];
+        let field = &sfs[field_idx.as_usize()];
         let span = source_map.span_extend_to_line(field.span);
         println!("{}", source_map.span_to_snippet(span).unwrap());
         let field_name = field.ident.name.to_ident_string();
@@ -397,15 +397,15 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             let mut enum_variants = vec![];
             let mut field_methods = String::new();
             for (field, tags) in &variant_tag_values[&u][&field_idx] {
-                all_fields.remove(&FieldIdx::from_u32(*field));
+                all_fields.remove(field);
                 for t in tags.keys() {
                     all_tags.remove(t);
                 }
                 for tag in tags.keys() {
                     enum_variants.push((Some(*field), *tag));
                 }
-                let field_name = ufs[*field as usize].ident.name.to_ident_string();
-                let ty = &tys[*field as usize];
+                let field_name = ufs[field.as_usize()].ident.name.to_ident_string();
+                let ty = &tys[field.as_usize()];
                 let pattern: String = tags
                     .keys()
                     .map(|tag| format!("Self::{}{}(v)", field_name, tag))
@@ -430,7 +430,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             } else {
                 assert_eq!(all_fields.len(), 1);
                 assert_eq!(all_tags.len(), 1);
-                let field = all_fields.into_iter().next().unwrap().as_u32();
+                let field = all_fields.into_iter().next().unwrap();
                 let tag = all_tags.into_iter().next().unwrap();
                 enum_variants.push((Some(field), tag));
             }
@@ -441,8 +441,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             );
             for (f, t) in enum_variants {
                 if let Some(f) = f {
-                    let field_name = ufs[f as usize].ident.name.to_ident_string();
-                    let ty = &tys[f as usize];
+                    let field_name = ufs[f.as_usize()].ident.name.to_ident_string();
+                    let ty = &tys[f.as_usize()];
                     let variant_name = format!("{}{}", field_name, t);
                     enum_str.push_str(&format!("{}({})", variant_name, ty));
                     get_tag_method.push_str(&format!("{}::{}(_)=>{}", union_name, variant_name, t));
@@ -474,9 +474,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         // } else {
         //     tcx.mir_for_ctfe(local_def_id)
         // };
+        let typeck = tcx.typeck(local_def_id);
         let mut visitor = HBodyVisitor {
             tcx,
             // mir_body,
+            typeck,
             func: local_def_id,
             structs: &structs,
             struct_tag_fields: &struct_tag_fields,
@@ -489,7 +491,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
 
 #[derive(Debug, Clone, Copy)]
 pub enum AccElem {
-    Field(u32),
+    Field(FieldIdx),
     Index,
     Deref,
 }
@@ -547,7 +549,7 @@ fn compute_tags<'tcx, D: HasLocalDecls<'tcx> + ?Sized>(
     states: &HashMap<Location, AbsMem>,
     local_decls: &D,
     tcx: TyCtxt<'tcx>,
-) -> Vec<(u32, AbsInt)> {
+) -> Vec<(FieldIdx, AbsInt)> {
     let state = some_or!(states.get(&access.location), return vec![]);
     let (path, is_deref) = access.get_path(state, local_decls, tcx);
     let g = state.g();
@@ -696,15 +698,16 @@ struct FieldAt {
     func: LocalDefId,
     location: Location,
     local: Local,
-    field: u32,
+    field: FieldIdx,
 }
 
 struct HBodyVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     // mir_body: &'a rustc_middle::mir::Body<'tcx>,
+    typeck: &'a TypeckResults<'tcx>,
     func: LocalDefId,
     structs: &'a HashMap<LocalDefId, Vec<(FieldIdx, LocalDefId)>>,
-    struct_tag_fields: &'a HashMap<LocalDefId, u32>,
+    struct_tag_fields: &'a HashMap<LocalDefId, FieldIdx>,
     aggregates: &'a HashMap<Span, (Local, Location)>,
     field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
 }
@@ -720,7 +723,7 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                 let tag_field_idx = *some_or!(self.struct_tag_fields.get(&def_id), return);
                 let unions = some_or!(self.structs.get(&def_id), return);
 
-                let span = fs[tag_field_idx as usize].span;
+                let span = fs[tag_field_idx.as_usize()].span;
                 let span = source_map.span_extend_to_line(span);
                 println!("{}", source_map.span_to_snippet(span).unwrap());
 
@@ -754,7 +757,15 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     println!("{}", v);
                 }
             }
-            ExprKind::Field(_, _) => {}
+            ExprKind::Field(expr, _field) => {
+                let ty = self.typeck.expr_ty(expr);
+                let TyKind::Adt(adt_def, _) = ty.kind() else { return };
+                let did = some_or!(adt_def.did().as_local(), return);
+                if let Some(_tag_field_idx) = self.struct_tag_fields.get(&did) {
+                    let _variant = adt_def.variant(VariantIdx::from_u32(0));
+                    // variant.fields[tag_field_idx];
+                }
+            }
             _ => {}
         }
     }

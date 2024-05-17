@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use etrace::some_or;
+use rustc_abi::FieldIdx;
 use rustc_hir::def_id::LocalDefId;
 use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
@@ -131,7 +132,7 @@ impl Index {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccElem {
-    Field(u32, bool),
+    Field(FieldIdx, bool),
     Index(Index),
 }
 
@@ -139,7 +140,7 @@ impl std::fmt::Debug for AccElem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AccElem::Field(i, is_union) => {
-                write!(f, ".{}", i)?;
+                write!(f, ".{}", i.as_u32())?;
                 if *is_union {
                     write!(f, "u")?;
                 }
@@ -211,7 +212,7 @@ impl AbsLoc {
     }
 
     #[inline]
-    fn push_field(mut self, i: u32, is_union: bool) -> Self {
+    fn push_field(mut self, i: FieldIdx, is_union: bool) -> Self {
         self.projection.push(AccElem::Field(i, is_union));
         self
     }
@@ -311,7 +312,7 @@ pub enum Obj {
     Top,
     AtAddr(AbsInt),
     Ptr(AbsLoc),
-    Struct(HashMap<u32, Obj>, bool),
+    Struct(HashMap<FieldIdx, Obj>, bool),
     Array(HashMap<Index, Obj>),
 }
 
@@ -329,7 +330,7 @@ impl std::fmt::Debug for Obj {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}: {:?}", k, fs[k])?;
+                    write!(f, "{}: {:?}", k.as_u32(), fs[k])?;
                 }
                 write!(f, "]")?;
                 if *is_union {
@@ -548,7 +549,7 @@ impl Obj {
 
     pub fn field(&self, i: u32) -> &Obj {
         let Obj::Struct(fs, _) = self else { panic!() };
-        fs.get(&i).unwrap()
+        fs.get(&FieldIdx::from_u32(i)).unwrap()
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -732,7 +733,7 @@ impl Graph {
 
         let l = l.extended(&[AccElem::Field(*f, true)]);
         let r = r.extended(&[AccElem::Field(*f, true)]);
-        let ty = tys[*f as usize].1;
+        let ty = tys[f.as_usize()].1;
         self.assign_with_ty(&l, l_deref, &r, ty);
     }
 
@@ -757,8 +758,9 @@ impl Graph {
                     self.assign_union(l, l_deref, r, tys);
                 } else {
                     for (i, (_, ty)) in tys.iter().enumerate() {
-                        let l = l.extended(&[AccElem::Field(i as _, false)]);
-                        let r = r.extended(&[AccElem::Field(i as _, false)]);
+                        let i = FieldIdx::from_usize(i);
+                        let l = l.extended(&[AccElem::Field(i, false)]);
+                        let r = r.extended(&[AccElem::Field(i, false)]);
                         self.assign_with_ty(&l, l_deref, &r, ty);
                     }
                 }
@@ -1175,8 +1177,7 @@ fn invalidate_rec(
         Obj::Struct(fs, is_union) => {
             let mut v = vec![];
             if let may_analysis::LocEdges::Fields(fs2) = edges {
-                for (index, node) in fs2.iter().enumerate() {
-                    let index = index as u32;
+                for (index, node) in fs2.iter_enumerated() {
                     let obj = some_or!(fs.get_mut(&index), continue);
                     let loc = loc.clone().push_field(index, *is_union);
                     v.extend(invalidate_rec(loc, obj, *node, visited, ctx));
@@ -1188,7 +1189,7 @@ fn invalidate_rec(
                     for (field, (offset, next)) in
                         offsets.iter().zip(offsets.iter().skip(1)).enumerate()
                     {
-                        if !fs.contains_key(&(field as _))
+                        if !fs.contains_key(&FieldIdx::from_usize(field))
                             && (*offset..*next).any(|o| ctx.writes.contains(index + o))
                         {
                             *fs = HashMap::new();

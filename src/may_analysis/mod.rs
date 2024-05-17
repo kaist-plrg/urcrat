@@ -5,6 +5,7 @@ use std::{
 };
 
 use etrace::some_or;
+use rustc_abi::FieldIdx;
 use rustc_data_structures::graph::{
     scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
 };
@@ -566,7 +567,7 @@ fn compute_bitfield_writes<'tcx>(
     func: &Operand<'tcx>,
     args: &[Operand<'tcx>],
     location: Location,
-    bitfields: &HashMap<LocalDefId, HashMap<String, usize>>,
+    bitfields: &HashMap<LocalDefId, HashMap<String, FieldIdx>>,
     tcx: TyCtxt<'tcx>,
     ends: &[usize],
     solutions: &[HybridBitSet<usize>],
@@ -591,7 +592,7 @@ fn compute_bitfield_writes<'tcx>(
         .entry(location)
         .or_insert(HybridBitSet::new_empty(ends.len()));
     for loc in solutions[l.var.root].iter() {
-        let loc = loc + offset;
+        let loc = loc + offset.as_usize();
         let end = ends[loc];
         if loc <= end {
             writes.insert(loc);
@@ -631,13 +632,13 @@ fn add_edges(
             node
         }
         TyShape::Struct(len, ts, is_union) => {
-            let succs: Vec<_> = ts
+            let succs: IndexVec<FieldIdx, _> = ts
                 .iter()
                 .map(|(offset, t)| {
                     add_edges(t, index + offset, graph, index_prefixes, union_offsets)
                 })
                 .collect();
-            let node = succs[0].parent();
+            let node = succs[FieldIdx::from_u32(0)].parent();
             graph.insert(node, LocEdges::Fields(succs));
             if *is_union {
                 let mut offsets: Vec<usize> = ts.iter().map(|(offset, _)| *offset).collect();
@@ -683,7 +684,7 @@ impl LocNode {
 }
 
 pub enum LocEdges {
-    Fields(Vec<LocNode>),
+    Fields(IndexVec<FieldIdx, LocNode>),
     Index(LocNode),
     Deref(Vec<LocNode>),
 }

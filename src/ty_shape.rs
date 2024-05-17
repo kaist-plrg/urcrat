@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rustc_abi::FieldIdx;
 use rustc_ast::UintTy;
 use rustc_hir::{def::Res, ItemKind, PrimTy, QPath, TyKind as HirTyKind};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
@@ -9,7 +10,7 @@ use typed_arena::Arena;
 use crate::*;
 
 pub struct TyShapes<'a, 'tcx> {
-    pub bitfields: HashMap<LocalDefId, HashMap<String, usize>>,
+    pub bitfields: HashMap<LocalDefId, HashMap<String, FieldIdx>>,
     pub tys: HashMap<Ty<'tcx>, &'a TyShape<'a>>,
     prim: &'a TyShape<'a>,
     arena: &'a Arena<TyShape<'a>>,
@@ -94,7 +95,7 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
             let field_indices = fields
                 .into_iter()
                 .enumerate()
-                .map(|(i, f)| (f, len + i))
+                .map(|(i, f)| (f, FieldIdx::from_usize(len + i)))
                 .collect();
             (ty, field_indices)
         })
