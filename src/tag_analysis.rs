@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use etrace::some_or;
@@ -23,7 +23,8 @@ use rustc_middle::{
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::LocalDefId, Span};
+use rustc_span::{def_id::LocalDefId, BytePos, Span};
+use rustfix::Suggestion;
 use typed_arena::Arena;
 
 use self::must_analysis::{AbsInt, AbsMem, AccPath};
@@ -400,6 +401,10 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             let mut all_tags = tag_values[&u][&field_idx].clone();
             let mut enum_variants = vec![];
             let mut field_methods = String::new();
+            let mut set_tag_method = format!(
+                "impl {}{{pub fn set_{}(&mut self,v:{}){{self.{}=match v{{",
+                struct_name, field_name, field_ty, struct_field_name
+            );
             for (field, tags) in &variant_tag_values[&u][&field_idx] {
                 all_fields.remove(field);
                 for t in tags.keys() {
@@ -432,7 +437,15 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 );
                 field_methods.push_str(&method);
                 field_methods.push('\n');
+                for t in tags.keys() {
+                    let arm = format!(
+                        "{}=>{}::{}{}(unsafe{{std::mem::transmute([0u8; std::mem::size_of::<{}>()])}}),",
+                        t, union_name, field_name, t, ty
+                    );
+                    set_tag_method.push_str(&arm);
+                }
             }
+            set_tag_method.push_str("_=>panic!()}}}");
             if all_fields.is_empty() {
                 for tag in all_tags {
                     enum_variants.push((None, tag));
@@ -467,7 +480,10 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             enum_str.push('}');
             get_tag_method.push_str("}}}");
             let snippet = compile_util::span_to_snippet(item.span, source_map);
-            let code = format!("{}\n{}\n{}", enum_str, field_methods, get_tag_method);
+            let code = format!(
+                "{}\n{}\n{}\n{}",
+                enum_str, field_methods, get_tag_method, set_tag_method
+            );
             let suggestion = compile_util::make_suggestion(snippet, code);
             v.push(suggestion);
         }
@@ -496,16 +512,19 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             aggregates: &aggregates,
             field_values: &field_values,
             unions: &unions,
+            suggestions: &mut suggestions,
         };
         visitor.visit_body(hir_body);
     }
 
-    for (path, suggestions) in &suggestions {
-        println!("{:?}", path);
-        for suggestion in suggestions {
-            println!("{:?}", suggestion);
-        }
-    }
+    // for (path, suggestions) in &suggestions {
+    //     println!("{:?}", path);
+    //     for suggestion in suggestions {
+    //         println!("{:?}", suggestion);
+    //     }
+    // }
+
+    compile_util::apply_suggestions(&mut suggestions);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -730,11 +749,14 @@ struct HBodyVisitor<'a, 'tcx> {
     aggregates: &'a HashMap<Span, (Local, Location)>,
     field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
     unions: &'a Vec<LocalDefId>,
+    suggestions: &'a mut HashMap<PathBuf, Vec<Suggestion>>,
 }
 
 impl<'tcx> HBodyVisitor<'_, 'tcx> {
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let source_map = self.tcx.sess.source_map();
+        let path = some_or!(compile_util::span_to_path(expr.span, source_map), return);
+        let suggestions = self.suggestions.entry(path).or_default();
         match expr.kind {
             ExprKind::Struct(path, fs, _) => {
                 let QPath::Resolved(_, path) = path else { return };
@@ -745,7 +767,9 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
 
                 let span = fs[tag_field_idx.as_usize()].span;
                 let span = source_map.span_extend_to_line(span);
-                println!("{}", source_map.span_to_snippet(span).unwrap());
+                let snippet = compile_util::span_to_snippet(span, source_map);
+                let suggestion = compile_util::make_suggestion(snippet, "".to_string());
+                suggestions.push(suggestion);
 
                 let (local, mut location) = self.aggregates[&expr.span];
                 location.statement_index += 1;
@@ -756,14 +780,12 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     field: tag_field_idx,
                 };
                 let values = &self.field_values[&field_at];
-                println!("{:?}", values);
-                assert_eq!(values.len(), 1);
+                assert_eq!(values.len(), 1, "{:?}", values);
                 let tag = values.iter().next().unwrap();
 
                 for (i, u) in unions {
                     let expr = fs[i.as_usize()].expr;
-                    println!("{}", source_map.span_to_snippet(expr.span).unwrap());
-
+                    let snippet = compile_util::span_to_snippet(expr.span, source_map);
                     let ExprKind::Struct(path, ufs, _) = expr.kind else { unreachable!() };
                     let union_name = source_map.span_to_snippet(path.span()).unwrap();
                     let QPath::Resolved(_, path) = path else { unreachable!() };
@@ -774,7 +796,8 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     let span = ufs[0].expr.span;
                     let init = source_map.span_to_snippet(span).unwrap();
                     let v = format!("{}::{}{}({})", union_name, name, tag, init);
-                    println!("{}", v);
+                    let suggestion = compile_util::make_suggestion(snippet, v);
+                    suggestions.push(suggestion);
                 }
             }
             ExprKind::Field(e, field) => {
@@ -786,17 +809,59 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     let variant = adt_def.variant(VariantIdx::from_u32(0));
                     let field_def = &variant.fields[*tag_field_idx];
                     if field_def.ident(self.tcx).name == field.name {
-                        println!("{}", source_map.span_to_snippet(expr.span).unwrap(),);
+                        let (ctx, e2) = get_expr_context(e, self.tcx);
+                        match ctx {
+                            ExprContext::Value => {
+                                let span = field.span.shrink_to_hi();
+                                let snippet = compile_util::span_to_snippet(span, source_map);
+                                let suggestion =
+                                    compile_util::make_suggestion(snippet, "()".to_string());
+                                suggestions.push(suggestion);
+                            }
+                            ExprContext::Store => {
+                                let span = field.span.shrink_to_lo();
+                                let snippet = compile_util::span_to_snippet(span, source_map);
+                                let suggestion =
+                                    compile_util::make_suggestion(snippet, "set_".to_string());
+                                suggestions.push(suggestion);
+
+                                let span = field.span.shrink_to_hi();
+                                let span = span.with_hi(span.hi() + BytePos(2));
+                                let snippet = compile_util::span_to_snippet(span, source_map);
+                                let suggestion =
+                                    compile_util::make_suggestion(snippet, "(".to_string());
+                                suggestions.push(suggestion);
+
+                                let span = e2.span.shrink_to_hi();
+                                let snippet = compile_util::span_to_snippet(span, source_map);
+                                let suggestion =
+                                    compile_util::make_suggestion(snippet, ")".to_string());
+                                suggestions.push(suggestion);
+                            }
+                            ExprContext::Address => panic!(),
+                        }
                     }
                 } else if self.unions.contains(&did) {
                     let (ctx, _) = get_expr_context(expr, self.tcx);
                     match ctx {
                         ExprContext::Value => {
-                            let span = field.span;
+                            let snippet = compile_util::span_to_snippet(field.span, source_map);
                             let call = format!("get_{}()", field.name);
-                            println!("{}: {}", source_map.span_to_snippet(span).unwrap(), call);
+                            let suggestion = compile_util::make_suggestion(snippet, call);
+                            suggestions.push(suggestion);
                         }
-                        ExprContext::Store | ExprContext::Address => {}
+                        ExprContext::Store | ExprContext::Address => {
+                            let span = expr.span.shrink_to_lo();
+                            let snippet = compile_util::span_to_snippet(span, source_map);
+                            let suggestion =
+                                compile_util::make_suggestion(snippet, "(*".to_string());
+                            suggestions.push(suggestion);
+
+                            let snippet = compile_util::span_to_snippet(field.span, source_map);
+                            let call = format!("deref_{}_mut())", field.name);
+                            let suggestion = compile_util::make_suggestion(snippet, call);
+                            suggestions.push(suggestion);
+                        }
                     }
                 }
             }
@@ -840,7 +905,7 @@ fn get_expr_context<'tcx>(
                 }
             }
             ExprKind::AddrOf(_, _, _) => (ExprContext::Address, e),
-            ExprKind::Field(e, _) | ExprKind::DropTemps(e) => get_expr_context(e, tcx),
+            ExprKind::Field(_, _) | ExprKind::DropTemps(_) => get_expr_context(e, tcx),
             _ => (ExprContext::Value, e),
         },
         Node::ExprField(_) | Node::Stmt(_) => (ExprContext::Value, expr),
