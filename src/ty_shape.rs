@@ -250,14 +250,14 @@ impl std::fmt::Debug for TyShape<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Primitive => write!(f, "*"),
-            Self::Array(t, len) => write!(f, "[{:?} * {}]", t, len),
+            Self::Array(t, len) => write!(f, "[{:?}; {}]", t, len),
             Self::Struct(len, fields, is_union) => {
-                write!(f, "[{}", len)?;
+                write!(f, "{{{}", len)?;
                 for (i, ts) in fields {
                     let sep = if *i == 0 { ";" } else { "," };
                     write!(f, "{} {}: {:?}", sep, i, ts)?;
                 }
-                write!(f, "]")?;
+                write!(f, "}}")?;
                 if *is_union {
                     write!(f, "u")?;
                 }

@@ -11,7 +11,7 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 
 use super::*;
-use crate::*;
+use crate::{ty_shape::TyShape, *};
 
 impl<'tcx> Analyzer<'tcx, '_, '_> {
     pub fn transfer_stmt(&self, stmt: &Statement<'tcx>, stmt_loc: Location, state: &mut AbsMem) {
@@ -184,27 +184,21 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         .gm()
                         .assign_with_ty(&l, l_deref, &v, self.ctx.tss.tys[&ty]);
                 } else {
-                    let tys = match lty.kind() {
-                        TyKind::Adt(adt_def, gargs) => {
-                            let AggregateKind::Adt(_, v_idx, _, _, _) = kind else {
-                                unreachable!()
-                            };
-                            let variant = adt_def.variant(*v_idx);
-                            variant
-                                .fields
-                                .iter()
-                                .map(|f| f.ty(self.tcx, gargs))
-                                .collect()
-                        }
-                        TyKind::Array(ty, _) => vec![*ty; rs.len()],
-                        _ => unreachable!(),
+                    let tys = match self.ctx.tss.tys[&lty] {
+                        TyShape::Array(t, len) => vec![t; *len],
+                        TyShape::Struct(_, tys, _) => tys.iter().map(|(_, t)| t).collect(),
+                        TyShape::Primitive => unreachable!(),
                     };
-                    for ((field, op), ty) in rs.iter_enumerated().zip(tys) {
+                    for ((field, op), ty) in rs.iter_enumerated().zip(&tys) {
                         let v = self.transfer_op(op, state);
                         let l = l.extended(&[AccElem::Field(field, false)]);
-                        state
-                            .gm()
-                            .assign_with_ty(&l, l_deref, &v, self.ctx.tss.tys[&ty]);
+                        state.gm().assign_with_ty(&l, l_deref, &v, ty);
+                    }
+                    for (field, ty) in tys.iter().enumerate().skip(rs.len()) {
+                        let v = OpVal::Int(0);
+                        let field = FieldIdx::from_usize(field);
+                        let l = l.extended(&[AccElem::Field(field, false)]);
+                        state.gm().assign_with_ty(&l, l_deref, &v, ty);
                     }
                 }
             }
