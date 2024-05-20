@@ -567,7 +567,7 @@ fn compute_bitfield_writes<'tcx>(
     func: &Operand<'tcx>,
     args: &[Operand<'tcx>],
     location: Location,
-    bitfields: &HashMap<LocalDefId, HashMap<String, FieldIdx>>,
+    bitfields: &HashMap<LocalDefId, BitField>,
     tcx: TyCtxt<'tcx>,
     ends: &[usize],
     solutions: &[HybridBitSet<usize>],
@@ -584,7 +584,7 @@ fn compute_bitfield_writes<'tcx>(
     let local_def_id = some_or!(def_id.as_local(), return);
     let (local_def_id, method) = some_or!(receiver_and_method(local_def_id, tcx), return);
     let field = method.strip_prefix("set_").unwrap();
-    let offset = bitfields[&local_def_id][field];
+    let offset = bitfields[&local_def_id].name_to_idx[field];
     let lhs = args[0].place().unwrap();
     assert!(lhs.projection.is_empty());
     let l = analyzer.prefixed_loc(lhs, ctx);

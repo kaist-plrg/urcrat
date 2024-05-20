@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use rustc_abi::FieldIdx;
 use rustc_ast::UintTy;
-use rustc_hir::{def::Res, ItemKind, PrimTy, QPath, TyKind as HirTyKind};
+use rustc_hir::{def::Res, FnRetTy, ImplItemKind, ItemKind, PrimTy, QPath, TyKind as HirTyKind};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
 use rustc_span::def_id::{DefId, LocalDefId};
 use typed_arena::Arena;
@@ -10,7 +10,7 @@ use typed_arena::Arena;
 use crate::*;
 
 pub struct TyShapes<'a, 'tcx> {
-    pub bitfields: HashMap<LocalDefId, HashMap<String, FieldIdx>>,
+    pub bitfields: HashMap<LocalDefId, BitField>,
     pub tys: HashMap<Ty<'tcx>, &'a TyShape<'a>>,
     prim: &'a TyShape<'a>,
     arena: &'a Arena<TyShape<'a>>,
@@ -22,6 +22,19 @@ impl std::fmt::Debug for TyShapes<'_, '_> {
             .field("bitfields", &self.bitfields)
             .field("tys", &self.tys)
             .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct BitField {
+    pub name_to_idx: HashMap<String, FieldIdx>,
+    pub fields: HashMap<FieldIdx, (String, String)>,
+}
+
+impl BitField {
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.fields.len()
     }
 }
 
@@ -78,7 +91,20 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
                         let name0 = name0.strip_prefix("set_").unwrap();
                         let name1 = items[1].ident.name.to_ident_string();
                         assert_eq!(name0, name1);
-                        name1
+                        let ImplItemKind::Fn(sig, _) = hir.impl_item(items[1].id).kind else {
+                            unreachable!()
+                        };
+                        let FnRetTy::Return(ty) = sig.decl.output else { unreachable!() };
+                        let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
+                            unreachable!()
+                        };
+                        let ty: String = path
+                            .segments
+                            .iter()
+                            .map(|seg| seg.ident.name.to_ident_string())
+                            .intersperse("::".to_string())
+                            .collect();
+                        (name1, ty)
                     })
                     .collect();
                 bitfield_impls.insert(local_def_id, fields);
@@ -89,15 +115,28 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
     tss.bitfields = bitfield_impls
         .into_iter()
         .map(|(ty, fields)| {
-            let bf1: String = fields.iter().map(|f| f.as_str()).intersperse("_").collect();
+            let bf1: String = fields
+                .iter()
+                .map(|(f, _)| f.as_str())
+                .intersperse("_")
+                .collect();
             let (ref bf2, len) = bitfield_structs[&ty];
             assert_eq!(&bf1, bf2);
-            let field_indices = fields
+            let name_to_idx = fields
+                .iter()
+                .enumerate()
+                .map(|(i, (f, _))| (f.clone(), FieldIdx::from_usize(len + i)))
+                .collect();
+            let fields = fields
                 .into_iter()
                 .enumerate()
-                .map(|(i, f)| (f, FieldIdx::from_usize(len + i)))
+                .map(|(i, p)| (FieldIdx::from_usize(len + i), p))
                 .collect();
-            (ty, field_indices)
+            let bitfield = BitField {
+                name_to_idx,
+                fields,
+            };
+            (ty, bitfield)
         })
         .collect();
 }

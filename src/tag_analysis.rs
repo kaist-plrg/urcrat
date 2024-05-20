@@ -380,13 +380,37 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         let v = suggestions.entry(file.clone()).or_default();
         let struct_name = item.ident.name.to_ident_string();
         let ItemKind::Struct(VariantData::Struct(sfs, _), _) = item.kind else { unreachable!() };
-        let field = &sfs[field_idx.as_usize()];
-        let span = source_map.span_extend_to_line(field.span);
-        let snippet = compile_util::span_to_snippet(span, source_map);
-        let suggestion = compile_util::make_suggestion(snippet, "".to_string());
-        v.push(suggestion);
-        let field_name = field.ident.name.to_ident_string();
-        let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
+
+        let (field_name, field_ty) = if let Some(field) = sfs.get(field_idx.as_usize()) {
+            let span = source_map.span_extend_to_line(field.span);
+            let snippet = compile_util::span_to_snippet(span, source_map);
+            let suggestion = compile_util::make_suggestion(snippet, "".to_string());
+            v.push(suggestion);
+
+            let field_name = field.ident.name.to_ident_string();
+            let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
+            (field_name, field_ty)
+        } else {
+            let (name, ty) = tss.bitfields[&s].fields[&field_idx].clone();
+            let mut lo = item.ident.span.hi() + BytePos(3);
+            'l: for f in sfs {
+                loop {
+                    let span = source_map.span_extend_to_line(f.span.with_lo(lo).with_hi(lo));
+                    let code = source_map.span_to_snippet(span).unwrap();
+                    if code.contains(&format!("#[bitfield(name = \"{}\"", name)) {
+                        let snippet = compile_util::span_to_snippet(span, source_map);
+                        let suggestion = compile_util::make_suggestion(snippet, "".to_string());
+                        v.push(suggestion);
+                        break 'l;
+                    }
+                    lo = span.hi() + BytePos(1);
+                    if span.hi() >= f.span.hi() {
+                        break;
+                    }
+                }
+            }
+            (name, ty)
+        };
 
         for (u, _, i) in us {
             let struct_field_name = sfs[i.as_usize()].ident.name.to_ident_string();
@@ -765,7 +789,7 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                 let tag_field_idx = *some_or!(self.struct_tag_fields.get(&def_id), return);
                 let unions = some_or!(self.structs.get(&def_id), return);
 
-                let span = fs[tag_field_idx.as_usize()].span;
+                let span = some_or!(fs.get(tag_field_idx.as_usize()), return).span;
                 let span = source_map.span_extend_to_line(span);
                 let snippet = compile_util::span_to_snippet(span, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, "".to_string());
@@ -807,7 +831,7 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
 
                 if let Some(tag_field_idx) = self.struct_tag_fields.get(&did) {
                     let variant = adt_def.variant(VariantIdx::from_u32(0));
-                    let field_def = &variant.fields[*tag_field_idx];
+                    let field_def = some_or!(variant.fields.get(*tag_field_idx), return);
                     if field_def.ident(self.tcx).name == field.name {
                         let (ctx, e2) = get_expr_context(e, self.tcx);
                         match ctx {

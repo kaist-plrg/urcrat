@@ -511,7 +511,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         let (ty, method) = may_analysis::receiver_and_method(f, self.tcx).unwrap();
         match args.len() {
             1 => {
-                let offset = self.ctx.tss.bitfields[&ty][&method];
+                let offset = self.ctx.tss.bitfields[&ty].name_to_idx[&method];
                 let mut r = l;
                 r.extend_projection(&[AccElem::Field(offset, false)]);
                 let r = OpVal::Place(r, true);
@@ -519,7 +519,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             }
             2 => {
                 let field = method.strip_prefix("set_").unwrap();
-                let offset = self.ctx.tss.bitfields[&ty][field];
+                let offset = self.ctx.tss.bitfields[&ty].name_to_idx[field];
                 l.extend_projection(&[AccElem::Field(offset, false)]);
                 let r = self.transfer_op(&args[1], state);
                 state.gm().assign(&l, true, &r);
