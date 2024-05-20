@@ -314,6 +314,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     println!("Analysis done");
 
     let mut tag_fields = HashMap::new();
+    let mut union_variant_tags = HashMap::new();
     for (u, vs) in &variant_tag_values {
         let tag_field = vs
             .iter()
@@ -344,6 +345,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 }
                 let tags: Vec<_> = vs.keys().copied().collect();
                 println!("  {}: {:?}", variant.as_u32(), tags);
+                union_variant_tags.insert((*u, *variant), tags);
             }
             if !all_tags.is_empty() {
                 println!("  *: {:?}", all_tags);
@@ -423,7 +425,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         };
 
         let mut set_tag_method = format!(
-            "\nimpl {}{{pub fn set_{}(&mut self,v:{}){{",
+            "
+impl {} {{
+    pub fn set_{}(&mut self, v: {}) {{",
             struct_name, field_name, field_ty,
         );
         for (n, (u, _, i)) in us.iter().enumerate() {
@@ -440,7 +444,13 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             let mut all_tags = tag_values[&u][&field_idx].clone();
             let mut enum_variants = vec![];
             let mut field_methods = String::new();
-            write!(&mut set_tag_method, "self.{}=match v{{", struct_field_name).unwrap();
+            write!(
+                &mut set_tag_method,
+                "
+        self.{} = match v {{",
+                struct_field_name
+            )
+            .unwrap();
             for (field, tags) in &variant_tag_values[&u][&field_idx] {
                 all_fields.remove(field);
                 for t in tags.keys() {
@@ -453,35 +463,97 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 let ty = &tys[field.as_usize()];
                 let pattern: String = tags
                     .keys()
-                    .map(|tag| format!("Self::{}{}(v)", field_name, tag))
-                    .intersperse("|".to_string())
+                    .map(|tag| format!("{}::{}{}(v)", union_name, field_name, tag))
+                    .intersperse(" | ".to_string())
                     .collect();
-                let pattern = if tags.len() == 1 {
-                    pattern
+                writeln!(
+                    &mut field_methods,
+                    "impl {} {{
+    pub fn get_{}(self) -> {} {{
+        if let {} = self {{
+            v
+        }} else {{
+            panic!()
+        }}
+    }}
+}}",
+                    union_name, field_name, ty, pattern,
+                )
+                .unwrap();
+                if tags.len() == 1 {
+                    let (t, _) = tags.iter().next().unwrap();
+                    writeln!(
+                        &mut field_methods,
+                        "impl {} {{
+    pub fn deref_{}_mut(&mut self) -> *mut {} {{
+        if !matches!(self, {}) {{
+            let v = unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }};
+            *self = Self::{}{}(v);
+        }}
+        if let {} = self {{
+            v as _
+        }} else {{
+            panic!()
+        }}
+    }}
+}}",
+                        union_name, field_name, ty, pattern, ty, field_name, t, pattern,
+                    )
+                    .unwrap();
                 } else {
-                    format!("({})", pattern)
-                };
-                let method = format!(
-                    "impl {}{{pub fn get_{}(self)->{}{{let {}=self else{{panic!()}};v}}}}",
-                    union_name, field_name, ty, pattern,
-                );
-                field_methods.push_str(&method);
-                field_methods.push('\n');
-                let method = format!(
-                    "impl {}{{pub fn deref_{}_mut(&mut self)->*mut {}{{let {}=self else{{panic!()}};v as _}}}}",
-                    union_name, field_name, ty, pattern,
-                );
-                field_methods.push_str(&method);
-                field_methods.push('\n');
+                    let mut arms = String::new();
+                    for t in tags.keys() {
+                        write!(
+                            &mut arms,
+                            "
+                {} => {}::{}{}(v),",
+                            t, union_name, field_name, t
+                        )
+                        .unwrap();
+                    }
+                    writeln!(
+                        &mut field_methods,
+                        "impl {} {{
+    pub fn deref_{}_mut(&mut self, t: {}) -> *mut {} {{
+        if !matches!(self, {}) {{
+            let v = unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }};
+            *self = match t {{{}
+                _ => panic!(),
+            }};
+        }}
+        if let {} = self {{
+            v as _
+        }} else {{
+            panic!()
+        }}
+    }}
+}}",
+                        union_name, field_name, field_ty, ty, pattern, ty, arms, pattern,
+                    )
+                    .unwrap();
+                }
                 for t in tags.keys() {
                     write!(
                         &mut set_tag_method,
-                        "{}=>{}::{}{}(unsafe{{std::mem::transmute([0u8; std::mem::size_of::<{}>()])}}),",
-                        t, union_name, field_name, t, ty
-                    ).unwrap();
+                        "
+            {} => {{
+                let v = if let {} = self.{} {{
+                    v
+                }} else {{
+                    unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}
+                }};
+                {}::{}{}(v)
+            }}",
+                        t, pattern, struct_field_name, ty, union_name, field_name, t,
+                    )
+                    .unwrap();
                 }
             }
-            set_tag_method.push_str("_=>panic!()};");
+            set_tag_method.push_str(
+                "
+            _ => panic!()
+        };",
+            );
             if all_fields.is_empty() {
                 for tag in all_tags {
                     enum_variants.push((None, tag));
@@ -493,9 +565,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 let tag = all_tags.into_iter().next().unwrap();
                 enum_variants.push((Some(field), tag));
             }
-            let mut enum_str = format!("pub enum {}{{", union_name);
+            let mut enum_str = format!("pub enum {} {{", union_name);
             let mut get_tag_method = format!(
-                "impl {}{{pub fn {}(self)->{}{{match self.{}{{",
+                "impl {} {{
+    pub fn {}(self) -> {} {{
+        match self.{} {{",
                 struct_name, field_name, field_ty, struct_field_name
             );
             for (f, t) in enum_variants {
@@ -503,18 +577,45 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     let field_name = ufs[f.as_usize()].ident.name.to_ident_string();
                     let ty = &tys[f.as_usize()];
                     let variant_name = format!("{}{}", field_name, t);
-                    enum_str.push_str(&format!("{}({})", variant_name, ty));
-                    get_tag_method.push_str(&format!("{}::{}(_)=>{}", union_name, variant_name, t));
+                    write!(
+                        &mut enum_str,
+                        "
+    {}({}),",
+                        variant_name, ty
+                    )
+                    .unwrap();
+                    write!(
+                        &mut get_tag_method,
+                        "
+            {}::{}(_) => {},",
+                        union_name, variant_name, t
+                    )
+                    .unwrap();
                 } else {
                     let variant_name = format!("Empty{}", t);
-                    enum_str.push_str(&variant_name);
-                    get_tag_method.push_str(&format!("{}::{}=>{}", union_name, variant_name, t));
+                    write!(
+                        &mut enum_str,
+                        "
+    {},",
+                        variant_name
+                    )
+                    .unwrap();
+                    write!(
+                        &mut get_tag_method,
+                        "
+            {}::{} => {},",
+                        union_name, variant_name, t
+                    )
+                    .unwrap();
                 };
-                enum_str.push(',');
-                get_tag_method.push(',');
             }
-            enum_str.push('}');
-            get_tag_method.push_str("}}}");
+            enum_str.push_str("\n}");
+            get_tag_method.push_str(
+                "
+        }
+    }
+}",
+            );
             let snippet = compile_util::span_to_snippet(item.span, source_map);
             let code = format!(
                 "{}\n{}\n{}",
@@ -526,7 +627,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             v.push(suggestion);
         }
 
-        set_tag_method.push_str("}}");
+        set_tag_method.push_str(
+            "
+    }
+}",
+        );
         let span = item.span.shrink_to_hi();
         let snippet = compile_util::span_to_snippet(span, source_map);
         let suggestion = compile_util::make_suggestion(snippet, set_tag_method);
@@ -556,6 +661,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             aggregates: &aggregates,
             field_values: &field_values,
             unions: &unions,
+            union_variant_tags: &union_variant_tags,
+            union_to_struct: &union_to_struct,
             suggestions: &mut suggestions,
         };
         visitor.visit_body(hir_body);
@@ -793,6 +900,8 @@ struct HBodyVisitor<'a, 'tcx> {
     aggregates: &'a HashMap<Span, (Local, Location)>,
     field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
     unions: &'a Vec<LocalDefId>,
+    union_variant_tags: &'a HashMap<(LocalDefId, FieldIdx), Vec<u128>>,
+    union_to_struct: &'a HashMap<LocalDefId, (FieldIdx, LocalDefId)>,
     suggestions: &'a mut HashMap<PathBuf, Vec<Suggestion>>,
 }
 
@@ -903,8 +1012,39 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                                 compile_util::make_suggestion(snippet, "(*".to_string());
                             suggestions.push(suggestion);
 
+                            let ItemKind::Union(VariantData::Struct(fs, _), _) =
+                                self.tcx.hir().expect_item(did).kind
+                            else {
+                                unreachable!()
+                            };
+                            let (i, _) = fs
+                                .iter()
+                                .enumerate()
+                                .find(|(_, f)| f.ident.name == field.name)
+                                .unwrap();
+                            let tags = &self.union_variant_tags[&(did, FieldIdx::from(i))];
+
+                            let call = if tags.len() == 1 {
+                                format!("deref_{}_mut())", field.name)
+                            } else {
+                                let (_, s_did) = self.union_to_struct[&did];
+                                let ItemKind::Struct(VariantData::Struct(fs, _), _) =
+                                    self.tcx.hir().expect_item(s_did).kind
+                                else {
+                                    unreachable!()
+                                };
+                                let field_idx = self.struct_tag_fields[&s_did];
+                                let field_name =
+                                    fs[field_idx.as_usize()].ident.name.to_ident_string();
+                                let ExprKind::Field(e2, _) = e.kind else { unreachable!() };
+                                let tag = format!(
+                                    "{}.{}",
+                                    source_map.span_to_snippet(e2.span).unwrap(),
+                                    field_name,
+                                );
+                                format!("deref_{}_mut({}()))", field.name, tag)
+                            };
                             let snippet = compile_util::span_to_snippet(field.span, source_map);
-                            let call = format!("deref_{}_mut())", field.name);
                             let suggestion = compile_util::make_suggestion(snippet, call);
                             suggestions.push(suggestion);
                         }
