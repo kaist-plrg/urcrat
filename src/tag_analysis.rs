@@ -448,6 +448,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         println!("No tagged union identified");
         return;
     }
+    println!("{} tagged unions identified", tagged_unions.len());
 
     let mut tagged_structs = HashMap::new();
     for (u, tu) in &tagged_unions {
@@ -1245,7 +1246,9 @@ fn get_expr_context<'tcx>(
             ExprKind::Field(_, _) | ExprKind::DropTemps(_) => get_expr_context(e, tcx),
             _ => (ExprContext::Value, e),
         },
-        Node::ExprField(_) | Node::Stmt(_) | Node::Local(_) => (ExprContext::Value, expr),
+        Node::ExprField(_) | Node::Stmt(_) | Node::Local(_) | Node::Block(_) => {
+            (ExprContext::Value, expr)
+        }
         _ => unreachable!("{:?}", parent),
     }
 }
