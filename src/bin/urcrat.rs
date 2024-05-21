@@ -62,6 +62,7 @@ fn main() {
             r#union,
             output,
         } => {
+            let transform = output.is_some();
             let file = if let Some(mut output) = output {
                 output.push(args.input.file_name().unwrap());
                 if output.exists() {
@@ -82,6 +83,7 @@ fn main() {
             let conf = tag_analysis::Config {
                 solutions,
                 unions: r#union.into_iter().collect(),
+                transform,
             };
             let start = std::time::Instant::now();
             tag_analysis::analyze_path(&file, &conf);
