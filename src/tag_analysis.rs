@@ -26,7 +26,7 @@ use rustc_middle::{
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::LocalDefId, BytePos, Span};
+use rustc_span::{def_id::LocalDefId, source_map::SourceMap, BytePos, Span};
 use rustfix::Suggestion;
 use typed_arena::Arena;
 
@@ -55,6 +55,7 @@ fn analyze_input(input: Input, conf: &Config) {
 
 pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let hir = tcx.hir();
+    let source_map = tcx.sess.source_map();
 
     let visitor = ty_finder::TyVisitor::new(tcx);
     let (local_tys, foreign_tys) = visitor.find_foreign_tys(tcx);
@@ -353,9 +354,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     }
     println!("Analysis done");
 
-    let mut tag_fields = HashMap::new();
-    let mut union_variant_tags = HashMap::new();
-    let mut union_empty_tags = HashMap::new();
+    let mut tagged_unions = HashMap::new();
     for (u, vs) in &variant_tag_values {
         let tag_field = vs
             .iter()
@@ -371,7 +370,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 let mut tags = HashSet::new();
                 for vs in vs.values() {
                     for v in vs.keys() {
-                        if !tags.insert(*v) {
+                        if *v > u32::MAX as u128 || !tags.insert(*v) {
                             return None;
                         }
                     }
@@ -379,35 +378,56 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 Some((*f, (vs.len(), sum)))
             })
             .max_by_key(|(_, n)| *n);
-        if let Some((tag_field, _)) = tag_field {
+        if let Some((tag_index, _)) = tag_field {
             println!("Union {:?}", u);
-            println!("Fields {:?}", fields[u]);
-            tag_fields.insert(*u, tag_field);
-            println!("Field: {:?}", tag_field);
+            println!("Used fields {:?}", fields[u]);
+            println!("Tag field: {:?}", tag_index);
             let mut all_fields = fields[u].clone();
-            let mut all_tags = tag_values[&u][&tag_field].clone();
-            for (variant, vs) in &vs[&tag_field] {
+            let mut all_tags = tag_values[&u][&tag_index].clone();
+            let mut variant_tags = HashMap::new();
+            for (variant, vs) in &vs[&tag_index] {
                 for v in vs.keys() {
                     all_tags.remove(v);
                 }
                 let tags: Vec<_> = vs.keys().copied().collect();
                 println!("  {}: {:?}", variant.as_u32(), tags);
-                union_variant_tags.insert((*u, *variant), tags);
+                variant_tags.insert(*variant, tags);
                 all_fields.remove(variant);
             }
+            let mut empty_tags = vec![];
             if !all_tags.is_empty() {
                 println!("  {:?}: {:?}", all_fields, all_tags);
                 assert!(all_fields.len() <= 1, "{:?} {:?}", all_fields, all_tags);
                 let tags = all_tags.into_iter().collect();
                 if let Some(variant) = all_fields.into_iter().next() {
-                    union_variant_tags.insert((*u, variant), tags);
+                    variant_tags.insert(variant, tags);
                 } else {
-                    union_empty_tags.insert(*u, tags);
+                    empty_tags.extend(tags);
                 }
             }
+            let item = hir.expect_item(*u);
+            let name = item.ident.name.to_ident_string();
+            let ItemKind::Union(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
+            let field_name_to_index = fs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.ident.name.to_ident_string(), FieldIdx::from_usize(i)))
+                .collect();
+            let (index_in_struct, struct_local_def_id) = union_to_struct[u];
+            let tu = TaggedUnion {
+                local_def_id: *u,
+                name,
+                variant_tags,
+                empty_tags,
+                field_name_to_index,
+                struct_local_def_id,
+                index_in_struct,
+                tag_index,
+            };
+            tagged_unions.insert(*u, tu);
         } else {
             tracing::info!("Union {:?}", u);
-            tracing::info!("Fields {:?}", fields[u]);
+            tracing::info!("Used fields {:?}", fields[u]);
             tracing::info!("  {:?}", tag_values[u]);
             for (f, vs) in vs {
                 tracing::info!("  {}", f.as_u32());
@@ -424,88 +444,59 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         }
     }
 
-    if tag_fields.is_empty() {
+    if tagged_unions.is_empty() {
         println!("No tagged union identified");
         return;
     }
 
-    let unions = tag_fields.keys().copied().collect();
-    let mut rewrite_structs: HashMap<_, Vec<_>> = HashMap::new();
-    for (u, tag_field) in &tag_fields {
-        let (i, s) = union_to_struct[&u];
-        rewrite_structs
-            .entry(s)
-            .or_default()
-            .push((*u, *tag_field, i));
-    }
-
-    let union_field_names: HashMap<_, HashMap<_, _>> = tag_fields
-        .keys()
-        .map(|u| {
-            let ItemKind::Union(VariantData::Struct(fs, _), _) = hir.expect_item(*u).kind else {
-                unreachable!()
-            };
-            let fs = fs
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (f.ident.name.to_ident_string(), FieldIdx::from_usize(i)))
-                .collect();
-            (*u, fs)
-        })
-        .collect();
-    let struct_field_names: HashMap<_, IndexVec<FieldIdx, _>> = rewrite_structs
-        .keys()
-        .map(|s| {
-            let ItemKind::Struct(VariantData::Struct(fs, _), _) = hir.expect_item(*s).kind else {
-                unreachable!()
-            };
-            let mut fs: IndexVec<FieldIdx, _> =
+    let mut tagged_structs = HashMap::new();
+    for (u, tu) in &tagged_unions {
+        let s = tu.struct_local_def_id;
+        let ts = tagged_structs.entry(s).or_insert_with(|| {
+            let item = hir.expect_item(s);
+            let name = item.ident.name.to_ident_string();
+            let ItemKind::Struct(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
+            let mut field_names: IndexVec<FieldIdx, _> =
                 fs.iter().map(|f| f.ident.name.to_ident_string()).collect();
-            if let Some(bitfield) = tss.bitfields.get(s) {
+            if let Some(bitfield) = tss.bitfields.get(&s) {
                 for _ in 0..bitfield.fields.len() {
-                    let (name, _) = &bitfield.fields[&fs.next_index()];
-                    fs.push(name.clone());
+                    let (name, _) = &bitfield.fields[&field_names.next_index()];
+                    field_names.push(name.clone());
                 }
             }
-            (*s, fs)
-        })
-        .collect();
+            TaggedStruct {
+                local_def_id: s,
+                name,
+                tag_index: tu.tag_index,
+                field_names,
+                unions: vec![],
+            }
+        });
+        assert_eq!(ts.tag_index, tu.tag_index);
+        ts.unions.push((*u, tu.index_in_struct));
+    }
 
-    let source_map = tcx.sess.source_map();
-
-    let mut struct_tag_fields = HashMap::new();
-    let mut suggestions: HashMap<_, Vec<_>> = HashMap::new();
-    for (s, us) in rewrite_structs {
-        let fs = us.iter().map(|(_, f, _)| *f).collect::<HashSet<_>>();
-        assert_eq!(fs.len(), 1);
-        let field_idx = fs.into_iter().next().unwrap();
-        struct_tag_fields.insert(s, field_idx);
-        let Node::Item(item) = hir.get_if_local(s.to_def_id()).unwrap() else { unreachable!() };
-        let file = compile_util::span_to_path(item.span, source_map).unwrap();
-        let v = suggestions.entry(file.clone()).or_default();
-        let struct_name = item.ident.name.to_ident_string();
+    let mut suggestions = Suggestions::new(source_map);
+    for (s, ts) in &tagged_structs {
+        let item = hir.expect_item(*s);
         let ItemKind::Struct(VariantData::Struct(sfs, _), _) = item.kind else { unreachable!() };
 
-        let (field_name, field_ty) = if let Some(field) = sfs.get(field_idx.as_usize()) {
+        let (field_name, field_ty) = if let Some(field) = sfs.get(ts.tag_index.as_usize()) {
             let span = source_map.span_extend_to_line(field.span);
-            let snippet = span_to_snippet(span, source_map);
-            let suggestion = make_suggestion(snippet, "".to_string());
-            v.push(suggestion);
+            suggestions.add(span, "".to_string());
 
             let field_name = field.ident.name.to_ident_string();
             let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
             (field_name, field_ty)
         } else {
-            let (name, ty) = tss.bitfields[&s].fields[&field_idx].clone();
+            let (name, ty) = tss.bitfields[&s].fields[&ts.tag_index].clone();
             let mut lo = item.ident.span.hi() + BytePos(3);
             'l: for f in sfs {
                 loop {
                     let span = source_map.span_extend_to_line(f.span.with_lo(lo).with_hi(lo));
                     let code = source_map.span_to_snippet(span).unwrap();
                     if code.contains(&format!("#[bitfield(name = \"{}\"", name)) {
-                        let snippet = span_to_snippet(span, source_map);
-                        let suggestion = make_suggestion(snippet, "".to_string());
-                        v.push(suggestion);
+                        suggestions.add(span, "".to_string());
                         break 'l;
                     }
                     lo = span.hi() + BytePos(1);
@@ -521,22 +512,19 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             "
 impl {} {{
     pub fn set_{}(&mut self, v: {}) {{",
-            struct_name, field_name, field_ty,
+            ts.name, field_name, field_ty,
         );
-        for (n, (u, _, i)) in us.iter().enumerate() {
+        for (n, (u, i)) in ts.unions.iter().enumerate() {
             let is_first_union = n == 0;
-            let struct_field_name = sfs[i.as_usize()].ident.name.to_ident_string();
-            let Node::Item(item) = hir.get_if_local(u.to_def_id()).unwrap() else { unreachable!() };
-            let union_name = item.ident.name.to_ident_string();
+            let tu = &tagged_unions[u];
+            let struct_field_name = &ts.field_names[*i];
+            let item = hir.expect_item(*u);
             let ItemKind::Union(VariantData::Struct(ufs, _), _) = item.kind else { unreachable!() };
             let tys: Vec<_> = ufs
                 .iter()
                 .map(|f| source_map.span_to_snippet(f.ty.span).unwrap().to_string())
                 .collect();
-            let mut all_fields = fields[&u].clone();
-            let mut all_tags = tag_values[&u][&field_idx].clone();
-            let mut enum_variants = vec![];
-            let mut field_methods = String::new();
+
             write!(
                 &mut set_tag_method,
                 "
@@ -544,19 +532,20 @@ impl {} {{
                 struct_field_name
             )
             .unwrap();
-            for (field, tags) in &variant_tag_values[&u][&field_idx] {
-                all_fields.remove(field);
-                for t in tags.keys() {
-                    all_tags.remove(t);
-                }
-                for tag in tags.keys() {
-                    enum_variants.push((Some(*field), *tag));
-                }
+            let mut get_tag_method = format!(
+                "impl {} {{
+    pub fn {}(self) -> {} {{
+        match self.{} {{",
+                ts.name, field_name, field_ty, struct_field_name
+            );
+            let mut field_methods = "".to_string();
+            let mut enum_str = format!("pub enum {} {{", tu.name);
+            for (field, tags) in &tu.variant_tags {
                 let field_name = ufs[field.as_usize()].ident.name.to_ident_string();
                 let ty = &tys[field.as_usize()];
                 let pattern: String = tags
-                    .keys()
-                    .map(|tag| format!("{}::{}{}(v)", union_name, field_name, tag))
+                    .iter()
+                    .map(|tag| format!("{}::{}{}(v)", tu.name, field_name, tag))
                     .intersperse(" | ".to_string())
                     .collect();
                 writeln!(
@@ -570,11 +559,11 @@ impl {} {{
         }}
     }}
 }}",
-                    union_name, field_name, ty, pattern,
+                    tu.name, field_name, ty, pattern,
                 )
                 .unwrap();
                 if tags.len() == 1 {
-                    let (t, _) = tags.iter().next().unwrap();
+                    let t = tags[0];
                     writeln!(
                         &mut field_methods,
                         "impl {} {{
@@ -590,26 +579,21 @@ impl {} {{
         }}
     }}
 }}",
-                        union_name, field_name, ty, pattern, ty, field_name, t, pattern,
+                        tu.name, field_name, ty, pattern, ty, field_name, t, pattern,
                     )
                     .unwrap();
                 } else {
-                    let mut arms = String::new();
-                    for t in tags.keys() {
+                    let mut arms = "".to_string();
+                    for t in tags {
                         write!(
                             &mut arms,
                             "
                 {} => {}::{}{}(v),",
-                            t, union_name, field_name, t
+                            t, tu.name, field_name, t
                         )
                         .unwrap();
                     }
-                    let default = format!(
-                        "{}::{}{}(v)",
-                        union_name,
-                        field_name,
-                        tags.keys().next().unwrap()
-                    );
+                    let default = format!("{}::{}{}(v)", tu.name, field_name, tags[0],);
                     writeln!(
                         &mut field_methods,
                         "impl {} {{
@@ -627,11 +611,12 @@ impl {} {{
         }}
     }}
 }}",
-                        union_name, field_name, field_ty, ty, pattern, ty, arms, default, pattern,
+                        tu.name, field_name, field_ty, ty, pattern, ty, arms, default, pattern,
                     )
                     .unwrap();
                 }
-                for t in tags.keys() {
+                for t in tags {
+                    let variant_name = format!("{}{}", field_name, t);
                     write!(
                         &mut set_tag_method,
                         "
@@ -641,41 +626,18 @@ impl {} {{
                 }} else {{
                     unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}
                 }};
-                {}::{}{}(v)
+                {}::{}(v)
             }}",
-                        t, pattern, struct_field_name, ty, union_name, field_name, t,
+                        t, pattern, struct_field_name, ty, tu.name, variant_name
                     )
                     .unwrap();
-                }
-            }
-            set_tag_method.push_str(
-                "
-            _ => panic!()
-        };",
-            );
-            if all_fields.is_empty() {
-                for tag in all_tags {
-                    enum_variants.push((None, tag));
-                }
-            } else {
-                assert_eq!(all_fields.len(), 1);
-                assert_eq!(all_tags.len(), 1);
-                let field = all_fields.into_iter().next().unwrap();
-                let tag = all_tags.into_iter().next().unwrap();
-                enum_variants.push((Some(field), tag));
-            }
-            let mut enum_str = format!("pub enum {} {{", union_name);
-            let mut get_tag_method = format!(
-                "impl {} {{
-    pub fn {}(self) -> {} {{
-        match self.{} {{",
-                struct_name, field_name, field_ty, struct_field_name
-            );
-            for (f, t) in enum_variants {
-                if let Some(f) = f {
-                    let field_name = ufs[f.as_usize()].ident.name.to_ident_string();
-                    let ty = &tys[f.as_usize()];
-                    let variant_name = format!("{}{}", field_name, t);
+                    write!(
+                        &mut get_tag_method,
+                        "
+            {}::{}(_) => {},",
+                        tu.name, variant_name, t
+                    )
+                    .unwrap();
                     write!(
                         &mut enum_str,
                         "
@@ -683,47 +645,52 @@ impl {} {{
                         variant_name, ty
                     )
                     .unwrap();
-                    write!(
-                        &mut get_tag_method,
-                        "
-            {}::{}(_) => {},",
-                        union_name, variant_name, t
-                    )
-                    .unwrap();
-                } else {
-                    let variant_name = format!("Empty{}", t);
-                    write!(
-                        &mut enum_str,
-                        "
-    {},",
-                        variant_name
-                    )
-                    .unwrap();
-                    write!(
-                        &mut get_tag_method,
-                        "
-            {}::{} => {},",
-                        union_name, variant_name, t
-                    )
-                    .unwrap();
-                };
+                }
             }
-            enum_str.push_str("\n}");
+            for t in &tu.empty_tags {
+                let variant_name = format!("Empty{}", t);
+                write!(
+                    &mut set_tag_method,
+                    "
+            {} => {}::{},",
+                    t, tu.name, variant_name
+                )
+                .unwrap();
+                write!(
+                    &mut get_tag_method,
+                    "
+            {}::{} => {},",
+                    tu.name, variant_name, t
+                )
+                .unwrap();
+                write!(
+                    &mut enum_str,
+                    "
+    {},",
+                    variant_name
+                )
+                .unwrap();
+            }
+            set_tag_method.push_str(
+                "
+            _ => panic!()
+        };",
+            );
             get_tag_method.push_str(
                 "
         }
     }
 }",
             );
-            let snippet = span_to_snippet(item.span, source_map);
+            enum_str.push_str("\n}");
+
             let code = format!(
                 "{}\n{}\n{}",
                 enum_str,
                 field_methods,
                 if is_first_union { &get_tag_method } else { "" },
             );
-            let suggestion = make_suggestion(snippet, code);
-            v.push(suggestion);
+            suggestions.add(item.span, code);
         }
 
         set_tag_method.push_str(
@@ -732,9 +699,7 @@ impl {} {{
 }",
         );
         let span = item.span.shrink_to_hi();
-        let snippet = span_to_snippet(span, source_map);
-        let suggestion = make_suggestion(snippet, set_tag_method);
-        v.push(suggestion);
+        suggestions.add(span, set_tag_method);
     }
 
     for item_id in hir.items() {
@@ -744,31 +709,21 @@ impl {} {{
         };
         let hir_body = hir.body(body_id);
         let local_def_id = item_id.owner_id.def_id;
-        // let mir_body = if matches!(item.kind, ItemKind::Fn(_, _, _)) {
-        //     tcx.optimized_mir(local_def_id)
-        // } else {
-        //     tcx.mir_for_ctfe(local_def_id)
-        // };
         let typeck = tcx.typeck(local_def_id);
         let mut visitor = HBodyVisitor {
             tcx,
-            // mir_body,
             typeck,
             func: local_def_id,
-            structs: &structs,
-            struct_tag_fields: &struct_tag_fields,
-            struct_field_names: &struct_field_names,
             aggregates: &aggregates,
             field_values: &field_values,
-            unions: &unions,
-            union_variant_tags: &union_variant_tags,
-            union_to_struct: &union_to_struct,
-            union_field_names: &union_field_names,
+            structs: &tagged_structs,
+            unions: &tagged_unions,
             suggestions: &mut suggestions,
         };
         visitor.visit_body(hir_body);
     }
 
+    let mut suggestions = suggestions.suggestions;
     for (path, suggestions) in &suggestions {
         tracing::info!("{:?}", path);
         for suggestion in suggestions {
@@ -778,6 +733,27 @@ impl {} {{
 
     if conf.transform {
         compile_util::apply_suggestions(&mut suggestions);
+    }
+}
+
+struct Suggestions<'tcx> {
+    suggestions: HashMap<PathBuf, Vec<Suggestion>>,
+    source_map: &'tcx SourceMap,
+}
+
+impl<'tcx> Suggestions<'tcx> {
+    fn new(source_map: &'tcx SourceMap) -> Self {
+        Self {
+            suggestions: HashMap::new(),
+            source_map,
+        }
+    }
+
+    fn add(&mut self, span: Span, code: String) {
+        let snippet = span_to_snippet(span, self.source_map);
+        let suggestion = make_suggestion(snippet, code);
+        let path = compile_util::span_to_path(span, self.source_map).unwrap();
+        self.suggestions.entry(path).or_default().push(suggestion);
     }
 }
 
@@ -1009,42 +985,52 @@ struct FieldAt {
     field: FieldIdx,
 }
 
+struct TaggedStruct {
+    #[allow(dead_code)]
+    local_def_id: LocalDefId,
+    name: String,
+    tag_index: FieldIdx,
+    field_names: IndexVec<FieldIdx, String>,
+    unions: Vec<(LocalDefId, FieldIdx)>,
+}
+
+struct TaggedUnion {
+    #[allow(dead_code)]
+    local_def_id: LocalDefId,
+    name: String,
+    variant_tags: HashMap<FieldIdx, Vec<u128>>,
+    empty_tags: Vec<u128>,
+    field_name_to_index: HashMap<String, FieldIdx>,
+    struct_local_def_id: LocalDefId,
+    index_in_struct: FieldIdx,
+    tag_index: FieldIdx,
+}
+
 struct HBodyVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    // mir_body: &'a rustc_middle::mir::Body<'tcx>,
     typeck: &'a TypeckResults<'tcx>,
     func: LocalDefId,
-    structs: &'a HashMap<LocalDefId, Vec<(FieldIdx, LocalDefId)>>,
-    struct_tag_fields: &'a HashMap<LocalDefId, FieldIdx>,
-    struct_field_names: &'a HashMap<LocalDefId, IndexVec<FieldIdx, String>>,
     aggregates: &'a HashMap<Span, (Local, Location)>,
     field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
-    unions: &'a HashSet<LocalDefId>,
-    union_variant_tags: &'a HashMap<(LocalDefId, FieldIdx), Vec<u128>>,
-    union_to_struct: &'a HashMap<LocalDefId, (FieldIdx, LocalDefId)>,
-    union_field_names: &'a HashMap<LocalDefId, HashMap<String, FieldIdx>>,
-    suggestions: &'a mut HashMap<PathBuf, Vec<Suggestion>>,
+    structs: &'a HashMap<LocalDefId, TaggedStruct>,
+    unions: &'a HashMap<LocalDefId, TaggedUnion>,
+    suggestions: &'a mut Suggestions<'tcx>,
 }
 
 impl<'tcx> HBodyVisitor<'_, 'tcx> {
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let source_map = self.tcx.sess.source_map();
-        let path = some_or!(compile_util::span_to_path(expr.span, source_map), return);
-        let suggestions = self.suggestions.entry(path).or_default();
         match expr.kind {
             ExprKind::Struct(_, fs, _) => {
                 let TyKind::Adt(adt_def, _) = self.typeck.expr_ty(expr).kind() else {
                     unreachable!()
                 };
                 let def_id = some_or!(adt_def.did().as_local(), return);
-                let tag_field_idx = *some_or!(self.struct_tag_fields.get(&def_id), return);
-                let unions = some_or!(self.structs.get(&def_id), return);
+                let ts = some_or!(self.structs.get(&def_id), return);
 
-                if let Some(field) = fs.get(tag_field_idx.as_usize()) {
+                if let Some(field) = fs.get(ts.tag_index.as_usize()) {
                     let span = source_map.span_extend_to_line(field.span);
-                    let snippet = span_to_snippet(span, source_map);
-                    let suggestion = make_suggestion(snippet, "".to_string());
-                    suggestions.push(suggestion);
+                    self.suggestions.add(span, "".to_string());
                 }
 
                 let (local, mut location) = self.aggregates[&expr.span];
@@ -1053,24 +1039,21 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     func: self.func,
                     location,
                     local,
-                    field: tag_field_idx,
+                    field: ts.tag_index,
                 };
                 let tag = self.field_values.get(&field_at).and_then(|values| {
                     assert!(values.len() <= 1, "{:?}", values);
                     values.iter().next()
                 });
 
-                for (i, u) in unions {
-                    if !self.unions.contains(u) {
-                        continue;
-                    }
-                    let field_name = &self.struct_field_names[&def_id][*i];
+                for (u, i) in &ts.unions {
+                    let tu = &self.unions[u];
+                    let field_name = &ts.field_names[*i];
                     let expr = fs
                         .iter()
                         .find(|f| &f.ident.name.to_ident_string() == field_name)
                         .unwrap()
                         .expr;
-                    let snippet = span_to_snippet(expr.span, source_map);
                     let ExprKind::Struct(path, ufs, _) = expr.kind else { unreachable!() };
                     let union_name = source_map.span_to_snippet(path.span()).unwrap();
                     let QPath::Resolved(_, path) = path else { unreachable!() };
@@ -1083,13 +1066,11 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     let tag = if let Some(tag) = tag {
                         *tag
                     } else {
-                        let i = self.union_field_names[u][&name];
-                        let tags = &self.union_variant_tags[&(*u, i)];
-                        tags[0]
+                        let i = tu.field_name_to_index[&name];
+                        tu.variant_tags[&i][0]
                     };
                     let v = format!("{}::{}{}({})", union_name, name, tag, init);
-                    let suggestion = make_suggestion(snippet, v);
-                    suggestions.push(suggestion);
+                    self.suggestions.add(expr.span, v);
                 }
             }
             ExprKind::Field(e, field) => {
@@ -1097,53 +1078,41 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                 let TyKind::Adt(adt_def, _) = ty.kind() else { return };
                 let did = some_or!(adt_def.did().as_local(), return);
 
-                if let Some(tag_field_idx) = self.struct_tag_fields.get(&did) {
+                if let Some(ts) = self.structs.get(&did) {
                     let variant = adt_def.variant(VariantIdx::from_u32(0));
-                    if let Some(field_def) = variant.fields.get(*tag_field_idx) {
+                    if let Some(field_def) = variant.fields.get(ts.tag_index) {
                         if field_def.ident(self.tcx).name == field.name {
                             let (ctx, e2) = get_expr_context(e, self.tcx);
                             match ctx {
                                 ExprContext::Value => {
                                     let span = field.span.shrink_to_hi();
-                                    let snippet = span_to_snippet(span, source_map);
-                                    let suggestion = make_suggestion(snippet, "()".to_string());
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, "()".to_string());
                                 }
                                 ExprContext::Store => {
                                     let span = field.span.shrink_to_lo();
-                                    let snippet = span_to_snippet(span, source_map);
-                                    let suggestion = make_suggestion(snippet, "set_".to_string());
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, "set_".to_string());
 
                                     let span = field.span.shrink_to_hi();
                                     let span = span.with_hi(span.hi() + BytePos(2));
-                                    let snippet = span_to_snippet(span, source_map);
-                                    let suggestion = make_suggestion(snippet, "(".to_string());
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, "(".to_string());
 
                                     let span = e2.span.shrink_to_hi();
-                                    let snippet = span_to_snippet(span, source_map);
-                                    let suggestion = make_suggestion(snippet, ")".to_string());
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, ")".to_string());
                                 }
                                 ExprContext::Address => panic!(),
                             }
                         }
                     }
-                } else if self.unions.contains(&did) {
+                } else if let Some(tu) = self.unions.get(&did) {
                     let (ctx, _) = get_expr_context(expr, self.tcx);
                     match ctx {
                         ExprContext::Value => {
-                            let snippet = span_to_snippet(field.span, source_map);
                             let call = format!("get_{}()", field.name);
-                            let suggestion = make_suggestion(snippet, call);
-                            suggestions.push(suggestion);
+                            self.suggestions.add(field.span, call);
                         }
                         ExprContext::Store | ExprContext::Address => {
                             let span = expr.span.shrink_to_lo();
-                            let snippet = span_to_snippet(span, source_map);
-                            let suggestion = make_suggestion(snippet, "(*".to_string());
-                            suggestions.push(suggestion);
+                            self.suggestions.add(span, "(*".to_string());
 
                             let ItemKind::Union(VariantData::Struct(fs, _), _) =
                                 self.tcx.hir().expect_item(did).kind
@@ -1155,14 +1124,13 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                                 .enumerate()
                                 .find(|(_, f)| f.ident.name == field.name)
                                 .unwrap();
-                            let tags = &self.union_variant_tags[&(did, FieldIdx::from(i))];
+                            let tags = &tu.variant_tags[&FieldIdx::from(i)];
 
                             let call = if tags.len() == 1 {
                                 format!("deref_{}_mut())", field.name)
                             } else {
-                                let (_, s_did) = self.union_to_struct[&did];
-                                let field_idx = self.struct_tag_fields[&s_did];
-                                let field_name = &self.struct_field_names[&s_did][field_idx];
+                                let ts = &self.structs[&tu.struct_local_def_id];
+                                let field_name = &ts.field_names[ts.tag_index];
                                 let ExprKind::Field(e2, _) = e.kind else { unreachable!() };
                                 let tag = format!(
                                     "{}.{}",
@@ -1171,9 +1139,7 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                                 );
                                 format!("deref_{}_mut({}()))", field.name, tag)
                             };
-                            let snippet = span_to_snippet(field.span, source_map);
-                            let suggestion = make_suggestion(snippet, call);
-                            suggestions.push(suggestion);
+                            self.suggestions.add(field.span, call);
 
                             let root = get_root(expr);
                             if let ExprKind::Unary(UnOp::Deref, e) = root.kind {
@@ -1184,15 +1150,11 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                                 }) = ty.kind()
                                 {
                                     let span = e.span.shrink_to_lo();
-                                    let snippet = span_to_snippet(span, source_map);
-                                    let suggestion = make_suggestion(snippet, "(".to_string());
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, "(".to_string());
 
                                     let span = e.span.shrink_to_hi();
-                                    let snippet = span_to_snippet(span, source_map);
                                     let cast = format!(" as *mut crate::{:?})", ty);
-                                    let suggestion = make_suggestion(snippet, cast);
-                                    suggestions.push(suggestion);
+                                    self.suggestions.add(span, cast);
                                 }
                             }
                         }
