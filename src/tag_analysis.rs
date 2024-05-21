@@ -378,6 +378,24 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             .push((u, tag_field, i));
     }
 
+    let struct_fields: HashMap<_, IndexVec<FieldIdx, _>> = rewrite_structs
+        .keys()
+        .map(|s| {
+            let ItemKind::Struct(VariantData::Struct(fs, _), _) = hir.expect_item(*s).kind else {
+                unreachable!()
+            };
+            let mut fs: IndexVec<FieldIdx, _> =
+                fs.iter().map(|f| f.ident.name.to_ident_string()).collect();
+            if let Some(bitfield) = tss.bitfields.get(s) {
+                for _ in 0..bitfield.fields.len() {
+                    let (name, _) = &bitfield.fields[&fs.next_index()];
+                    fs.push(name.clone());
+                }
+            }
+            (*s, fs)
+        })
+        .collect();
+
     let source_map = tcx.sess.source_map();
 
     let mut struct_tag_fields = HashMap::new();
@@ -663,6 +681,7 @@ impl {} {{
             unions: &unions,
             union_variant_tags: &union_variant_tags,
             union_to_struct: &union_to_struct,
+            struct_fields: &struct_fields,
             suggestions: &mut suggestions,
         };
         visitor.visit_body(hir_body);
@@ -902,6 +921,7 @@ struct HBodyVisitor<'a, 'tcx> {
     unions: &'a Vec<LocalDefId>,
     union_variant_tags: &'a HashMap<(LocalDefId, FieldIdx), Vec<u128>>,
     union_to_struct: &'a HashMap<LocalDefId, (FieldIdx, LocalDefId)>,
+    struct_fields: &'a HashMap<LocalDefId, IndexVec<FieldIdx, String>>,
     suggestions: &'a mut HashMap<PathBuf, Vec<Suggestion>>,
 }
 
@@ -1028,14 +1048,8 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                                 format!("deref_{}_mut())", field.name)
                             } else {
                                 let (_, s_did) = self.union_to_struct[&did];
-                                let ItemKind::Struct(VariantData::Struct(fs, _), _) =
-                                    self.tcx.hir().expect_item(s_did).kind
-                                else {
-                                    unreachable!()
-                                };
                                 let field_idx = self.struct_tag_fields[&s_did];
-                                let field_name =
-                                    fs[field_idx.as_usize()].ident.name.to_ident_string();
+                                let field_name = &self.struct_fields[&s_did][field_idx];
                                 let ExprKind::Field(e2, _) = e.kind else { unreachable!() };
                                 let tag = format!(
                                     "{}.{}",
@@ -1094,7 +1108,7 @@ fn get_expr_context<'tcx>(
             ExprKind::Field(_, _) | ExprKind::DropTemps(_) => get_expr_context(e, tcx),
             _ => (ExprContext::Value, e),
         },
-        Node::ExprField(_) | Node::Stmt(_) => (ExprContext::Value, expr),
-        _ => unreachable!(),
+        Node::ExprField(_) | Node::Stmt(_) | Node::Local(_) => (ExprContext::Value, expr),
+        _ => unreachable!("{:?}", parent),
     }
 }
