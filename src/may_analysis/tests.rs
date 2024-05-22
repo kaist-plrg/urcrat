@@ -2623,7 +2623,6 @@ fn test_writes_bitfield() {
     // _10 = &mut _4
     // _11 = const 3_i32
     // _9 = s::set_z(move _10, move _11) -> [return: bb2, unwind continue]
-
     analyze_fn_with(
         "
         #[derive(Copy, Clone, BitfieldStruct)]
@@ -2692,6 +2691,75 @@ fn test_writes_bitfield() {
             let w = res.bitfield_writes.remove(&def_id).unwrap();
             assert_eq!(wg(&w, 0, 8), vec![11]);
             assert_eq!(wg(&w, 1, 2), vec![12]);
+        },
+    );
+}
+
+#[test]
+fn test_writes_struct_bitfield() {
+    // _2 = s { x: const 0_i32, y: const 0_i32 }
+    // _3 = [const 0_u8; 1]
+    // _4 = [const 0_u8; 3]
+    // _1 = t { x: move _2, y_z: move _3, c2rust_padding: move _4 }
+    // _6 = &mut _1
+    // _7 = const 1_i32
+    // _5 = t::set_y(move _6, move _7) -> [return: bb1, unwind continue]
+    analyze_fn_with(
+        "
+        #[derive(Copy, Clone)]
+        #[repr(C)]
+        pub struct s {
+            pub x: libc::c_int,
+            pub y: libc::c_int,
+        }
+        #[derive(Copy, Clone, BitfieldStruct)]
+        #[repr(C)]
+        pub struct t {
+            pub x: s,
+            #[bitfield(name = \"y\", ty = \"libc::c_int\", bits = \"0..=0\")]
+            #[bitfield(name = \"z\", ty = \"libc::c_int\", bits = \"1..=1\")]
+            pub y_z: [u8; 1],
+            #[bitfield(padding)]
+            pub c2rust_padding: [u8; 3],
+        }
+        ",
+        "",
+        "
+        let mut x: t = t {
+            x: s { x: 0, y: 0 },
+            y_z: [0; 1],
+            c2rust_padding: [0; 3],
+        };
+        x.set_y(1 as libc::c_int);
+        ",
+        |mut res, tcx| {
+            assert_eq!(res.ends, vec![0, 6, 2, 3, 4, 5, 6, 8, 8, 9, 10, 11, 12, 13],);
+            assert_eq!(sol(&res, 0), e());
+            assert_eq!(sol(&res, 1), e());
+            assert_eq!(sol(&res, 2), e());
+            assert_eq!(sol(&res, 3), e());
+            assert_eq!(sol(&res, 4), e());
+            assert_eq!(sol(&res, 5), e());
+            assert_eq!(sol(&res, 6), e());
+            assert_eq!(sol(&res, 7), e());
+            assert_eq!(sol(&res, 8), e());
+            assert_eq!(sol(&res, 9), e());
+            assert_eq!(sol(&res, 10), e());
+            assert_eq!(sol(&res, 11), e());
+            assert_eq!(sol(&res, 12), vec![1]);
+            assert_eq!(sol(&res, 13), e());
+
+            let def_id = find("f", tcx);
+            let w = res.writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 0), e());
+            assert_eq!(wg(&w, 0, 1), e());
+            assert_eq!(wg(&w, 0, 2), e());
+            assert_eq!(wg(&w, 0, 3), vec![1, 2, 3, 4, 5, 6]);
+            assert_eq!(wg(&w, 0, 4), e());
+            assert_eq!(wg(&w, 0, 5), e());
+            assert_eq!(wg(&w, 0, 6), e());
+            let w = res.bitfield_writes.remove(&def_id).unwrap();
+            assert_eq!(wg(&w, 0, 6), vec![5]);
         },
     );
 }

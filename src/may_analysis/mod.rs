@@ -441,7 +441,7 @@ pub fn post_analyze<'a, 'tcx>(
                     func,
                     args,
                     location,
-                    &tss.bitfields,
+                    tss,
                     tcx,
                     &pre.ends,
                     &solutions,
@@ -567,7 +567,7 @@ fn compute_bitfield_writes<'tcx>(
     func: &Operand<'tcx>,
     args: &[Operand<'tcx>],
     location: Location,
-    bitfields: &HashMap<LocalDefId, BitField>,
+    tss: &TyShapes<'_, 'tcx>,
     tcx: TyCtxt<'tcx>,
     ends: &[usize],
     solutions: &[HybridBitSet<usize>],
@@ -584,7 +584,10 @@ fn compute_bitfield_writes<'tcx>(
     let local_def_id = some_or!(def_id.as_local(), return);
     let (local_def_id, method) = some_or!(receiver_and_method(local_def_id, tcx), return);
     let field = method.strip_prefix("set_").unwrap();
-    let offset = bitfields[&local_def_id].name_to_idx[field];
+    let TyKind::Ref(_, ty, _) = args[0].ty(ctx.locals, tcx).kind() else { unreachable!() };
+    let TyShape::Struct(_, fs, _) = tss.tys[ty] else { unreachable!() };
+    let idx = tss.bitfields[&local_def_id].name_to_idx[field];
+    let offset = fs[idx.as_usize()].0;
     let lhs = args[0].place().unwrap();
     assert!(lhs.projection.is_empty());
     let l = analyzer.prefixed_loc(lhs, ctx);
@@ -592,7 +595,7 @@ fn compute_bitfield_writes<'tcx>(
         .entry(location)
         .or_insert(HybridBitSet::new_empty(ends.len()));
     for loc in solutions[l.var.root].iter() {
-        let loc = loc + offset.as_usize();
+        let loc = loc + offset;
         let end = ends[loc];
         if loc <= end {
             writes.insert(loc);
