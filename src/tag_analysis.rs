@@ -802,6 +802,9 @@ impl VariantTags {
         let mut all_tags = HashSet::new();
         let mut field_tags = BTreeMap::new();
         for (f, tags) in &self.tags {
+            if tags.is_empty() {
+                continue;
+            }
             for t in tags.keys() {
                 if !all_tags.insert(*t) {
                     return None;
@@ -821,6 +824,9 @@ impl VariantTags {
                 .copied()
                 .filter(|t| !existing_tags.contains(t))
                 .collect();
+            if v.is_empty() {
+                continue;
+            }
             for t in &v {
                 if !new_tags.insert(*t) {
                     return;
@@ -1330,6 +1336,15 @@ fn get_expr_context<'tcx>(
             }
             ExprKind::AddrOf(_, _, _) => (ExprContext::Address, e),
             ExprKind::Field(_, _) | ExprKind::DropTemps(_) => get_expr_context(e, tcx),
+            ExprKind::MethodCall(method, receiver, _, _) => {
+                if expr.hir_id == receiver.hir_id
+                    && method.ident.name.to_ident_string() == "as_mut_ptr"
+                {
+                    (ExprContext::Address, expr)
+                } else {
+                    (ExprContext::Value, expr)
+                }
+            }
             _ => (ExprContext::Value, e),
         },
         Node::ExprField(_) | Node::Stmt(_) | Node::Local(_) | Node::Block(_) => {
