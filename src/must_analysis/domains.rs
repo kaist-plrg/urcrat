@@ -274,10 +274,10 @@ impl AbsInt {
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &u128> {
+    pub fn iter(&self) -> Box<dyn Iterator<Item = u128> + '_> {
         match self {
-            Self::Top => panic!(),
-            Self::Set(s) => s.iter(),
+            Self::Top => Box::new(std::iter::empty()),
+            Self::Set(s) => Box::new(s.iter().copied()),
         }
     }
 

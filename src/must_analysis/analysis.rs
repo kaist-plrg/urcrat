@@ -58,7 +58,7 @@ pub fn analyze(tcx: TyCtxt<'_>, gc: bool) -> AnalysisResults {
                 no_gc_locals: None,
                 gc,
             };
-            Some((local_def_id, analyze_body(body, ctx, tcx)))
+            Some((local_def_id, analyze_body(body, ctx, tcx).states))
         })
         .collect();
     AnalysisResults { functions }
@@ -78,13 +78,14 @@ pub fn analyze_body<'tcx>(
     body: &'tcx Body<'tcx>,
     ctx: AnalysisContext<'_, '_, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> HashMap<Location, AbsMem> {
+) -> BodyAnalysisResult {
     // println!("{}", compile_util::body_to_str(body));
     // println!("{}", compile_util::body_size(body));
     let pre_rpo_map = get_rpo_map(body);
     let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
     let loop_heads: HashSet<_> = loop_blocks.keys().map(|bb| bb.start_location()).collect();
     let rpo_map = compute_rpo_map(body, &loop_blocks);
+    let join_terminators = compute_join_terminators(body);
     let mut dead_locals = get_dead_locals(body, tcx);
     if let Some(no_gc) = ctx.no_gc_locals {
         for dead in &mut dead_locals {
@@ -98,6 +99,7 @@ pub fn analyze_body<'tcx>(
         body,
         loop_heads,
         rpo_map,
+        join_terminators,
         dead_locals,
         discriminant_values,
     };
@@ -116,12 +118,19 @@ pub struct Analyzer<'tcx, 'a, 'b> {
     pub body: &'tcx Body<'tcx>,
     pub loop_heads: HashSet<Location>,
     pub rpo_map: HashMap<BasicBlock, usize>,
+    pub join_terminators: HashSet<Location>,
     pub dead_locals: Vec<BitSet<Local>>,
     pub discriminant_values: HashMap<BasicBlock, DiscrVal>,
 }
 
+#[derive(Debug)]
+pub struct BodyAnalysisResult {
+    pub states: HashMap<Location, AbsMem>,
+    pub out_states: HashMap<Location, AbsMem>,
+}
+
 impl Analyzer<'_, '_, '_> {
-    fn analyze(&self) -> HashMap<Location, AbsMem> {
+    fn analyze(&self) -> BodyAnalysisResult {
         let bot = AbsMem::bot();
 
         let mut work_list = WorkList::new(&self.rpo_map);
@@ -129,6 +138,8 @@ impl Analyzer<'_, '_, '_> {
 
         let mut states = HashMap::new();
         states.insert(Location::START, AbsMem::top());
+
+        let mut out_states: HashMap<Location, AbsMem> = HashMap::new();
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
@@ -149,6 +160,12 @@ impl Analyzer<'_, '_, '_> {
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
+                if self.join_terminators.contains(&location) {
+                    let out_state = out_states.get(&location).unwrap_or(&bot);
+                    let joined = out_state.join(&new_next_state);
+                    out_states.insert(location, joined);
+                }
+
                 let next_state = states.get(&next_location).unwrap_or(&bot);
                 let mut joined = if self.loop_heads.contains(&next_location) {
                     next_state.widen(&new_next_state)
@@ -166,7 +183,7 @@ impl Analyzer<'_, '_, '_> {
             }
         }
 
-        states
+        BodyAnalysisResult { states, out_states }
     }
 
     pub fn resolve_indirect_call(&self, loc: Location) -> &[LocalDefId] {
@@ -344,6 +361,24 @@ fn compute_rpo_map(
     );
     rpo.reverse();
     rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
+}
+
+fn compute_join_terminators(body: &Body<'_>) -> HashSet<Location> {
+    let mut blocks: HashMap<_, HashSet<_>> = HashMap::new();
+    for (block, bbd) in body.basic_blocks.iter_enumerated() {
+        let loc = Location {
+            block,
+            statement_index: bbd.statements.len(),
+        };
+        for succ in bbd.terminator().successors() {
+            blocks.entry(succ).or_default().insert(loc);
+        }
+    }
+    blocks
+        .into_iter()
+        .filter(|(_, locs)| locs.len() > 1)
+        .flat_map(|(_, locs)| locs)
+        .collect()
 }
 
 fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Local>> {

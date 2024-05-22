@@ -5,7 +5,7 @@ use std::{
 };
 
 use compile_util::{make_suggestion, span_to_snippet};
-use etrace::some_or;
+use etrace::{ok_or, some_or};
 use must_analysis::Obj;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_ast::Mutability;
@@ -152,12 +152,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         })
         .collect();
 
-    let mut fields: HashMap<_, BTreeSet<_>> = HashMap::new();
-    let mut tag_values: HashMap<_, BTreeMap<_, BTreeSet<u128>>> = HashMap::new();
-    let mut variant_tag_values: HashMap<_, BTreeMap<_, BTreeMap<_, BTreeMap<_, BTreeSet<_>>>>> =
-        HashMap::new();
+    let mut union_uses: HashMap<_, UnionUse> = HashMap::new();
     let mut aggregates: HashMap<_, _> = HashMap::new();
-    let mut field_values: HashMap<FieldAt, BTreeSet<u128>> = HashMap::new();
+    let mut field_values: HashMap<FieldAt, BTreeSet<Tag>> = HashMap::new();
     println!("Start analysis");
     for item_id in hir.items() {
         let item = hir.item(item_id);
@@ -170,10 +167,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         let hbody = hir.body(body_id);
         let mut visitor = MBodyVisitor::new(tcx, &body.local_decls, &structs, &unions);
         visitor.visit_body(body);
-        let mut hvisitor = BitFieldInitVisitor {
-            tcx,
-            inits: HashMap::new(),
-        };
+        let mut hvisitor = BitFieldInitVisitor::new(tcx);
         hvisitor.visit_body(hbody);
         if !hvisitor.inits.is_empty() {
             for (local, location) in &visitor.inits {
@@ -197,7 +191,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             aggregates.entry(span).or_insert((*local, *location));
         }
         for a in &visitor.accesses {
-            fields.entry(a.ty).or_default().insert(a.field);
+            union_uses.entry(a.ty).or_default().insert_field(a.field);
         }
         let local_set: HashSet<_> = visitor
             .accesses
@@ -247,21 +241,18 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 continue;
             }
             let span = body.source_info(access.location).span;
-            let tags = compute_tags(access, &states, &body.local_decls, tcx);
+            let tags = compute_tags(access, &states.states, &body.local_decls, tcx);
             for (f, ns) in tags {
-                let vs = variant_tag_values
+                let vts = union_uses
                     .entry(access.ty)
                     .or_default()
-                    .entry(f)
-                    .or_default()
-                    .entry(access.field)
-                    .or_default();
+                    .get_access_tags_mut(f);
                 for n in ns.into_set() {
-                    vs.entry(n).or_default().insert(span);
+                    vts.insert(access.field, n, span);
                 }
             }
         }
-        for (loc, mem) in &states {
+        for (loc, mem) in states.states.iter().chain(states.out_states.iter()) {
             let Location {
                 block,
                 statement_index,
@@ -285,12 +276,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                             })
                             .collect();
                         for (f, n) in &v {
-                            tag_values
-                                .entry(*u)
-                                .or_default()
-                                .entry(*f)
-                                .or_default()
-                                .extend(n.into_set());
+                            union_uses.entry(*u).or_default().insert_tags(*f, n.iter());
                             let field_at = FieldAt {
                                 func: local_def_id,
                                 location: *loc,
@@ -300,30 +286,14 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                             field_values
                                 .entry(field_at)
                                 .or_default()
-                                .extend(n.into_set());
+                                .extend(n.iter().filter_map(|n| n.try_into().ok()).map(Tag));
                         }
                         if body.basic_blocks[block].statements.len() > statement_index {
                             continue;
                         }
-                        if let TerminatorKind::Call {
-                            func: Operand::Constant(box constant),
-                            ..
-                        } = body.basic_blocks[block].terminator().kind
-                        {
-                            let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
-                            let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                            if def_id.as_local().is_some()
-                                && tcx.impl_of_method(*def_id).is_some()
-                                && tcx
-                                    .def_path(*def_id)
-                                    .data
-                                    .last()
-                                    .unwrap()
-                                    .to_string()
-                                    .starts_with("set_")
-                            {
-                                continue;
-                            }
+                        let terminator = body.basic_blocks[block].terminator();
+                        if hvisitor.set_exprs.contains(&terminator.source_info.span) {
+                            continue;
                         }
                         let uv = fs
                             .get(&f)
@@ -335,15 +305,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                         if uv.len() == 1 {
                             let variant = uv[0];
                             for (f, ns) in &v {
-                                let vs = variant_tag_values
-                                    .entry(*u)
-                                    .or_default()
-                                    .entry(*f)
-                                    .or_default()
-                                    .entry(variant)
-                                    .or_default();
+                                let vts = union_uses.entry(*u).or_default().get_obj_tags_mut(*f);
                                 for n in ns.into_set() {
-                                    vs.entry(n).or_default().insert(span);
+                                    vts.insert(variant, n, span);
                                 }
                             }
                         }
@@ -355,43 +319,18 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     println!("Analysis done");
 
     let mut tagged_unions = HashMap::new();
-    for (u, vs) in &variant_tag_values {
-        let tag_field = vs
-            .iter()
-            .filter_map(|(f, vs)| {
-                let sum: usize = vs
-                    .values()
-                    .flat_map(|vs| vs.values())
-                    .map(|spans| spans.len())
-                    .sum();
-                if vs.len() <= 1 {
-                    return None;
-                }
-                let mut tags = HashSet::new();
-                for vs in vs.values() {
-                    for v in vs.keys() {
-                        if *v > u32::MAX as u128 || !tags.insert(*v) {
-                            return None;
-                        }
-                    }
-                }
-                Some((*f, (vs.len(), sum)))
-            })
-            .max_by_key(|(_, n)| *n);
-        if let Some((tag_index, _)) = tag_field {
+    for (u, uu) in &union_uses {
+        if let Some((tag_index, mut variant_tags)) = uu.compute_tags() {
             println!("Union {:?}", u);
-            println!("Used fields {:?}", fields[u]);
+            println!("Used fields: {:?}", uu.fields);
             println!("Tag field: {:?}", tag_index);
-            let mut all_fields = fields[u].clone();
-            let mut all_tags = tag_values[&u][&tag_index].clone();
-            let mut variant_tags = HashMap::new();
-            for (variant, vs) in &vs[&tag_index] {
-                for v in vs.keys() {
+            let mut all_fields = uu.fields.clone();
+            let mut all_tags = uu.tags[&tag_index].clone();
+            for (variant, tags) in &variant_tags {
+                for v in tags {
                     all_tags.remove(v);
                 }
-                let tags: Vec<_> = vs.keys().copied().collect();
-                println!("  {}: {:?}", variant.as_u32(), tags);
-                variant_tags.insert(*variant, tags);
+                println!("  {:?}: {:?}", variant, tags);
                 all_fields.remove(variant);
             }
             let mut empty_tags = vec![];
@@ -405,6 +344,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     empty_tags.extend(tags);
                 }
             }
+
             let item = hir.expect_item(*u);
             let name = item.ident.name.to_ident_string();
             let ItemKind::Union(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
@@ -427,14 +367,28 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             tagged_unions.insert(*u, tu);
         } else {
             tracing::info!("Union {:?}", u);
-            tracing::info!("Used fields {:?}", fields[u]);
-            tracing::info!("  {:?}", tag_values[u]);
-            for (f, vs) in vs {
-                tracing::info!("  {}", f.as_u32());
-                for (variant, vs) in vs {
-                    tracing::info!("    {}", variant.as_u32());
+            tracing::info!("Used fields: {:?}", uu.fields);
+            tracing::info!("Tags: {:?}", uu.tags);
+            tracing::info!("Access:");
+            for (f, vts) in &uu.access_tags {
+                tracing::info!("  Field {:?}", f);
+                for (variant, vs) in &vts.tags {
+                    tracing::info!("    Variant {:?}", variant);
                     for (n, spans) in vs {
-                        tracing::info!("      {}", n);
+                        tracing::info!("      Tag {}", n);
+                        for span in spans {
+                            tracing::info!("        {:?}", span);
+                        }
+                    }
+                }
+            }
+            tracing::info!("Obj:");
+            for (f, vts) in &uu.obj_tags {
+                tracing::info!("  Field {:?}", f);
+                for (variant, vs) in &vts.tags {
+                    tracing::info!("    Variant {:?}", variant);
+                    for (n, spans) in vs {
+                        tracing::info!("      Tag {}", n);
                         for span in spans {
                             tracing::info!("        {:?}", span);
                         }
@@ -758,6 +712,125 @@ impl<'tcx> Suggestions<'tcx> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Tag(u32);
+
+impl std::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Default)]
+struct UnionUse {
+    fields: BTreeSet<FieldIdx>,
+    tags: BTreeMap<FieldIdx, BTreeSet<Tag>>,
+    access_tags: BTreeMap<FieldIdx, VariantTags>,
+    obj_tags: BTreeMap<FieldIdx, VariantTags>,
+}
+
+impl UnionUse {
+    #[inline]
+    fn insert_field(&mut self, field: FieldIdx) {
+        self.fields.insert(field);
+    }
+
+    #[inline]
+    fn insert_tags<T: TryInto<u32>, S: IntoIterator<Item = T>>(
+        &mut self,
+        field: FieldIdx,
+        tags: S,
+    ) {
+        self.tags
+            .entry(field)
+            .or_default()
+            .extend(tags.into_iter().filter_map(|t| t.try_into().ok().map(Tag)));
+    }
+
+    #[inline]
+    fn get_access_tags_mut(&mut self, field: FieldIdx) -> &mut VariantTags {
+        self.access_tags.entry(field).or_default()
+    }
+
+    #[inline]
+    fn get_obj_tags_mut(&mut self, field: FieldIdx) -> &mut VariantTags {
+        self.obj_tags.entry(field).or_default()
+    }
+
+    fn compute_tags(&self) -> Option<(FieldIdx, BTreeMap<FieldIdx, Vec<Tag>>)> {
+        self.access_tags
+            .iter()
+            .filter_map(|(f, ts)| {
+                let mut tags = ts.compute_tags()?;
+                if let Some(tag_spans) = self.obj_tags.get(f) {
+                    tag_spans.compute_tags_with(&mut tags);
+                }
+                if tags.len() <= 1 {
+                    None
+                } else {
+                    Some((*f, tags))
+                }
+            })
+            .max_by_key(|(_, tags)| tags.len())
+    }
+}
+
+#[derive(Debug, Default)]
+struct VariantTags {
+    tags: BTreeMap<FieldIdx, BTreeMap<Tag, Vec<Span>>>,
+}
+
+impl VariantTags {
+    #[inline]
+    fn insert<T: TryInto<u32>>(&mut self, field: FieldIdx, tag: T, span: Span) {
+        let tag = ok_or!(tag.try_into(), return);
+        self.tags
+            .entry(field)
+            .or_default()
+            .entry(Tag(tag))
+            .or_default()
+            .push(span);
+    }
+
+    fn compute_tags(&self) -> Option<BTreeMap<FieldIdx, Vec<Tag>>> {
+        let mut all_tags = HashSet::new();
+        let mut field_tags = BTreeMap::new();
+        for (f, tags) in &self.tags {
+            for t in tags.keys() {
+                if !all_tags.insert(*t) {
+                    return None;
+                }
+            }
+            field_tags.insert(*f, tags.keys().copied().collect());
+        }
+        Some(field_tags)
+    }
+
+    fn compute_tags_with(&self, field_tags: &mut BTreeMap<FieldIdx, Vec<Tag>>) {
+        let existing_tags: HashSet<_> = field_tags.values().flatten().copied().collect();
+        let mut new_tags = HashSet::new();
+        for (f, tags) in &self.tags {
+            let v: Vec<_> = tags
+                .keys()
+                .copied()
+                .filter(|t| !existing_tags.contains(t))
+                .collect();
+            for t in &v {
+                if !new_tags.insert(*t) {
+                    return;
+                }
+            }
+            field_tags.entry(*f).or_default().extend(v);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum AccElem {
     Field(FieldIdx),
@@ -999,8 +1072,8 @@ struct TaggedUnion {
     #[allow(dead_code)]
     local_def_id: LocalDefId,
     name: String,
-    variant_tags: HashMap<FieldIdx, Vec<u128>>,
-    empty_tags: Vec<u128>,
+    variant_tags: BTreeMap<FieldIdx, Vec<Tag>>,
+    empty_tags: Vec<Tag>,
     field_name_to_index: HashMap<String, FieldIdx>,
     struct_local_def_id: LocalDefId,
     index_in_struct: FieldIdx,
@@ -1012,7 +1085,7 @@ struct HBodyVisitor<'a, 'tcx> {
     typeck: &'a TypeckResults<'tcx>,
     func: LocalDefId,
     aggregates: &'a HashMap<Span, (Local, Location)>,
-    field_values: &'a HashMap<FieldAt, BTreeSet<u128>>,
+    field_values: &'a HashMap<FieldAt, BTreeSet<Tag>>,
     structs: &'a HashMap<LocalDefId, TaggedStruct>,
     unions: &'a HashMap<LocalDefId, TaggedUnion>,
     suggestions: &'a mut Suggestions<'tcx>,
@@ -1183,9 +1256,18 @@ impl<'tcx> HVisitor<'tcx> for HBodyVisitor<'_, 'tcx> {
 struct BitFieldInitVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     inits: HashMap<Span, Span>,
+    set_exprs: HashSet<Span>,
 }
 
 impl<'tcx> BitFieldInitVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            inits: HashMap::new(),
+            set_exprs: HashSet::new(),
+        }
+    }
+
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let ExprKind::Block(block, _) = expr.kind else { return };
         if block.stmts.len() <= 1 {
@@ -1205,6 +1287,10 @@ impl<'tcx> BitFieldInitVisitor<'tcx> {
             return;
         }
         self.inits.insert(e.span, init.span);
+        for stmt in block.stmts.iter().skip(1) {
+            let StmtKind::Semi(e) = stmt.kind else { continue };
+            self.set_exprs.insert(e.span);
+        }
     }
 }
 
