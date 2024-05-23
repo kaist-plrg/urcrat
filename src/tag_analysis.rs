@@ -139,7 +139,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             .fields
             .iter_enumerated()
             .filter(|(i, f)| {
-                f.ty(tcx, List::empty()).is_integral()
+                let ty = f.ty(tcx, List::empty());
+                (ty.is_integral() || ty.is_bool())
                     && non_tag_fields.map_or(true, |fields| !fields.contains(i))
             })
             .map(|(i, _)| i)
@@ -816,16 +817,28 @@ impl UnionUse {
         &self,
         int_fields: &HashSet<FieldIdx>,
     ) -> Option<(FieldIdx, BTreeMap<FieldIdx, Vec<Tag>>)> {
-        self.access_tags
-            .iter()
-            .filter_map(|(f, ts)| {
+        let fs: HashSet<_> = self
+            .access_tags
+            .keys()
+            .chain(self.obj_tags.keys())
+            .copied()
+            .collect();
+        fs.iter()
+            .filter_map(|f| {
                 if !int_fields.contains(f) {
                     return None;
                 }
-                let mut tags = ts.compute_tags()?;
-                if let Some(tag_spans) = self.obj_tags.get(f) {
-                    tag_spans.compute_tags_with(&mut tags);
-                }
+                let tags = match (self.access_tags.get(f), self.obj_tags.get(f)) {
+                    (Some(ts1), Some(ts2)) => {
+                        let mut tags = ts1.compute_tags()?;
+                        if !ts2.compute_tags_with(&mut tags) {
+                            return None;
+                        }
+                        tags
+                    }
+                    (Some(ts), None) | (None, Some(ts)) => ts.compute_tags()?,
+                    _ => unreachable!(),
+                };
                 if tags.len() <= 1 {
                     None
                 } else {
@@ -870,7 +883,7 @@ impl VariantTags {
         Some(field_tags)
     }
 
-    fn compute_tags_with(&self, field_tags: &mut BTreeMap<FieldIdx, Vec<Tag>>) {
+    fn compute_tags_with(&self, field_tags: &mut BTreeMap<FieldIdx, Vec<Tag>>) -> bool {
         let existing_tags: HashSet<_> = field_tags.values().flatten().copied().collect();
         let mut new_tags = HashSet::new();
         for (f, tags) in &self.tags {
@@ -884,11 +897,12 @@ impl VariantTags {
             }
             for t in &v {
                 if !new_tags.insert(*t) {
-                    return;
+                    return false;
                 }
             }
             field_tags.entry(*f).or_default().extend(v);
         }
+        true
     }
 }
 
@@ -1386,7 +1400,7 @@ impl<'tcx> FieldVisitor<'_, 'tcx> {
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let ExprKind::Field(e, f) = expr.kind else { return };
         let ty = self.typeck.expr_ty(expr);
-        if !ty.is_integral() {
+        if !ty.is_integral() && !ty.is_bool() {
             return;
         }
         let ty = self.typeck.expr_ty(e);
