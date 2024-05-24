@@ -602,6 +602,7 @@ impl Node {
 pub struct Graph {
     pub nodes: Vec<Node>,
     locals: HashMap<Local, NodeId>,
+    statics: HashMap<LocalDefId, NodeId>,
     ints: HashMap<u128, AbsLoc>,
 }
 
@@ -628,6 +629,14 @@ impl Graph {
         for (l1, id1) in &self.locals {
             let (_, id2) = some_or!(other.locals.iter().find(|(l2, _)| l1 == *l2), continue);
             let (id, _) = ctx.joined.get_local_node_mut(*l1);
+            let idp = (AbsLoc::new_root(*id1), AbsLoc::new_root(*id2));
+            ctx.id_map.insert(idp.clone(), id);
+            ctx.remaining.push(idp);
+        }
+
+        for (s1, id1) in &self.statics {
+            let (_, id2) = some_or!(other.statics.iter().find(|(s2, _)| s1 == *s2), continue);
+            let id = ctx.joined.get_static(*s1);
             let idp = (AbsLoc::new_root(*id1), AbsLoc::new_root(*id2));
             ctx.id_map.insert(idp.clone(), id);
             ctx.remaining.push(idp);
@@ -704,6 +713,7 @@ impl Graph {
     pub fn assign(&mut self, l: &AccPath, l_deref: bool, r: &OpVal) {
         match r {
             OpVal::Place(r, r_deref) => self.x_eq_y(l, l_deref, r, *r_deref),
+            OpVal::Static(s) => self.x_eq_static(l, l_deref, *s),
             OpVal::Int(n) => self.x_eq_int(l, l_deref, *n),
             OpVal::Other => self.x_eq(l, l_deref),
         }
@@ -842,6 +852,22 @@ impl Graph {
         *obj = Obj::Ptr(loc);
     }
 
+    fn get_static(&mut self, s: LocalDefId) -> NodeId {
+        if let Some(id) = self.statics.get(&s) {
+            *id
+        } else {
+            let (id, _) = self.add_node();
+            self.statics.insert(s, id);
+            id
+        }
+    }
+
+    fn x_eq_static(&mut self, x: &AccPath, x_deref: bool, y: LocalDefId) {
+        let id = self.get_static(y);
+        let obj = self.lvalue(x, x_deref);
+        *obj = Obj::Ptr(AbsLoc::new_root(id));
+    }
+
     fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: u128) {
         let loc = self.get_int_node(n);
         let obj = self.lvalue(x, deref);
@@ -890,6 +916,7 @@ impl Graph {
                     let obj = self.lvalue(x, false);
                     *obj = Obj::Ptr(loc);
                 }
+                OpVal::Static(_) => unreachable!(),
                 OpVal::Int(idx) => {
                     *n += idx;
                     let obj = self.lvalue(x, false);

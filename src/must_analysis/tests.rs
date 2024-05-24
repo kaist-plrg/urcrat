@@ -2220,3 +2220,56 @@ fn test_union_field_invalidate() {
         },
     );
 }
+
+#[test]
+fn test_eq_static() {
+    // _1 = const 1_i32
+    // _2 = const {alloc1: *mut i32}
+    // (*_2) = move _1
+    // _4 = const {alloc1: *mut i32}
+    // _3 = (*_4)
+    analyze_fn_with(
+        "
+        pub static mut x: libc::c_int = 0 as libc::c_int;
+        ",
+        "",
+        "
+        x = 1 as libc::c_int;
+        let mut y: libc::c_int = x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=4);
+            assert_eq!(n[&1].as_ptr(), n[&3].as_ptr());
+            assert_eq!(n[&2].as_ptr(), n[&4].as_ptr());
+        },
+    );
+}
+
+#[test]
+fn test_static_invalidate() {
+    // _1 = const 1_i32
+    // _2 = const {alloc1: *mut i32}
+    // (*_2) = move _1
+    // _3 = g() -> [return: bb1, unwind continue]
+    // _5 = const {alloc1: *mut i32}
+    // _4 = (*_5)
+    analyze_fn_with(
+        "
+        pub static mut x: libc::c_int = 0 as libc::c_int;
+        pub unsafe extern \"C\" fn g() {
+            x = 2 as libc::c_int;
+        }
+        ",
+        "",
+        "
+        x = 1 as libc::c_int;
+        g();
+        let mut y: libc::c_int = x;
+        ",
+        |g, _, _| {
+            let n = get_nodes(&g, 1..=5);
+            assert_ne!(n[&1].as_ptr(), n[&4].as_ptr());
+            assert_eq!(n[&2].as_ptr(), n[&5].as_ptr());
+        },
+    );
+}

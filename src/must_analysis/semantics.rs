@@ -1,7 +1,7 @@
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, Scalar},
+        interpret::{ConstValue, GlobalAlloc, Scalar},
         AggregateKind, BinOp, CastKind, ConstantKind, HasLocalDecls, Local, Location, Operand,
         Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
@@ -267,7 +267,17 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     }
                     _ => OpVal::Other,
                 },
-                Scalar::Ptr(_, _) => OpVal::Other,
+                Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
+                    GlobalAlloc::Static(def_id) => {
+                        if let Some(def_id) = def_id.as_local() {
+                            OpVal::Static(def_id)
+                        } else {
+                            OpVal::Other
+                        }
+                    }
+                    GlobalAlloc::Memory(_) => OpVal::Other,
+                    _ => unreachable!(),
+                },
             },
             ConstValue::ZeroSized => OpVal::Other,
             ConstValue::Slice { .. } => unreachable!(),
@@ -367,6 +377,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                             .collect()
                     }
                 },
+                OpVal::Static(_) => unreachable!(),
                 OpVal::Int(i) => {
                     let target_opt = targets.iter().find(|(v, _)| i == *v);
                     let target = if let Some((_, target)) = target_opt {
@@ -601,6 +612,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
 #[derive(Debug, Clone)]
 pub enum OpVal {
     Place(AccPath, bool),
+    Static(LocalDefId),
     Int(u128),
     Other,
 }
@@ -617,6 +629,7 @@ impl OpVal {
     fn extend_projection(&mut self, proj: &[AccElem]) {
         match self {
             OpVal::Place(path, _) => path.extend_projection(proj),
+            OpVal::Static(_) => unreachable!(),
             OpVal::Int(_) => assert!(proj.is_empty()),
             OpVal::Other => {}
         }
