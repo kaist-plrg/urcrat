@@ -8,12 +8,12 @@ use compile_util::{make_suggestion, span_to_snippet};
 use etrace::{ok_or, some_or};
 use must_analysis::Obj;
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_ast::Mutability;
+use rustc_ast::{BindingAnnotation, Mutability};
 use rustc_hir::{
     def::Res,
     definitions::DefPathDataName,
     intravisit::{self, Visitor as HVisitor},
-    Expr, ExprKind, ItemKind, Node, PatKind, QPath, StmtKind, UnOp, VariantData,
+    ByRef, Expr, ExprKind, ItemKind, Node, PatKind, QPath, StmtKind, UnOp, VariantData,
 };
 use rustc_index::{bit_set::BitSet, IndexVec};
 use rustc_middle::{
@@ -1468,9 +1468,17 @@ fn get_expr_context<'tcx>(
             }
             _ => (ExprContext::Value, e),
         },
-        Node::ExprField(_) | Node::Stmt(_) | Node::Local(_) | Node::Block(_) => {
-            (ExprContext::Value, expr)
+        Node::Local(rustc_hir::Local { pat, .. }) => {
+            let PatKind::Binding(BindingAnnotation(by_ref, _), _, _, _) = pat.kind else {
+                unreachable!()
+            };
+            if by_ref == ByRef::Yes {
+                (ExprContext::Address, expr)
+            } else {
+                (ExprContext::Value, expr)
+            }
         }
+        Node::ExprField(_) | Node::Stmt(_) | Node::Block(_) => (ExprContext::Value, expr),
         _ => unreachable!("{:?}", parent),
     }
 }
