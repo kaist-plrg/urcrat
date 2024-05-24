@@ -301,7 +301,10 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 destination: None, ..
             }
             | TerminatorKind::Call { target: None, .. } => vec![],
-            TerminatorKind::SwitchInt { discr, targets } => match self.transfer_op(discr, state) {
+            TerminatorKind::SwitchInt {
+                discr: discr_op,
+                targets,
+            } => match self.transfer_op(discr_op, state) {
                 OpVal::Place(discr, is_deref) => match dv {
                     Some(dv) => {
                         assert_eq!(targets.all_targets().len(), 2);
@@ -334,25 +337,35 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         }
                         vec![(tl, ts), (fl, fs)]
                     }
-                    None => targets
-                        .iter()
-                        .map(|(v, target)| {
-                            let location = Location {
-                                block: target,
-                                statement_index: 0,
-                            };
-                            let mut state = state.clone();
-                            state.gm().filter_x_int(&discr, is_deref, v);
-                            (location, state)
-                        })
-                        .chain(std::iter::once((
-                            Location {
-                                block: targets.otherwise(),
-                                statement_index: 0,
-                            },
-                            state.clone(),
-                        )))
-                        .collect(),
+                    None => {
+                        let is_bool = discr_op.ty(&self.body.local_decls, self.tcx).is_bool();
+                        targets
+                            .iter()
+                            .map(|(v, target)| {
+                                let location = Location {
+                                    block: target,
+                                    statement_index: 0,
+                                };
+                                if is_bool {
+                                    assert_eq!(v, 0);
+                                }
+                                let mut state = state.clone();
+                                state.gm().filter_x_int(&discr, is_deref, v);
+                                (location, state)
+                            })
+                            .chain(std::iter::once({
+                                let location = Location {
+                                    block: targets.otherwise(),
+                                    statement_index: 0,
+                                };
+                                let mut state = state.clone();
+                                if is_bool {
+                                    state.gm().filter_x_int(&discr, is_deref, 1);
+                                }
+                                (location, state)
+                            }))
+                            .collect()
+                    }
                 },
                 OpVal::Int(i) => {
                     let target_opt = targets.iter().find(|(v, _)| i == *v);
