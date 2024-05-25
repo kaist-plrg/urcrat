@@ -2273,3 +2273,57 @@ fn test_static_invalidate() {
         },
     );
 }
+
+#[test]
+fn test_switch_filter() {
+    // _2 = const 0_i32
+    // switchInt(_1) -> [1: bb2, 2: bb3, otherwise: bb1]
+    // _5 = const 3_i32
+    // _2 = move _5
+    // goto -> bb4
+    // _3 = const 1_i32
+    // _2 = move _3
+    // goto -> bb4
+    // _4 = const 2_i32
+    // _2 = move _4
+    // goto -> bb4
+    // _6 = const 0_i32
+    // switchInt(_2) -> [1: bb6, 2: bb6, otherwise: bb5]
+    // _8 = _2
+    // _6 = move _8
+    // goto -> bb7
+    // _7 = const 3_i32
+    // _6 = move _7
+    // goto -> bb7
+    analyze_fn_with(
+        "
+        ",
+        "mut x: libc::c_int",
+        "
+        let mut y: libc::c_int = 0 as libc::c_int;
+        match x {
+            1 => {
+                y = 1 as libc::c_int;
+            }
+            2 => {
+                y = 2 as libc::c_int;
+            }
+            _ => {
+                y = 3 as libc::c_int;
+            }
+        }
+        let mut z: libc::c_int = 0 as libc::c_int;
+        match y {
+            1 | 2 => {
+                z = 3 as libc::c_int;
+            }
+            _ => {
+                z = y;
+            }
+        };
+        ",
+        |g, _, _| {
+            assert_eq!(g.get_local_as_int(6), Some(3));
+        },
+    );
+}

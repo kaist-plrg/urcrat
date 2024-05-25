@@ -343,7 +343,11 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                                 (fs.gm(), ts.gm())
                             };
                             g.filter_x_int(&AccPath::new(local, vec![]), false, v);
-                            gn.filter_x_not_int(&AccPath::new(local, vec![]), false, v);
+                            gn.filter_x_not_ints(
+                                &AccPath::new(local, vec![]),
+                                false,
+                                std::iter::once(v),
+                            );
                         }
                         vec![(tl, ts), (fl, fs)]
                     }
@@ -371,6 +375,12 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                                 let mut state = state.clone();
                                 if is_bool {
                                     state.gm().filter_x_int(&discr, is_deref, 1);
+                                } else {
+                                    state.gm().filter_x_not_ints(
+                                        &discr,
+                                        is_deref,
+                                        targets.iter().map(|(v, _)| v),
+                                    )
                                 }
                                 (location, state)
                             }))

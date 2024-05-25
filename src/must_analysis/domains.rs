@@ -958,12 +958,21 @@ impl Graph {
         }
     }
 
-    pub fn filter_x_not_int(&mut self, x: &AccPath, deref: bool, n: u128) {
+    pub fn filter_x_not_ints<I: Iterator<Item = u128>>(
+        &mut self,
+        x: &AccPath,
+        deref: bool,
+        nums: I,
+    ) {
         let ptr_loc = self.set_obj_ptr(|this| this.lvalue(x, deref));
         let obj = self.obj_at_location_mut(&ptr_loc, false);
         let Obj::AtAddr(ns) = obj else { return };
         let mut nset = ns.into_set();
-        if !nset.remove(&n) {
+        let mut removed = false;
+        for n in nums {
+            removed |= nset.remove(&n);
+        }
+        if !removed {
             return;
         }
         if nset.len() == 1 {
