@@ -537,6 +537,12 @@ impl {} {{
                 struct_field_name
             )
             .unwrap();
+            let mut new_method = format!(
+                "impl {} {{
+    pub fn new(t: {}) -> Self {{
+        match t {{",
+                tu.name, field_ty,
+            );
             let mut get_tag_method = format!(
                 "impl {} {{
     pub fn {}(self) -> {} {{
@@ -637,6 +643,13 @@ impl {} {{
                     )
                     .unwrap();
                     write!(
+                        &mut new_method,
+                        "
+            {} => Self::{}(unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}),",
+                        t, variant_name, ty
+                    )
+                    .unwrap();
+                    write!(
                         &mut get_tag_method,
                         "
             {}::{}(_) => {},",
@@ -662,6 +675,13 @@ impl {} {{
                 )
                 .unwrap();
                 write!(
+                    &mut new_method,
+                    "
+            {} => Self::{},",
+                    t, variant_name,
+                )
+                .unwrap();
+                write!(
                     &mut get_tag_method,
                     "
             {}::{} => {},",
@@ -681,6 +701,13 @@ impl {} {{
             _ => panic!()
         };",
             );
+            new_method.push_str(
+                "
+            _ => panic!(),
+        }
+    }
+}",
+            );
             get_tag_method.push_str(
                 "
         }
@@ -690,8 +717,9 @@ impl {} {{
             enum_str.push_str("\n}");
 
             let code = format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}",
                 enum_str,
+                new_method,
                 field_methods,
                 if is_first_union { &get_tag_method } else { "" },
             );
@@ -1183,10 +1211,12 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                 let def_id = some_or!(adt_def.did().as_local(), return);
                 let ts = some_or!(self.structs.get(&def_id), return);
 
-                if let Some(field) = fs.get(ts.tag_index.as_usize()) {
+                let tag_expr = fs.get(ts.tag_index.as_usize()).and_then(|field| {
                     let span = source_map.span_extend_to_line(field.span);
                     self.suggestions.add(span, "".to_string());
-                }
+
+                    source_map.span_to_snippet(field.expr.span).ok()
+                });
 
                 let (local, mut location) = self.aggregates[&expr.span];
                 location.statement_index += 1;
@@ -1196,10 +1226,7 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     local,
                     field: ts.tag_index,
                 };
-                let tag = self.field_values.get(&field_at).and_then(|values| {
-                    assert!(values.len() <= 1, "{:?}", values);
-                    values.iter().next()
-                });
+                let tags = self.field_values.get(&field_at);
 
                 for (u, i) in &ts.unions {
                     let tu = &self.unions[u];
@@ -1218,13 +1245,18 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     let name = ufs[0].ident.name.to_ident_string();
                     let span = ufs[0].expr.span;
                     let init = source_map.span_to_snippet(span).unwrap();
-                    let tag = if let Some(tag) = tag {
-                        *tag
+                    let v = if let Some(tags) = tags {
+                        if tags.len() == 1 {
+                            let tag = tags.iter().next().unwrap();
+                            format!("{}::{}{}({})", union_name, name, tag, init)
+                        } else {
+                            format!("{}::new({})", union_name, tag_expr.as_ref().unwrap())
+                        }
                     } else {
                         let i = tu.field_name_to_index[&name];
-                        tu.variant_tags[&i][0]
+                        let tag = tu.variant_tags[&i][0];
+                        format!("{}::{}{}({})", union_name, name, tag, init)
                     };
-                    let v = format!("{}::{}{}({})", union_name, name, tag, init);
                     self.suggestions.add(expr.span, v);
                 }
             }
