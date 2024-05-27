@@ -600,7 +600,10 @@ impl {} {{
                             &mut arms,
                             "
                 {} => {}::{}{}(v),",
-                            t, tu.name, field_name, t
+                            tag_to_string(*t, &field_ty),
+                            tu.name,
+                            field_name,
+                            t
                         )
                         .unwrap();
                     }
@@ -639,21 +642,30 @@ impl {} {{
                 }};
                 {}::{}(v)
             }}",
-                        t, pattern, struct_field_name, ty, tu.name, variant_name
+                        tag_to_string(*t, &field_ty),
+                        pattern,
+                        struct_field_name,
+                        ty,
+                        tu.name,
+                        variant_name
                     )
                     .unwrap();
                     write!(
                         &mut new_method,
                         "
             {} => Self::{}(unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}),",
-                        t, variant_name, ty
+                        tag_to_string(*t, &field_ty),
+                        variant_name,
+                        ty
                     )
                     .unwrap();
                     write!(
                         &mut get_tag_method,
                         "
             {}::{}(_) => {},",
-                        tu.name, variant_name, t
+                        tu.name,
+                        variant_name,
+                        tag_to_string(*t, &field_ty),
                     )
                     .unwrap();
                     write!(
@@ -671,14 +683,17 @@ impl {} {{
                     &mut set_tag_method,
                     "
             {} => {}::{},",
-                    t, tu.name, variant_name
+                    tag_to_string(*t, &field_ty),
+                    tu.name,
+                    variant_name
                 )
                 .unwrap();
                 write!(
                     &mut new_method,
                     "
             {} => Self::{},",
-                    t, variant_name,
+                    tag_to_string(*t, &field_ty),
+                    variant_name,
                 )
                 .unwrap();
                 write!(
@@ -1518,4 +1533,12 @@ fn get_expr_context<'tcx>(
 fn get_root<'tcx>(expr: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
     let ExprKind::Field(e, _) = expr.kind else { return expr };
     get_root(e)
+}
+
+fn tag_to_string(tag: Tag, ty: &str) -> String {
+    if ty == "bool" {
+        (tag.0 != 0).to_string()
+    } else {
+        tag.to_string()
+    }
 }
