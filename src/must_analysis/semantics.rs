@@ -224,7 +224,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             Operand::Constant(box constant) => match constant.literal {
                 ConstantKind::Ty(_) => unreachable!(),
                 ConstantKind::Unevaluated(constant, ty) => {
-                    if ty.is_integral() {
+                    if ty.is_integral() || ty.is_char() {
                         if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
                             self.transfer_const_value(v, ty)
                         } else {
@@ -265,6 +265,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         };
                         OpVal::Int(v)
                     }
+                    TyKind::Char => OpVal::Int(i.try_to_u32().unwrap() as _),
                     _ => OpVal::Other,
                 },
                 Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
@@ -850,6 +851,7 @@ macro_rules! create_cast_fn {
                     UintTy::U128 => n as $typ as u128,
                 },
                 TyKind::Bool => (n != 0) as $typ as u128,
+                TyKind::Char => (n as u32) as $typ as u128,
                 _ => panic!(),
             }
         }

@@ -700,7 +700,9 @@ impl {} {{
                     &mut get_tag_method,
                     "
             {}::{} => {},",
-                    tu.name, variant_name, t
+                    tu.name,
+                    variant_name,
+                    tag_to_string(*t, &field_ty),
                 )
                 .unwrap();
                 write!(
@@ -1547,6 +1549,8 @@ fn get_root<'tcx>(expr: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
 fn tag_to_string(tag: Tag, ty: &str) -> String {
     if ty == "bool" {
         (tag.0 != 0).to_string()
+    } else if ty.ends_with("c_int") {
+        (tag.0 as i32).to_string()
     } else {
         tag.to_string()
     }
