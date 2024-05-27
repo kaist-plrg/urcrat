@@ -1263,10 +1263,19 @@ impl<'tcx> HBodyVisitor<'_, 'tcx> {
                     let v = if let Some(tags) = tags {
                         if tags.len() == 1 {
                             let tag = tags.iter().next().unwrap();
+                            let i = tu.field_name_to_index[&name];
+                            let tags_from_i = &tu.variant_tags[&i];
+                            let tag = if tags_from_i.contains(tag) {
+                                *tag
+                            } else {
+                                tags_from_i[0]
+                            };
                             format!("{}::{}{}({})", union_name, name, tag, init)
                         } else {
                             format!("{}::new({})", union_name, tag_expr.as_ref().unwrap())
                         }
+                    } else if let Some(tag_expr) = &tag_expr {
+                        format!("{}::new({})", union_name, tag_expr)
                     } else {
                         let i = tu.field_name_to_index[&name];
                         let tag = tu.variant_tags[&i][0];
