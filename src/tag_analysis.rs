@@ -799,6 +799,8 @@ impl {} {{
         suggestions.add(span, set_tag_method);
     }
 
+    let mut match_targets = 0;
+    let mut if_targets = 0;
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let (ItemKind::Fn(_, _, body_id) | ItemKind::Static(_, _, body_id)) = item.kind else {
@@ -824,7 +826,13 @@ impl {} {{
             if_targets: HashMap::new(),
         };
         visitor.visit_body(hir_body);
+
+        match_targets += visitor.match_targets.len();
+        if_targets += visitor.if_targets.len();
     }
+
+    println!("match_targets: {}", match_targets);
+    println!("if_targets: {}", if_targets);
 
     let mut suggestions = suggestions.suggestions;
     for (path, suggestions) in &suggestions {
@@ -1305,45 +1313,34 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
             let ts = &self.structs[&tu.struct_local_def_id];
             let union_field_name = &ts.field_names[tu.index_in_struct];
 
-            let expr_wo_cast = unwrap_cast(expr);
-            match expr_wo_cast.kind {
-                ExprKind::Field(expr_struct, _) | ExprKind::MethodCall(_, expr_struct, _, _) => {
-                    let span = expr.span.with_lo(expr_struct.span.hi());
-                    self.suggestions.add(span, format!(".{}", union_field_name));
+            let struct_expr = self.get_struct(expr).unwrap();
+            let ty = self.typeck.expr_ty(struct_expr);
+            let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
+            if adt_def.did().as_local() == Some(ts.local_def_id) {
+                let struct_str = source_map.span_to_snippet(struct_expr.span).unwrap();
+                self.match_targets
+                    .insert(expr.span, normalize_expr_str(&struct_str));
+                self.suggestions
+                    .add(expr.span, format!("{}.{}", struct_str, union_field_name));
 
-                    let s = source_map.span_to_snippet(expr_struct.span).unwrap();
-                    self.match_targets.insert(expr.span, normalize_expr_str(&s));
-                }
-                ExprKind::Path(QPath::Resolved(_, path)) => {
-                    let Res::Local(hir_id) = path.res else { unreachable!() };
-                    let init = self.locals[&hir_id];
-                    let ExprKind::Field(expr_struct, _) = init.kind else { unreachable!() };
-                    let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
-                    self.suggestions
-                        .add(expr.span, format!("{}.{}", struct_str, union_field_name));
-                    self.match_targets
-                        .insert(expr.span, normalize_expr_str(&struct_str));
-                }
-                _ => unreachable!("{:?}", expr),
-            }
-            let is_const = is_from_const_ptr(expr_wo_cast, self.typeck);
-
-            let match_expr = get_parent(expr, self.tcx).unwrap();
-            let ExprKind::Match(_, arms, _) = match_expr.kind else { unreachable!() };
-            for arm in arms {
-                let span = arm.pat.span;
-                if let Some(tags) = pat_to_tags(arm.pat) {
-                    let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
-                    self.suggestions.add(span, pat);
-                    if matches!(arm.body.kind, ExprKind::Block(_, _)) {
-                        if let Some(cast) = cast {
-                            let pos = arm.body.span.lo() + BytePos(1);
-                            let span = arm.body.span.with_lo(pos).with_hi(pos);
-                            self.suggestions.add(span, cast);
+                let is_const = is_from_const_ptr(expr, self.typeck);
+                let match_expr = get_parent(expr, self.tcx).unwrap();
+                let ExprKind::Match(_, arms, _) = match_expr.kind else { unreachable!() };
+                for arm in arms {
+                    let span = arm.pat.span;
+                    if let Some(tags) = pat_to_tags(arm.pat) {
+                        let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
+                        self.suggestions.add(span, pat);
+                        if matches!(arm.body.kind, ExprKind::Block(_, _)) {
+                            if let Some(cast) = cast {
+                                let pos = arm.body.span.lo() + BytePos(1);
+                                let span = arm.body.span.with_lo(pos).with_hi(pos);
+                                self.suggestions.add(span, cast);
+                            }
                         }
+                    } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
+                        self.suggestions.add(arm.pat.span, "_".to_string());
                     }
-                } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
-                    self.suggestions.add(arm.pat.span, "_".to_string());
                 }
             }
         } else if let Some(access) = self.access_in_ifs.get(&expr.span) {
@@ -1352,7 +1349,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 if field == tu.tag_index {
                     let ts = &self.structs[&tu.struct_local_def_id];
                     let union_field_name = &ts.field_names[tu.index_in_struct];
-                    if let Some(exprs) = decompose_expr(expr) {
+                    if let Some(exprs) = self.decompose_expr(expr) {
                         let expr_strs: HashSet<_> = exprs
                             .iter()
                             .map(|e| {
@@ -1362,34 +1359,38 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             .collect();
                         assert_eq!(expr_strs.len(), 1);
                         let struct_expr = exprs[0];
-                        let is_const = is_from_const_ptr(struct_expr, self.typeck);
-                        let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
-                        let code = format!(
-                            "let {} = {}.{}",
-                            pat,
-                            source_map.span_to_snippet(struct_expr.span).unwrap(),
-                            union_field_name,
-                        );
-                        self.suggestions.add(expr.span, code);
+                        let ty = self.typeck.expr_ty(struct_expr);
+                        let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
+                        if adt_def.did().as_local() == Some(ts.local_def_id) {
+                            let is_const = is_from_const_ptr(struct_expr, self.typeck);
+                            let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
+                            let code = format!(
+                                "let {} = {}.{}",
+                                pat,
+                                source_map.span_to_snippet(struct_expr.span).unwrap(),
+                                union_field_name,
+                            );
+                            self.suggestions.add(expr.span, code);
 
-                        if let Some(cast) = cast {
-                            let if_expr = get_parent(expr, self.tcx).unwrap();
-                            let ExprKind::If(_, t, _) = if_expr.kind else {
-                                unreachable!("{:?}", if_expr)
-                            };
-                            assert!(matches!(t.kind, ExprKind::Block(_, _)));
-                            let pos = t.span.lo() + BytePos(1);
-                            let span = t.span.with_lo(pos).with_hi(pos);
-                            self.suggestions.add(span, cast);
+                            if let Some(cast) = cast {
+                                let if_expr = get_parent(expr, self.tcx).unwrap();
+                                let ExprKind::If(_, t, _) = if_expr.kind else {
+                                    unreachable!("{:?}", if_expr)
+                                };
+                                assert!(matches!(t.kind, ExprKind::Block(_, _)));
+                                let pos = t.span.lo() + BytePos(1);
+                                let span = t.span.with_lo(pos).with_hi(pos);
+                                self.suggestions.add(span, cast);
+                            }
+
+                            self.if_targets
+                                .insert(expr.span, expr_strs.into_iter().next().unwrap());
                         }
-
-                        self.if_targets
-                            .insert(expr.span, expr_strs.into_iter().next().unwrap());
                     } else {
                         println!(
                             "{:?} {}",
                             tags,
-                            source_map.span_to_snippet(expr.span).unwrap()
+                            source_map.span_to_snippet(expr.span).unwrap(),
                         );
                     }
                 }
@@ -1507,11 +1508,14 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         .iter()
                         .find(|(_, ams)| ams.iter().any(|am| am.arm_span.contains(expr.span)))
                     {
-                        let s1 = &self.match_targets[match_span];
-                        let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
-                        let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
-                        let s2 = normalize_expr_str(&struct_str);
-                        s1 == &s2
+                        if let Some(s1) = self.match_targets.get(match_span) {
+                            let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
+                            let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
+                            let s2 = normalize_expr_str(&struct_str);
+                            s1 == &s2
+                        } else {
+                            false
+                        }
                     } else if let Some((if_span, _)) = self
                         .access_in_ifs
                         .iter()
@@ -1610,6 +1614,43 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
         let PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
         let init = some_or!(local.init, return);
         self.locals.insert(hir_id, init);
+    }
+
+    fn get_struct(&self, expr: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
+        match unwrap_cast_and_drop(expr).kind {
+            ExprKind::Field(expr_struct, _) | ExprKind::MethodCall(_, expr_struct, _, _) => {
+                Some(expr_struct)
+            }
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                let Res::Local(hir_id) = path.res else { return None };
+                let init = self.locals.get(&hir_id)?;
+                self.get_struct(init)
+            }
+            _ => None,
+        }
+    }
+
+    fn decompose_expr(&self, expr: &'tcx Expr<'tcx>) -> Option<Vec<&'tcx Expr<'tcx>>> {
+        let expr = unwrap_cast_and_drop(expr);
+        let ExprKind::Binary(Spanned { node, .. }, lhs, rhs) = expr.kind else { return None };
+        match node {
+            BinOpKind::Or => {
+                let mut exprs1 = self.decompose_expr(lhs)?;
+                let exprs2 = self.decompose_expr(rhs)?;
+                exprs1.extend(exprs2);
+                Some(exprs1)
+            }
+            BinOpKind::Eq => {
+                if let (Some(struct_expr), None) | (None, Some(struct_expr)) =
+                    (self.get_struct(lhs), self.get_struct(rhs))
+                {
+                    Some(vec![struct_expr])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2026,7 +2067,7 @@ fn access_in_if<'tcx>(
                     field_tags,
                     if_loc: mif.loc,
                     branch_loc,
-                    if_span: mif.c,
+                    if_span: c_span,
                     branch_span,
                 };
                 accesses.push(access);
@@ -2111,11 +2152,6 @@ fn extract_tags_from_obj(obj: &Obj, g: &Graph) -> Vec<(FieldIdx, HashSet<u128>)>
         .collect()
 }
 
-fn unwrap_cast<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
-    let ExprKind::Cast(e, _) = e.kind else { return e };
-    unwrap_cast(e)
-}
-
 fn normalize_expr_str(s: &str) -> String {
     s.chars()
         .filter(|&c| !c.is_whitespace() && c != '(' && c != ')')
@@ -2123,7 +2159,7 @@ fn normalize_expr_str(s: &str) -> String {
 }
 
 fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
-    match e.kind {
+    match unwrap_cast_and_drop(e).kind {
         ExprKind::MethodCall(_, e, _, _)
         | ExprKind::Cast(e, _)
         | ExprKind::DropTemps(e)
@@ -2194,28 +2230,6 @@ fn tags_to_pattern<I: Iterator<Item = u128>>(
     (pat, cast)
 }
 
-fn decompose_expr<'a, 'tcx>(expr: &'a Expr<'tcx>) -> Option<Vec<&'a Expr<'tcx>>> {
-    let ExprKind::Binary(Spanned { node, .. }, lhs, rhs) = expr.kind else { return None };
-    match node {
-        BinOpKind::Or => {
-            let mut exprs1 = decompose_expr(lhs)?;
-            let exprs2 = decompose_expr(rhs)?;
-            exprs1.extend(exprs2);
-            Some(exprs1)
-        }
-        BinOpKind::Eq => {
-            if let ExprKind::Field(struct_expr, _) = unwrap_cast(lhs).kind {
-                Some(vec![struct_expr])
-            } else if let ExprKind::Field(struct_expr, _) = unwrap_cast(rhs).kind {
-                Some(vec![struct_expr])
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 fn is_from_const_ptr<'tcx>(expr: &Expr<'tcx>, typeck: &TypeckResults<'tcx>) -> bool {
     let expr_wo_proj = unwrap_projection(expr);
     if let ExprKind::Unary(UnOp::Deref, expr_ptr) = expr_wo_proj.kind {
@@ -2238,5 +2252,13 @@ fn get_parent<'tcx>(expr: &Expr<'_>, tcx: TyCtxt<'tcx>) -> Option<&'tcx Expr<'tc
         get_parent(parent, tcx)
     } else {
         Some(parent)
+    }
+}
+
+fn unwrap_cast_and_drop<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
+    if let ExprKind::Cast(e, _) | ExprKind::DropTemps(e) = e.kind {
+        unwrap_cast_and_drop(e)
+    } else {
+        e
     }
 }
