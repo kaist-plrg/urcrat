@@ -386,9 +386,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             println!("Tag field: {:?}", tag_index);
             let mut all_fields = uu.fields.clone();
             let mut all_tags = uu.tags[&tag_index].clone();
+            let mut tag_variants = HashMap::new();
             for (variant, tags) in &variant_tags {
-                for v in tags {
-                    all_tags.remove(v);
+                for tag in tags {
+                    all_tags.remove(tag);
+                    tag_variants.insert(*tag, Some(*variant));
                 }
                 println!("  {:?}: {:?}", variant, tags);
                 all_fields.remove(variant);
@@ -397,10 +399,16 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             if !all_tags.is_empty() {
                 println!("  {:?}: {:?}", all_fields, all_tags);
                 assert!(all_fields.len() <= 1, "{:?} {:?}", all_fields, all_tags);
-                let tags = all_tags.into_iter().collect();
+                let tags: Vec<_> = all_tags.into_iter().collect();
                 if let Some(variant) = all_fields.into_iter().next() {
+                    for tag in &tags {
+                        tag_variants.insert(*tag, Some(variant));
+                    }
                     variant_tags.insert(variant, tags);
                 } else {
+                    for tag in &tags {
+                        tag_variants.insert(*tag, None);
+                    }
                     empty_tags.extend(tags);
                 }
             }
@@ -424,6 +432,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 name,
                 variant_tags,
                 empty_tags,
+                tag_variants,
                 field_names,
                 field_tys,
                 field_name_to_index,
@@ -470,6 +479,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         return;
     }
     println!("{} tagged unions identified", tagged_unions.len());
+
+    access_in_matches.retain(|_, v| tagged_unions.contains_key(&v[0].ty));
+    println!("access_in_matches: {}", access_in_matches.len());
 
     let mut tagged_structs = HashMap::new();
     for (u, tu) in &tagged_unions {
@@ -1238,6 +1250,7 @@ struct TaggedUnion {
     name: String,
     variant_tags: BTreeMap<FieldIdx, Vec<Tag>>,
     empty_tags: Vec<Tag>,
+    tag_variants: HashMap<Tag, Option<FieldIdx>>,
     field_names: IndexVec<FieldIdx, String>,
     field_tys: IndexVec<FieldIdx, String>,
     field_name_to_index: HashMap<String, FieldIdx>,
@@ -1291,6 +1304,19 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 }
                 _ => unreachable!("{:?}", expr),
             }
+            let expr_wo_proj = unwrap_projection(expr_wo_cast);
+            let is_const = if let ExprKind::Unary(UnOp::Deref, expr_ptr) = expr_wo_proj.kind {
+                let ty = self.typeck.expr_ty(expr_ptr);
+                matches!(
+                    ty.kind(),
+                    TyKind::RawPtr(TypeAndMut {
+                        mutbl: Mutability::Not,
+                        ..
+                    })
+                )
+            } else {
+                false
+            };
 
             let Node::Expr(match_expr) = self.tcx.hir().get_parent(expr.hir_id) else {
                 unreachable!()
@@ -1299,36 +1325,54 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
             for arm in arms {
                 let span = arm.pat.span;
                 if let Some(tags) = pat_to_tags(arm.pat) {
-                    assert_eq!(tags.len(), 1);
-                    let tag = Tag(*tags.iter().next().unwrap() as _);
-                    let pat = if tu.empty_tags.contains(&tag) {
-                        format!("{}::Empty{}", tu.name, tag)
+                    let tag_and_variants: Vec<_> = tags
+                        .iter()
+                        .map(|tag| {
+                            let tag = Tag(*tag as _);
+                            (tag, tu.tag_variants[&tag])
+                        })
+                        .collect();
+                    let variants: HashSet<_> = tag_and_variants.iter().map(|(_, v)| *v).collect();
+                    let field = if variants.len() == 1 {
+                        variants.into_iter().next().unwrap()
                     } else {
-                        let f = tu
-                            .variant_tags
-                            .iter()
-                            .find_map(
-                                |(f, tags)| {
-                                    if tags.contains(&tag) {
-                                        Some(*f)
-                                    } else {
-                                        None
-                                    }
-                                },
-                            )
-                            .unwrap();
-
-                        assert!(matches!(arm.body.kind, ExprKind::Block(_, _)));
-                        let pos = arm.body.span.lo() + BytePos(1);
-                        let span = arm.body.span.with_lo(pos).with_hi(pos);
-                        let f_ty = &tu.field_tys[f];
-                        let code = format!("let mut __v = __v as *mut {};", f_ty);
-                        self.suggestions.add(span, code);
-
-                        let f_name = &tu.field_names[f];
-                        format!("{}::{}{}(ref mut __v)", tu.name, f_name, tag)
+                        None
                     };
+                    let binding = if let Some(field) = field {
+                        if matches!(arm.body.kind, ExprKind::Block(_, _)) {
+                            let pos = arm.body.span.lo() + BytePos(1);
+                            let span = arm.body.span.with_lo(pos).with_hi(pos);
+                            let f_ty = &tu.field_tys[field];
+                            let m = if is_const { "const" } else { "mut" };
+                            let code = format!("let __v = __v as *{} {};", m, f_ty);
+                            self.suggestions.add(span, code);
+
+                            if is_const {
+                                "ref __v"
+                            } else {
+                                "ref mut __v"
+                            }
+                        } else {
+                            "_"
+                        }
+                    } else {
+                        "_"
+                    };
+                    let pat: String = tag_and_variants
+                        .iter()
+                        .map(|(tag, variant)| {
+                            if let Some(v) = variant {
+                                let f_name = &tu.field_names[*v];
+                                format!("{}::{}{}({})", tu.name, f_name, tag, binding)
+                            } else {
+                                format!("{}::Empty{}", tu.name, tag)
+                            }
+                        })
+                        .intersperse(" | ".to_string())
+                        .collect();
                     self.suggestions.add(span, pat);
+                } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
+                    self.suggestions.add(arm.pat.span, "_".to_string());
                 }
             }
         }
@@ -2033,4 +2077,15 @@ fn normalize_expr_str(s: &str) -> String {
     s.chars()
         .filter(|&c| !c.is_whitespace() && c != '(' && c != ')')
         .collect()
+}
+
+fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
+    match e.kind {
+        ExprKind::MethodCall(_, e, _, _)
+        | ExprKind::Cast(e, _)
+        | ExprKind::DropTemps(e)
+        | ExprKind::Field(e, _)
+        | ExprKind::Index(e, _, _) => unwrap_projection(e),
+        _ => e,
+    }
 }
