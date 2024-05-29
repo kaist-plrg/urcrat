@@ -1285,7 +1285,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
 
             let expr_wo_cast = unwrap_cast(expr);
             match expr_wo_cast.kind {
-                ExprKind::Field(expr_struct, _) => {
+                ExprKind::Field(expr_struct, _) | ExprKind::MethodCall(_, expr_struct, _, _) => {
                     let span = expr.span.with_lo(expr_struct.span.hi());
                     self.suggestions.add(span, format!(".{}", union_field_name));
 
@@ -1554,6 +1554,18 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            ExprKind::Assign(lhs, rhs, _) => {
+                if let ExprKind::Path(QPath::Resolved(_, path)) = lhs.kind {
+                    if let Res::Local(hir_id) = path.res {
+                        self.locals.insert(hir_id, rhs);
+                    }
+                }
+                if let ExprKind::Path(QPath::Resolved(_, path)) = rhs.kind {
+                    if let Res::Local(hir_id) = path.res {
+                        self.locals.insert(hir_id, lhs);
                     }
                 }
             }
