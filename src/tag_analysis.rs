@@ -13,8 +13,8 @@ use rustc_hir::{
     def::Res,
     definitions::DefPathDataName,
     intravisit::{self, Visitor as HVisitor},
-    ByRef, Expr, ExprKind, HirId, ItemKind, MatchSource, Node, Pat, PatKind, QPath, StmtKind, UnOp,
-    VariantData,
+    BinOpKind, ByRef, Expr, ExprKind, HirId, ItemKind, MatchSource, Node, Pat, PatKind, QPath,
+    StmtKind, UnOp, VariantData,
 };
 use rustc_index::{bit_set::BitSet, IndexVec};
 use rustc_middle::{
@@ -27,7 +27,11 @@ use rustc_middle::{
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::LocalDefId, source_map::SourceMap, BytePos, Span, Symbol};
+use rustc_span::{
+    def_id::LocalDefId,
+    source_map::{SourceMap, Spanned},
+    BytePos, Span, Symbol,
+};
 use rustfix::Suggestion;
 use typed_arena::Arena;
 
@@ -206,6 +210,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let mut aggregates: HashMap<_, _> = HashMap::new();
     let mut field_values: HashMap<FieldAt, BTreeSet<Tag>> = HashMap::new();
     let mut access_in_matches: HashMap<_, Vec<_>> = HashMap::new();
+    let mut access_in_ifs: HashMap<_, Vec<_>> = HashMap::new();
     println!("Start analysis");
     for item_id in hir.items() {
         let item = hir.item(item_id);
@@ -297,7 +302,17 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 tags
             } else {
                 let accesses_if = access_in_if(access, &hvisitor.ifs, &visitor.ifs, ctx);
-                accesses_if.into_iter().flat_map(|a| a.field_tags).collect()
+                let tags = accesses_if
+                    .iter()
+                    .flat_map(|a| a.field_tags.clone())
+                    .collect();
+                for access_if in accesses_if {
+                    access_in_ifs
+                        .entry(access_if.if_span)
+                        .or_default()
+                        .push(access_if);
+                }
+                tags
             };
             let span = body.source_info(access.location).span;
             for (f, ns) in tags {
@@ -480,8 +495,11 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     }
     println!("{} tagged unions identified", tagged_unions.len());
 
-    access_in_matches.retain(|_, v| tagged_unions.contains_key(&v[0].ty));
+    access_in_matches.retain(|_, v| tagged_unions.contains_key(&v[0].access.ty));
     println!("access_in_matches: {}", access_in_matches.len());
+
+    access_in_ifs.retain(|_, v| tagged_unions.contains_key(&v[0].access.ty));
+    println!("access_in_ifs: {}", access_in_ifs.len());
 
     let mut tagged_structs = HashMap::new();
     for (u, tu) in &tagged_unions {
@@ -798,10 +816,12 @@ impl {} {{
             structs: &tagged_structs,
             unions: &tagged_unions,
             access_in_matches: &access_in_matches,
+            access_in_ifs: &access_in_ifs,
             suggestions: &mut suggestions,
 
             locals: HashMap::new(),
             match_targets: HashMap::new(),
+            if_targets: HashMap::new(),
         };
         visitor.visit_body(hir_body);
     }
@@ -1268,10 +1288,12 @@ struct SuggestingVisitor<'a, 'tcx> {
     structs: &'a HashMap<LocalDefId, TaggedStruct>,
     unions: &'a HashMap<LocalDefId, TaggedUnion>,
     access_in_matches: &'a HashMap<Span, Vec<AccessInMatch<'tcx>>>,
+    access_in_ifs: &'a HashMap<Span, Vec<AccessInIf<'tcx>>>,
     suggestions: &'a mut Suggestions<'tcx>,
 
     locals: HashMap<HirId, &'tcx Expr<'tcx>>,
     match_targets: HashMap<Span, String>,
+    if_targets: HashMap<Span, String>,
 }
 
 impl<'tcx> SuggestingVisitor<'_, 'tcx> {
@@ -1279,7 +1301,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
         let source_map = self.tcx.sess.source_map();
 
         if let Some(access) = self.access_in_matches.get(&expr.span) {
-            let tu = &self.unions[&access[0].ty];
+            let tu = &self.unions[&access[0].access.ty];
             let ts = &self.structs[&tu.struct_local_def_id];
             let union_field_name = &ts.field_names[tu.index_in_struct];
 
@@ -1304,75 +1326,72 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 }
                 _ => unreachable!("{:?}", expr),
             }
-            let expr_wo_proj = unwrap_projection(expr_wo_cast);
-            let is_const = if let ExprKind::Unary(UnOp::Deref, expr_ptr) = expr_wo_proj.kind {
-                let ty = self.typeck.expr_ty(expr_ptr);
-                matches!(
-                    ty.kind(),
-                    TyKind::RawPtr(TypeAndMut {
-                        mutbl: Mutability::Not,
-                        ..
-                    })
-                )
-            } else {
-                false
-            };
+            let is_const = is_from_const_ptr(expr_wo_cast, self.typeck);
 
-            let Node::Expr(match_expr) = self.tcx.hir().get_parent(expr.hir_id) else {
-                unreachable!()
-            };
+            let match_expr = get_parent(expr, self.tcx).unwrap();
             let ExprKind::Match(_, arms, _) = match_expr.kind else { unreachable!() };
             for arm in arms {
                 let span = arm.pat.span;
                 if let Some(tags) = pat_to_tags(arm.pat) {
-                    let tag_and_variants: Vec<_> = tags
-                        .iter()
-                        .map(|tag| {
-                            let tag = Tag(*tag as _);
-                            (tag, tu.tag_variants[&tag])
-                        })
-                        .collect();
-                    let variants: HashSet<_> = tag_and_variants.iter().map(|(_, v)| *v).collect();
-                    let field = if variants.len() == 1 {
-                        variants.into_iter().next().unwrap()
-                    } else {
-                        None
-                    };
-                    let binding = if let Some(field) = field {
-                        if matches!(arm.body.kind, ExprKind::Block(_, _)) {
+                    let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
+                    self.suggestions.add(span, pat);
+                    if matches!(arm.body.kind, ExprKind::Block(_, _)) {
+                        if let Some(cast) = cast {
                             let pos = arm.body.span.lo() + BytePos(1);
                             let span = arm.body.span.with_lo(pos).with_hi(pos);
-                            let f_ty = &tu.field_tys[field];
-                            let m = if is_const { "const" } else { "mut" };
-                            let code = format!("let __v = __v as *{} {};", m, f_ty);
-                            self.suggestions.add(span, code);
-
-                            if is_const {
-                                "ref __v"
-                            } else {
-                                "ref mut __v"
-                            }
-                        } else {
-                            "_"
+                            self.suggestions.add(span, cast);
                         }
-                    } else {
-                        "_"
-                    };
-                    let pat: String = tag_and_variants
-                        .iter()
-                        .map(|(tag, variant)| {
-                            if let Some(v) = variant {
-                                let f_name = &tu.field_names[*v];
-                                format!("{}::{}{}({})", tu.name, f_name, tag, binding)
-                            } else {
-                                format!("{}::Empty{}", tu.name, tag)
-                            }
-                        })
-                        .intersperse(" | ".to_string())
-                        .collect();
-                    self.suggestions.add(span, pat);
+                    }
                 } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
                     self.suggestions.add(arm.pat.span, "_".to_string());
+                }
+            }
+        } else if let Some(access) = self.access_in_ifs.get(&expr.span) {
+            if let Some((field, tags)) = find_tag_from_accesses(access) {
+                let tu = &self.unions[&access[0].access.ty];
+                if field == tu.tag_index {
+                    let ts = &self.structs[&tu.struct_local_def_id];
+                    let union_field_name = &ts.field_names[tu.index_in_struct];
+                    if let Some(exprs) = decompose_expr(expr) {
+                        let expr_strs: HashSet<_> = exprs
+                            .iter()
+                            .map(|e| {
+                                let s = source_map.span_to_snippet(e.span).unwrap();
+                                normalize_expr_str(&s)
+                            })
+                            .collect();
+                        assert_eq!(expr_strs.len(), 1);
+                        let struct_expr = exprs[0];
+                        let is_const = is_from_const_ptr(struct_expr, self.typeck);
+                        let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
+                        let code = format!(
+                            "let {} = {}.{}",
+                            pat,
+                            source_map.span_to_snippet(struct_expr.span).unwrap(),
+                            union_field_name,
+                        );
+                        self.suggestions.add(expr.span, code);
+
+                        if let Some(cast) = cast {
+                            let if_expr = get_parent(expr, self.tcx).unwrap();
+                            let ExprKind::If(_, t, _) = if_expr.kind else {
+                                unreachable!("{:?}", if_expr)
+                            };
+                            assert!(matches!(t.kind, ExprKind::Block(_, _)));
+                            let pos = t.span.lo() + BytePos(1);
+                            let span = t.span.with_lo(pos).with_hi(pos);
+                            self.suggestions.add(span, cast);
+                        }
+
+                        self.if_targets
+                            .insert(expr.span, expr_strs.into_iter().next().unwrap());
+                    } else {
+                        println!(
+                            "{:?} {}",
+                            tags,
+                            source_map.span_to_snippet(expr.span).unwrap()
+                        );
+                    }
                 }
             }
         }
@@ -1455,10 +1474,11 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             let (ctx, e2) = get_expr_context(e, self.tcx);
                             match ctx {
                                 ExprContext::Value => {
-                                    if self
-                                        .access_in_matches
-                                        .iter()
-                                        .all(|(span, _)| !span.contains(expr.span))
+                                    if !self
+                                        .match_targets
+                                        .keys()
+                                        .chain(self.if_targets.keys())
+                                        .any(|s| s.contains(e.span))
                                     {
                                         let span = field.span.shrink_to_hi();
                                         self.suggestions.add(span, "()".to_string());
@@ -1492,6 +1512,19 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
                         let s2 = normalize_expr_str(&struct_str);
                         s1 == &s2
+                    } else if let Some((if_span, _)) = self
+                        .access_in_ifs
+                        .iter()
+                        .find(|(_, ais)| ais.iter().any(|ai| ai.branch_span.contains(expr.span)))
+                    {
+                        if let Some(s1) = self.if_targets.get(if_span) {
+                            let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
+                            let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
+                            let s2 = normalize_expr_str(&struct_str);
+                            s1 == &s2
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     };
@@ -1861,7 +1894,6 @@ impl<'a, 'tcx> AccessCtx<'a, 'tcx> {
 #[derive(Debug)]
 #[allow(dead_code)]
 struct AccessInMatch<'tcx> {
-    ty: LocalDefId,
     access: FieldAccess<'tcx>,
     field_tags: Vec<(FieldIdx, HashSet<u128>)>,
     match_loc: Location,
@@ -1919,7 +1951,6 @@ fn access_in_match<'tcx>(
     }
 
     let access = AccessInMatch {
-        ty: access.ty,
         access,
         field_tags,
         match_loc,
@@ -2099,5 +2130,113 @@ fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
         | ExprKind::Field(e, _)
         | ExprKind::Index(e, _, _) => unwrap_projection(e),
         _ => e,
+    }
+}
+
+fn find_tag_from_accesses<'a>(
+    accesses: &'a [AccessInIf<'_>],
+) -> Option<(FieldIdx, &'a HashSet<u128>)> {
+    let access = accesses.get(0)?;
+    if access.field_tags.len() > 1 {
+        return None;
+    }
+    let (field, ref tags) = access.field_tags[0];
+    for access in &accesses[1..] {
+        if access.field_tags.len() > 1 {
+            return None;
+        }
+        let (field2, ref tags2) = access.field_tags[0];
+        if field != field2 || tags != tags2 {
+            return None;
+        }
+    }
+    Some((field, tags))
+}
+
+fn tags_to_pattern<I: Iterator<Item = u128>>(
+    tags: I,
+    is_const: bool,
+    tu: &TaggedUnion,
+) -> (String, Option<String>) {
+    let tag_and_variants: Vec<_> = tags
+        .map(|tag| {
+            let tag = Tag(tag as _);
+            (tag, tu.tag_variants[&tag])
+        })
+        .collect();
+    let variants: HashSet<_> = tag_and_variants.iter().map(|(_, v)| *v).collect();
+    let field = if variants.len() == 1 {
+        variants.into_iter().next().unwrap()
+    } else {
+        None
+    };
+    let (binding, cast) = if let Some(field) = field {
+        let binding = if is_const { "ref __v" } else { "ref mut __v" };
+        let f_ty = &tu.field_tys[field];
+        let m = if is_const { "const" } else { "mut" };
+        let cast = format!("let __v = __v as *{} {};", m, f_ty);
+        (binding, Some(cast))
+    } else {
+        ("_", None)
+    };
+    let pat = tag_and_variants
+        .iter()
+        .map(|(tag, variant)| {
+            if let Some(v) = variant {
+                let f_name = &tu.field_names[*v];
+                format!("{}::{}{}({})", tu.name, f_name, tag, binding)
+            } else {
+                format!("{}::Empty{}", tu.name, tag)
+            }
+        })
+        .intersperse(" | ".to_string())
+        .collect();
+    (pat, cast)
+}
+
+fn decompose_expr<'a, 'tcx>(expr: &'a Expr<'tcx>) -> Option<Vec<&'a Expr<'tcx>>> {
+    let ExprKind::Binary(Spanned { node, .. }, lhs, rhs) = expr.kind else { return None };
+    match node {
+        BinOpKind::Or => {
+            let mut exprs1 = decompose_expr(lhs)?;
+            let exprs2 = decompose_expr(rhs)?;
+            exprs1.extend(exprs2);
+            Some(exprs1)
+        }
+        BinOpKind::Eq => {
+            if let ExprKind::Field(struct_expr, _) = unwrap_cast(lhs).kind {
+                Some(vec![struct_expr])
+            } else if let ExprKind::Field(struct_expr, _) = unwrap_cast(rhs).kind {
+                Some(vec![struct_expr])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_from_const_ptr<'tcx>(expr: &Expr<'tcx>, typeck: &TypeckResults<'tcx>) -> bool {
+    let expr_wo_proj = unwrap_projection(expr);
+    if let ExprKind::Unary(UnOp::Deref, expr_ptr) = expr_wo_proj.kind {
+        let ty = typeck.expr_ty(expr_ptr);
+        matches!(
+            ty.kind(),
+            TyKind::RawPtr(TypeAndMut {
+                mutbl: Mutability::Not,
+                ..
+            })
+        )
+    } else {
+        false
+    }
+}
+
+fn get_parent<'tcx>(expr: &Expr<'_>, tcx: TyCtxt<'tcx>) -> Option<&'tcx Expr<'tcx>> {
+    let Node::Expr(parent) = tcx.hir().get_parent(expr.hir_id) else { return None };
+    if matches!(parent.kind, ExprKind::DropTemps(_)) {
+        get_parent(parent, tcx)
+    } else {
+        Some(parent)
     }
 }
