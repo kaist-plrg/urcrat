@@ -1632,23 +1632,26 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
 
     fn decompose_expr(&self, expr: &'tcx Expr<'tcx>) -> Option<Vec<&'tcx Expr<'tcx>>> {
         let expr = unwrap_cast_and_drop(expr);
-        let ExprKind::Binary(Spanned { node, .. }, lhs, rhs) = expr.kind else { return None };
-        match node {
-            BinOpKind::Or => {
-                let mut exprs1 = self.decompose_expr(lhs)?;
-                let exprs2 = self.decompose_expr(rhs)?;
-                exprs1.extend(exprs2);
-                Some(exprs1)
-            }
-            BinOpKind::Eq => {
-                if let (Some(struct_expr), None) | (None, Some(struct_expr)) =
-                    (self.get_struct(lhs), self.get_struct(rhs))
-                {
-                    Some(vec![struct_expr])
-                } else {
-                    None
+        match expr.kind {
+            ExprKind::Binary(Spanned { node, .. }, lhs, rhs) => match node {
+                BinOpKind::Or => {
+                    let mut exprs1 = self.decompose_expr(lhs)?;
+                    let exprs2 = self.decompose_expr(rhs)?;
+                    exprs1.extend(exprs2);
+                    Some(exprs1)
                 }
-            }
+                BinOpKind::Eq => {
+                    if let (Some(struct_expr), None) | (None, Some(struct_expr)) =
+                        (self.get_struct(lhs), self.get_struct(rhs))
+                    {
+                        Some(vec![struct_expr])
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            ExprKind::Field(struct_expr, _) => Some(vec![struct_expr]),
             _ => None,
         }
     }
