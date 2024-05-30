@@ -143,15 +143,18 @@ impl Analyzer<'_, '_, '_> {
 
         while let Some(location) = work_list.pop() {
             let state = states.get(&location).unwrap_or(&bot);
-            let nexts = self.body.stmt_at(location).either(
+            let (nexts, is_call) = self.body.stmt_at(location).either(
                 |stmt| {
                     let mut next_state = state.clone();
                     self.transfer_stmt(stmt, location, &mut next_state);
-                    vec![(location.successor_within_block(), next_state)]
+                    (vec![(location.successor_within_block(), next_state)], false)
                 },
                 |terminator| {
                     let v = self.discriminant_values.get(&location.block);
-                    self.transfer_term(terminator, v, location, state)
+                    (
+                        self.transfer_term(terminator, v, location, state),
+                        matches!(terminator.kind, TerminatorKind::Call { .. }),
+                    )
                 },
             );
             // println!("{:?}", state);
@@ -160,7 +163,7 @@ impl Analyzer<'_, '_, '_> {
             // println!("{:?}", nexts);
             // println!("-----------------");
             for (next_location, new_next_state) in nexts {
-                if self.join_terminators.contains(&location) {
+                if self.join_terminators.contains(&location) || is_call {
                     let out_state = out_states.get(&location).unwrap_or(&bot);
                     let joined = out_state.join(&new_next_state);
                     out_states.insert(location, joined);
