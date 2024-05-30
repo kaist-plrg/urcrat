@@ -1587,7 +1587,13 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                     };
 
                     if matched {
-                        self.suggestions.add(expr.span, "(*__v)".to_string());
+                        if !self
+                            .aggregate_spans
+                            .iter()
+                            .any(|span| span.contains(expr.span))
+                        {
+                            self.suggestions.add(expr.span, "(*__v)".to_string());
+                        }
                     } else {
                         let (ctx, _) = get_expr_context(expr, self.tcx);
                         if !self
@@ -1891,7 +1897,6 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
     }
 
     fn assigned_value_to_string(&self, assigned_value: &AssignedValue<'tcx>) -> String {
-        let source_map = self.tcx.sess.source_map();
         match assigned_value {
             AssignedValue::Compound(name, fields) => {
                 let mut s = name.clone();
@@ -1909,20 +1914,26 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 s.push_str(" }");
                 s
             }
-            AssignedValue::Primitive(value) => {
-                if let ExprKind::Field(e, f) = value.kind {
-                    let ty = self.typeck.expr_ty(e);
-                    if let TyKind::Adt(adt_def, _) = ty.kind() {
-                        if let Some(did) = adt_def.did().as_local() {
-                            if self.unions.contains_key(&did) {
-                                let e = source_map.span_to_snippet(e.span).unwrap();
-                                return format!("{}.get_{}()", e, f.name);
-                            }
-                        }
+            AssignedValue::Primitive(value) => self.replace_if_union(value),
+        }
+    }
+
+    fn replace_if_union(&self, expr: &Expr<'tcx>) -> String {
+        let source_map = self.tcx.sess.source_map();
+        if let ExprKind::Field(e, f) = expr.kind {
+            let ty = self.typeck.expr_ty(e);
+            if let TyKind::Adt(adt_def, _) = ty.kind() {
+                if let Some(did) = adt_def.did().as_local() {
+                    if self.unions.contains_key(&did) {
+                        let e = source_map.span_to_snippet(e.span).unwrap();
+                        return format!("{}.get_{}()", e, f.name);
                     }
                 }
-                source_map.span_to_snippet(value.span).unwrap()
             }
+            let s = self.replace_if_union(e);
+            format!("{}.{}", s, f.name)
+        } else {
+            source_map.span_to_snippet(expr.span).unwrap()
         }
     }
 }
