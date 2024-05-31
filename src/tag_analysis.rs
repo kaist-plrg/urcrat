@@ -44,22 +44,61 @@ pub struct Config {
     pub solutions: Option<may_analysis::Solutions>,
     pub unions: HashSet<String>,
     pub transform: bool,
+    pub verbose: bool,
 }
 
-pub fn analyze_path(path: &Path, conf: &Config) {
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Statistics {
+    pub unions: usize,
+    pub structs: usize,
+    pub candidates: usize,
+    pub bodies: usize,
+    pub analyzed_bodies: usize,
+    pub tagged_unions: usize,
+    pub tagged_structs: usize,
+    pub preparation: usize,
+    pub may_analysis: usize,
+    pub must_analysis: usize,
+    pub transformation: usize,
+}
+
+impl std::fmt::Display for Statistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {} {} {} {} {} {}",
+            self.unions,
+            self.structs,
+            self.candidates,
+            self.bodies,
+            self.analyzed_bodies,
+            self.tagged_unions,
+            self.tagged_structs,
+            self.preparation,
+            self.may_analysis,
+            self.must_analysis,
+            self.transformation
+        )
+    }
+}
+
+pub fn analyze_path(path: &Path, conf: &Config) -> Statistics {
     analyze_input(compile_util::path_to_input(path), conf)
 }
 
-pub fn analyze_str(code: &str, conf: &Config) {
+pub fn analyze_str(code: &str, conf: &Config) -> Statistics {
     analyze_input(compile_util::str_to_input(code), conf)
 }
 
-fn analyze_input(input: Input, conf: &Config) {
+fn analyze_input(input: Input, conf: &Config) -> Statistics {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| analyze(tcx, conf)).unwrap()
 }
 
-pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
+pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
+    let mut stat = Statistics::default();
+    let start = std::time::Instant::now();
+
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
@@ -67,12 +106,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let (local_tys, foreign_tys) = visitor.find_foreign_tys(tcx);
     let arena = Arena::new();
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = may_analysis::pre_analyze(&tss, tcx);
-    let solutions = conf
-        .solutions
-        .clone()
-        .unwrap_or_else(|| may_analysis::analyze(&pre, &tss, tcx));
-    let may_points_to = may_analysis::post_analyze(pre, solutions, &tss, tcx);
 
     let mut non_tag_fields = HashMap::new();
     for item_id in hir.items() {
@@ -109,6 +142,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         })
         .collect();
 
+    let mut num_unions = 0;
+    let mut num_structs = 0;
     let mut structs = HashMap::new();
     let mut unions = vec![];
     let mut union_to_struct = HashMap::new();
@@ -132,12 +167,16 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
         }
 
-        if !matches!(item.kind, ItemKind::Struct(_, _)) {
-            continue;
-        }
         if foreign_tys.contains(&local_def_id) {
             continue;
         }
+        if !matches!(item.kind, ItemKind::Struct(_, _)) {
+            if matches!(item.kind, ItemKind::Union(_, _)) {
+                num_unions += 1;
+            }
+            continue;
+        }
+        num_structs += 1;
         let adt_def = tcx.adt_def(local_def_id);
         let variant = adt_def.variant(VariantIdx::from_u32(0));
         let non_tag_fields = non_tag_fields.get(&local_def_id);
@@ -188,16 +227,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             structs.insert(local_def_id, info);
         }
     }
-
-    if unions.is_empty() {
-        println!("No candidates");
-        return;
-    }
-    println!("{} candidates:", unions.len());
-    for u in &unions {
-        println!("{:?}", u);
-    }
-
     let paths_to_unions: Vec<_> = unions
         .iter()
         .map(|u| {
@@ -207,6 +236,40 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         })
         .collect();
 
+    stat.unions = num_unions;
+    stat.structs = num_structs;
+    stat.candidates = unions.len();
+    stat.preparation = start.elapsed().as_millis() as usize;
+
+    if unions.is_empty() {
+        if conf.verbose {
+            println!("No candidates");
+        }
+        return stat;
+    }
+    if conf.verbose {
+        println!("{} candidates:", unions.len());
+        for u in &unions {
+            println!("{:?}", u);
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let pre = may_analysis::pre_analyze(&tss, tcx);
+    let solutions = conf
+        .solutions
+        .clone()
+        .unwrap_or_else(|| may_analysis::analyze(&pre, &tss, tcx));
+    let may_points_to = may_analysis::post_analyze(pre, solutions, &tss, tcx);
+    stat.may_analysis = start.elapsed().as_millis() as usize;
+
+    if conf.verbose {
+        println!("Start analysis");
+    }
+
+    let start = std::time::Instant::now();
+    let mut bodies = 0;
+    let mut analyzed_bodies = 0;
     let mut union_uses: HashMap<_, UnionUse> = HashMap::new();
     let mut aggregates: HashMap<_, _> = HashMap::new();
     let mut field_values: HashMap<FieldAt, BTreeSet<Tag>> = HashMap::new();
@@ -214,7 +277,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
     let mut access_in_ifs: HashMap<_, Vec<_>> = HashMap::new();
     let mut basic_blocks = HashMap::new();
     let mut locals: HashMap<_, HashMap<_, _>> = HashMap::new();
-    println!("Start analysis");
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let local_def_id = item_id.owner_id.def_id;
@@ -223,6 +285,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             ItemKind::Static(_, _, body_id) => (body_id, tcx.mir_for_ctfe(local_def_id)),
             _ => continue,
         };
+        bodies += 1;
         let hbody = hir.body(body_id);
         let mut visitor = MBodyVisitor::new(tcx, &body.local_decls, &structs, &unions);
         visitor.visit_body(body);
@@ -289,7 +352,6 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                 }
             }
         }
-        println!("{:?}", local_def_id);
         let ctx = must_analysis::AnalysisContext {
             local_def_id,
             tss: &tss,
@@ -297,6 +359,10 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             no_gc_locals: Some(&locals),
             gc: true,
         };
+        if conf.verbose {
+            println!("{:?}", local_def_id);
+        }
+        analyzed_bodies += 1;
         let states = must_analysis::analyze_body(body, ctx, tcx);
         let ctx = AccessCtx::new(&states.states, &local_to_unions, body, tcx);
         for access in visitor.accesses {
@@ -398,16 +464,23 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
             }
         }
     }
-    println!("Analysis done");
+    if conf.verbose {
+        println!("Analysis done");
+    }
+
+    stat.bodies = bodies;
+    stat.analyzed_bodies = analyzed_bodies;
 
     let mut tagged_unions = HashMap::new();
     for (u, uu) in &union_uses {
         let (index_in_struct, struct_local_def_id) = union_to_struct[u];
         let int_fields = &structs[&struct_local_def_id].int_fields;
         if let Some((tag_index, mut variant_tags)) = uu.compute_tags(int_fields) {
-            println!("Union {:?}", u);
-            println!("Used fields: {:?}", uu.fields);
-            println!("Tag field: {:?}", tag_index);
+            if conf.verbose {
+                println!("Union {:?}", u);
+                println!("Used fields: {:?}", uu.fields);
+                println!("Tag field: {:?}", tag_index);
+            }
             let mut all_fields = uu.fields.clone();
             let mut all_tags = uu.tags[&tag_index].clone();
             let mut tag_variants = HashMap::new();
@@ -416,12 +489,16 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
                     all_tags.remove(tag);
                     tag_variants.insert(*tag, Some(*variant));
                 }
-                println!("  {:?}: {:?}", variant, tags);
+                if conf.verbose {
+                    println!("  {:?}: {:?}", variant, tags);
+                }
                 all_fields.remove(variant);
             }
             let mut empty_tags = vec![];
             if !all_tags.is_empty() {
-                println!("  {:?}: {:?}", all_fields, all_tags);
+                if conf.verbose {
+                    println!("  {:?}: {:?}", all_fields, all_tags);
+                }
                 assert!(all_fields.len() <= 1, "{:?} {:?}", all_fields, all_tags);
                 let tags: Vec<_> = all_tags.into_iter().collect();
                 if let Some(variant) = all_fields.into_iter().next() {
@@ -498,17 +575,26 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         }
     }
 
+    stat.tagged_unions = tagged_unions.len();
+    stat.must_analysis = start.elapsed().as_millis() as usize;
+
     if tagged_unions.is_empty() {
-        println!("No tagged union identified");
-        return;
+        if conf.verbose {
+            println!("No tagged union identified");
+        }
+        return stat;
     }
-    println!("{} tagged unions identified", tagged_unions.len());
+
+    let start = std::time::Instant::now();
 
     access_in_matches.retain(|_, v| tagged_unions.contains_key(&v[0].access.ty));
-    println!("access_in_matches: {}", access_in_matches.len());
-
     access_in_ifs.retain(|_, v| tagged_unions.contains_key(&v[0].access.ty));
-    println!("access_in_ifs: {}", access_in_ifs.len());
+
+    if conf.verbose {
+        println!("{} tagged unions identified", tagged_unions.len());
+        println!("access_in_matches: {}", access_in_matches.len());
+        println!("access_in_ifs: {}", access_in_ifs.len());
+    }
 
     let mut tagged_structs = HashMap::new();
     for (u, tu) in &tagged_unions {
@@ -536,6 +622,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) {
         assert_eq!(ts.tag_index, tu.tag_index);
         ts.unions.push((*u, tu.index_in_struct));
     }
+
+    stat.tagged_structs = tagged_structs.len();
 
     let mut suggestions = Suggestions::new(source_map);
     for (s, ts) in &tagged_structs {
@@ -846,9 +934,11 @@ impl {} {{
         aggregates_num += visitor.aggregates_num;
     }
 
-    println!("match_targets: {}", match_targets);
-    println!("if_targets: {}", if_targets);
-    println!("aggregates_num: {}", aggregates_num);
+    if conf.verbose {
+        println!("match_targets: {}", match_targets);
+        println!("if_targets: {}", if_targets);
+        println!("aggregates_num: {}", aggregates_num);
+    }
 
     let mut suggestions = suggestions.suggestions;
     for (path, suggestions) in &mut suggestions {
@@ -862,6 +952,9 @@ impl {} {{
     if conf.transform {
         compile_util::apply_suggestions(&suggestions);
     }
+
+    stat.transformation = start.elapsed().as_millis() as usize;
+    stat
 }
 
 struct Suggestions<'tcx> {
@@ -1434,7 +1527,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                 .insert(expr.span, expr_strs.into_iter().next().unwrap());
                         }
                     } else {
-                        println!(
+                        tracing::info!(
                             "{:?} {}",
                             tags,
                             source_map.span_to_snippet(expr.span).unwrap(),
@@ -1852,7 +1945,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                     }
                     removed = true;
                 } else {
-                    println!(
+                    tracing::info!(
                         "{}",
                         self.tcx
                             .sess

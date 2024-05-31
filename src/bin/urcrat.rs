@@ -26,6 +26,8 @@ enum Command {
 struct Args {
     #[arg(short, long)]
     log: Option<PathBuf>,
+    #[arg(short, long)]
+    verbose: bool,
 
     input: PathBuf,
 
@@ -46,16 +48,13 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    let elapsed = match args.command {
+    match args.command {
         Command::May { dump } => {
-            let start = std::time::Instant::now();
             let solutions = may_analysis::analyze_path(&file);
-            let elapsed = start.elapsed();
             if let Some(dump) = dump {
                 let arr = may_analysis::serialize_solutions(&solutions);
                 std::fs::write(dump, arr).unwrap();
             }
-            elapsed
         }
         Command::Must {
             may,
@@ -84,13 +83,12 @@ fn main() {
                 solutions,
                 unions: r#union.into_iter().collect(),
                 transform,
+                verbose: args.verbose,
             };
-            let start = std::time::Instant::now();
-            tag_analysis::analyze_path(&file, &conf);
-            start.elapsed()
+            let stat = tag_analysis::analyze_path(&file, &conf);
+            println!("{}", stat);
         }
-    };
-    println!("{}", elapsed.as_millis());
+    }
 }
 
 fn clear_dir(path: &Path) {
