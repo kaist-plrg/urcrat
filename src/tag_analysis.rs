@@ -1438,8 +1438,8 @@ struct SuggestingVisitor<'a, 'tcx> {
     suggestions: &'a mut Suggestions<'tcx>,
 
     locals: HashMap<HirId, &'tcx Expr<'tcx>>,
-    match_targets: HashMap<Span, String>,
-    if_targets: HashMap<Span, String>,
+    match_targets: HashMap<Span, (String, Vec<Span>)>,
+    if_targets: HashMap<Span, Option<String>>,
     aggregates_num: usize,
     aggregate_spans: Vec<Span>,
 }
@@ -1458,14 +1458,23 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
             let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
             if adt_def.did().as_local() == Some(ts.local_def_id) {
                 let struct_str = source_map.span_to_snippet(struct_expr.span).unwrap();
-                self.match_targets
-                    .insert(expr.span, normalize_expr_str(&struct_str));
                 self.suggestions
                     .add(expr.span, format!("{}.{}", struct_str, union_field_name));
 
+                let (root, derefs) = unwrap_deref(unwrap_projection(struct_expr));
+                let root = if let ExprKind::Path(QPath::Resolved(_, path)) = root.kind {
+                    if let Res::Local(hir_id) = path.res {
+                        Some(hir_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let is_const = is_from_const_ptr(expr, self.typeck);
                 let match_expr = get_parent(expr, self.tcx).unwrap();
                 let ExprKind::Match(_, arms, _) = match_expr.kind else { unreachable!() };
+                let mut arm_spans = vec![];
                 for arm in arms {
                     let span = arm.pat.span;
                     if let Some(tags) = pat_to_tags(arm.pat) {
@@ -1481,7 +1490,26 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                     } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
                         self.suggestions.add(arm.pat.span, "_".to_string());
                     }
+                    let has_assign = root
+                        .map(|root| {
+                            let mut visitor = AssignVisitor::new(self.tcx);
+                            visitor.visit_expr(arm.body);
+                            visitor
+                                .assigns
+                                .iter()
+                                .any(|(hir_id, i)| root == *hir_id && *i < derefs)
+                        })
+                        .unwrap_or(false);
+                    if !has_assign {
+                        arm_spans.push(arm.body.span);
+                    } else {
+                        println!("match has assign");
+                    }
                 }
+
+                let normalized_struct_str = normalize_expr_str(&struct_str);
+                self.match_targets
+                    .insert(expr.span, (normalized_struct_str, arm_spans));
             }
         } else if let Some(access) = self.access_in_ifs.get(&expr.span) {
             if let Some((field, tags)) = find_tag_from_accesses(access) {
@@ -1502,6 +1530,16 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         let ty = self.typeck.expr_ty(struct_expr);
                         let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
                         if adt_def.did().as_local() == Some(ts.local_def_id) {
+                            let (root, derefs) = unwrap_deref(unwrap_projection(struct_expr));
+                            let root = if let ExprKind::Path(QPath::Resolved(_, path)) = root.kind {
+                                if let Res::Local(hir_id) = path.res {
+                                    Some(hir_id)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
                             let is_const = is_from_const_ptr(struct_expr, self.typeck);
                             let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
                             let code = format!(
@@ -1512,19 +1550,37 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             );
                             self.suggestions.add(expr.span, code);
 
+                            let if_expr = get_parent(expr, self.tcx).unwrap();
+                            let ExprKind::If(_, t, _) = if_expr.kind else {
+                                unreachable!("{:?}", if_expr)
+                            };
+
                             if let Some(cast) = cast {
-                                let if_expr = get_parent(expr, self.tcx).unwrap();
-                                let ExprKind::If(_, t, _) = if_expr.kind else {
-                                    unreachable!("{:?}", if_expr)
-                                };
                                 assert!(matches!(t.kind, ExprKind::Block(_, _)));
                                 let pos = t.span.lo() + BytePos(1);
                                 let span = t.span.with_lo(pos).with_hi(pos);
                                 self.suggestions.add(span, cast);
                             }
 
-                            self.if_targets
-                                .insert(expr.span, expr_strs.into_iter().next().unwrap());
+                            let has_assign = root
+                                .map(|root| {
+                                    let mut visitor = AssignVisitor::new(self.tcx);
+                                    visitor.visit_expr(t);
+                                    visitor
+                                        .assigns
+                                        .iter()
+                                        .any(|(hir_id, i)| root == *hir_id && *i < derefs)
+                                })
+                                .unwrap_or(false);
+                            let s = if has_assign {
+                                None
+                            } else {
+                                Some(expr_strs.into_iter().next().unwrap())
+                            };
+                            if has_assign {
+                                println!("if has assign");
+                            }
+                            self.if_targets.insert(expr.span, s);
                         }
                     } else {
                         tracing::info!(
@@ -1654,11 +1710,11 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         .iter()
                         .find(|(_, ams)| ams.iter().any(|am| am.arm_span.contains(expr.span)))
                     {
-                        if let Some(s1) = self.match_targets.get(match_span) {
+                        if let Some((s1, arm_spans)) = self.match_targets.get(match_span) {
                             let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
                             let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
                             let s2 = normalize_expr_str(&struct_str);
-                            s1 == &s2
+                            s1 == &s2 && arm_spans.iter().any(|span| span.contains(expr.span))
                         } else {
                             false
                         }
@@ -1667,7 +1723,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         .iter()
                         .find(|(_, ais)| ais.iter().any(|ai| ai.branch_span.contains(expr.span)))
                     {
-                        if let Some(s1) = self.if_targets.get(if_span) {
+                        if let Some(Some(s1)) = self.if_targets.get(if_span) {
                             let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
                             let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
                             let s2 = normalize_expr_str(&struct_str);
@@ -1875,7 +1931,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
         for block in blocks.blocks {
             let ty = block[0].struct_ty;
             let expr = block[0].struct_expr;
-            let root = unwrap_deref(unwrap_projection(expr));
+            let (root, _) = unwrap_deref(unwrap_projection(expr));
             let ts = self.structs.get(&ty).unwrap();
             let tag_field_name = &ts.field_names[ts.tag_index];
 
@@ -2275,6 +2331,41 @@ impl<'tcx> FieldVisitor<'_, 'tcx> {
 }
 
 impl<'tcx> HVisitor<'tcx> for FieldVisitor<'_, 'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        self.handle_expr(expr);
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+struct AssignVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    assigns: Vec<(HirId, usize)>,
+}
+
+impl<'tcx> AssignVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            assigns: vec![],
+        }
+    }
+
+    fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let ExprKind::Assign(lhs, _, _) = expr.kind else { return };
+        let (root, i) = unwrap_deref(lhs);
+        let ExprKind::Path(QPath::Resolved(_, path)) = root.kind else { return };
+        let Res::Local(hir_id) = path.res else { return };
+        self.assigns.push((hir_id, i));
+    }
+}
+
+impl<'tcx> HVisitor<'tcx> for AssignVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
@@ -2749,10 +2840,11 @@ fn unwrap_cast_and_drop<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
     }
 }
 
-fn unwrap_deref<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
+fn unwrap_deref<'a, 'tcx>(e: &'a Expr<'tcx>) -> (&'a Expr<'tcx>, usize) {
     if let ExprKind::Unary(UnOp::Deref, e) = e.kind {
-        unwrap_deref(e)
+        let (e, i) = unwrap_deref(e);
+        (e, i + 1)
     } else {
-        e
+        (e, 0)
     }
 }
