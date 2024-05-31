@@ -60,13 +60,14 @@ pub struct Statistics {
     pub may_analysis: usize,
     pub must_analysis: usize,
     pub transformation: usize,
+    pub nums: Nums,
 }
 
 impl std::fmt::Display for Statistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
             self.unions,
             self.structs,
             self.candidates,
@@ -77,7 +78,8 @@ impl std::fmt::Display for Statistics {
             self.preparation,
             self.may_analysis,
             self.must_analysis,
-            self.transformation
+            self.transformation,
+            self.nums,
         )
     }
 }
@@ -896,9 +898,7 @@ impl {} {{
         suggestions.add(span, set_tag_method);
     }
 
-    let mut match_targets = 0;
-    let mut if_targets = 0;
-    let mut aggregates_num = 0;
+    let mut nums = Nums::default();
     for item_id in hir.items() {
         let item = hir.item(item_id);
         let (ItemKind::Fn(_, _, body_id) | ItemKind::Static(_, _, body_id)) = item.kind else {
@@ -924,21 +924,14 @@ impl {} {{
             locals: HashMap::new(),
             match_targets: HashMap::new(),
             if_targets: HashMap::new(),
-            aggregates_num: 0,
             aggregate_spans: vec![],
+
+            nums: Nums::default(),
         };
         visitor.visit_body(hir_body);
-
-        match_targets += visitor.match_targets.len();
-        if_targets += visitor.if_targets.len();
-        aggregates_num += visitor.aggregates_num;
+        nums += visitor.nums;
     }
-
-    if conf.verbose {
-        println!("match_targets: {}", match_targets);
-        println!("if_targets: {}", if_targets);
-        println!("aggregates_num: {}", aggregates_num);
-    }
+    stat.nums = nums;
 
     let mut suggestions = suggestions.suggestions;
     for (path, suggestions) in &mut suggestions {
@@ -1440,8 +1433,85 @@ struct SuggestingVisitor<'a, 'tcx> {
     locals: HashMap<HirId, &'tcx Expr<'tcx>>,
     match_targets: HashMap<Span, (String, Vec<Span>)>,
     if_targets: HashMap<Span, Option<String>>,
-    aggregates_num: usize,
     aggregate_spans: Vec<Span>,
+
+    nums: Nums,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Nums {
+    pub match_num: usize,
+    pub if_num: usize,
+    pub aggregate_num: usize,
+
+    pub new_num: usize,
+
+    pub get_tag_num: usize,
+    pub get_tag_match_num: usize,
+    pub get_tag_if_num: usize,
+
+    pub set_tag_num: usize,
+    pub set_tag_aggregate_num: usize,
+
+    pub get_variant_num: usize,
+    pub get_variant_match_num: usize,
+    pub get_variant_if_num: usize,
+
+    pub set_variant_num: usize,
+    pub set_variant_match_num: usize,
+    pub set_variant_if_num: usize,
+    pub set_variant_aggregate_num: usize,
+}
+
+impl std::fmt::Display for Nums {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            self.match_num,
+            self.if_num,
+            self.aggregate_num,
+            self.new_num,
+            self.get_tag_num,
+            self.get_tag_match_num,
+            self.get_tag_if_num,
+            self.set_tag_num,
+            self.set_tag_aggregate_num,
+            self.get_variant_num,
+            self.get_variant_match_num,
+            self.get_variant_if_num,
+            self.set_variant_num,
+            self.set_variant_match_num,
+            self.set_variant_if_num,
+            self.set_variant_aggregate_num,
+        )
+    }
+}
+
+impl std::ops::AddAssign for Nums {
+    fn add_assign(&mut self, rhs: Self) {
+        self.match_num += rhs.match_num;
+        self.if_num += rhs.if_num;
+        self.aggregate_num += rhs.aggregate_num;
+
+        self.new_num += rhs.new_num;
+
+        self.get_tag_num += rhs.get_tag_num;
+        self.get_tag_match_num += rhs.get_tag_match_num;
+        self.get_tag_if_num += rhs.get_tag_if_num;
+
+        self.set_tag_num += rhs.set_tag_num;
+        self.set_tag_aggregate_num += rhs.set_tag_aggregate_num;
+
+        self.get_variant_num += rhs.get_variant_num;
+        self.get_variant_match_num += rhs.get_variant_match_num;
+        self.get_variant_if_num += rhs.get_variant_if_num;
+
+        self.set_variant_num += rhs.set_variant_num;
+        self.set_variant_match_num += rhs.set_variant_match_num;
+        self.set_variant_if_num += rhs.set_variant_if_num;
+        self.set_variant_aggregate_num += rhs.set_variant_aggregate_num;
+    }
 }
 
 impl<'tcx> SuggestingVisitor<'_, 'tcx> {
@@ -1502,14 +1572,13 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         .unwrap_or(false);
                     if !has_assign {
                         arm_spans.push(arm.body.span);
-                    } else {
-                        println!("match has assign");
                     }
                 }
 
                 let normalized_struct_str = normalize_expr_str(&struct_str);
                 self.match_targets
                     .insert(expr.span, (normalized_struct_str, arm_spans));
+                self.nums.match_num += 1;
             }
         } else if let Some(access) = self.access_in_ifs.get(&expr.span) {
             if let Some((field, tags)) = find_tag_from_accesses(access) {
@@ -1577,10 +1646,8 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             } else {
                                 Some(expr_strs.into_iter().next().unwrap())
                             };
-                            if has_assign {
-                                println!("if has assign");
-                            }
                             self.if_targets.insert(expr.span, s);
+                            self.nums.if_num += 1;
                         }
                     } else {
                         tracing::info!(
@@ -1656,6 +1723,9 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         let tag = tu.variant_tags[&i][0];
                         format!("{}::{}{}({})", union_name, name, tag, init)
                     };
+                    if v.contains("::new(") {
+                        self.nums.new_num += 1;
+                    }
                     self.suggestions.add(expr.span, v);
                 }
             }
@@ -1671,24 +1741,26 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             let (ctx, e2) = get_expr_context(e, self.tcx);
                             match ctx {
                                 ExprContext::Value => {
-                                    if !self
-                                        .match_targets
-                                        .keys()
-                                        .chain(self.if_targets.keys())
-                                        .any(|s| s.contains(e.span))
-                                    {
+                                    if self.match_targets.keys().any(|s| s.contains(e.span)) {
+                                        self.nums.get_tag_match_num += 1;
+                                    } else if self.if_targets.keys().any(|s| s.contains(e.span)) {
+                                        self.nums.get_tag_if_num += 1;
+                                    } else {
                                         let span = field.span.shrink_to_hi();
                                         self.suggestions.add(span, "()".to_string());
+                                        self.nums.get_tag_num += 1;
                                     }
                                 }
                                 ExprContext::Store(op) => {
                                     assert!(!op);
 
-                                    if !self
+                                    if self
                                         .aggregate_spans
                                         .iter()
                                         .any(|span| span.contains(expr.span))
                                     {
+                                        self.nums.set_tag_aggregate_num += 1;
+                                    } else {
                                         let span = field.span.shrink_to_lo();
                                         self.suggestions.add(span, "set_".to_string());
 
@@ -1698,6 +1770,8 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
 
                                         let span = e2.span.shrink_to_hi();
                                         self.suggestions.add(span, ")".to_string());
+
+                                        self.nums.set_tag_num += 1;
                                     }
                                 }
                                 ExprContext::Address => panic!(),
@@ -1714,9 +1788,13 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
                             let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
                             let s2 = normalize_expr_str(&struct_str);
-                            s1 == &s2 && arm_spans.iter().any(|span| span.contains(expr.span))
+                            if s1 == &s2 && arm_spans.iter().any(|span| span.contains(expr.span)) {
+                                Some(true)
+                            } else {
+                                None
+                            }
                         } else {
-                            false
+                            None
                         }
                     } else if let Some((if_span, _)) = self
                         .access_in_ifs
@@ -1727,35 +1805,54 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             let ExprKind::Field(expr_struct, _) = e.kind else { unreachable!() };
                             let struct_str = source_map.span_to_snippet(expr_struct.span).unwrap();
                             let s2 = normalize_expr_str(&struct_str);
-                            s1 == &s2
+                            if s1 == &s2 {
+                                Some(false)
+                            } else {
+                                None
+                            }
                         } else {
-                            false
+                            None
                         }
                     } else {
-                        false
+                        None
                     };
 
-                    if matched {
+                    let (ctx, _) = get_expr_context(expr, self.tcx);
+                    if let Some(is_match) = matched {
                         if !self
                             .aggregate_spans
                             .iter()
                             .any(|span| span.contains(expr.span))
                         {
                             self.suggestions.add(expr.span, "(*__v)".to_string());
+
+                            match (is_match, ctx) {
+                                (true, ExprContext::Value) => self.nums.get_variant_match_num += 1,
+                                (true, _) => self.nums.set_variant_match_num += 1,
+                                (false, ExprContext::Value) => self.nums.get_variant_if_num += 1,
+                                (false, _) => self.nums.set_variant_if_num += 1,
+                            }
                         }
                     } else {
-                        let (ctx, _) = get_expr_context(expr, self.tcx);
-                        if !self
+                        let replaced_by_aggregate = self
                             .aggregate_spans
                             .iter()
-                            .any(|span| span.contains(expr.span))
-                        {
-                            match ctx {
-                                ExprContext::Value => {
+                            .any(|span| span.contains(expr.span));
+                        match ctx {
+                            ExprContext::Value => {
+                                if !replaced_by_aggregate {
                                     let call = format!("get_{}()", field.name);
                                     self.suggestions.add(field.span, call);
+
+                                    self.nums.get_variant_num += 1;
                                 }
-                                ExprContext::Store(_) | ExprContext::Address => {
+                            }
+                            ExprContext::Store(_) | ExprContext::Address => {
+                                if replaced_by_aggregate {
+                                    self.nums.set_variant_aggregate_num += 1;
+                                } else {
+                                    self.nums.set_variant_num += 1;
+
                                     let span = expr.span.shrink_to_lo();
                                     self.suggestions.add(span, "(*".to_string());
 
@@ -2014,7 +2111,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
             if removed {
                 self.suggestions.add(tag_assign.span, "".to_string());
                 self.aggregate_spans.push(tag_assign.span);
-                self.aggregates_num += 1;
+                self.nums.aggregate_num += 1;
             }
         }
     }
