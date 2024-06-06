@@ -56,6 +56,7 @@ pub struct Statistics {
     pub analyzed_bodies: usize,
     pub tagged_unions: usize,
     pub tagged_structs: usize,
+    pub method_lines: usize,
     pub preparation: usize,
     pub may_analysis: usize,
     pub must_analysis: usize,
@@ -67,7 +68,7 @@ impl std::fmt::Display for Statistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {} {}",
             self.unions,
             self.structs,
             self.candidates,
@@ -75,6 +76,7 @@ impl std::fmt::Display for Statistics {
             self.analyzed_bodies,
             self.tagged_unions,
             self.tagged_structs,
+            self.method_lines,
             self.preparation,
             self.may_analysis,
             self.must_analysis,
@@ -627,6 +629,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
 
     stat.tagged_structs = tagged_structs.len();
 
+    let mut method_lines = 0;
     let mut suggestions = Suggestions::new(source_map);
     for (s, ts) in &tagged_structs {
         let item = hir.expect_item(*s);
@@ -886,6 +889,7 @@ impl {} {{
                 field_methods,
                 if is_first_union { &get_tag_method } else { "" },
             );
+            method_lines += code.split('\n').count();
             suggestions.add(item.span, code);
         }
 
@@ -894,9 +898,11 @@ impl {} {{
     }
 }",
         );
+        method_lines += set_tag_method.split('\n').count();
         let span = item.span.shrink_to_hi();
         suggestions.add(span, set_tag_method);
     }
+    stat.method_lines = method_lines;
 
     let mut nums = Nums::default();
     for item_id in hir.items() {
