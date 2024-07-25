@@ -213,11 +213,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
                 continue;
             }
             let u = def_id.expect_local();
-            if conf.unions.is_empty()
-                || conf
-                    .unions
-                    .contains(&tcx.def_path(u.to_def_id()).to_string_no_crate_verbose())
-            {
+            if conf.unions.is_empty() || conf.unions.contains(&tcx.def_path_str(u)) {
                 unions.push(u);
                 union_to_struct.insert(u, (i, local_def_id));
                 struct_unions.push((i, u));

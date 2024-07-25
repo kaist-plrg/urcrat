@@ -8,6 +8,10 @@ use urcrat::*;
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    Unsafe {
+        #[arg(short, long)]
+        r#union: Vec<String>,
+    },
     May {
         #[arg(short, long)]
         dump: Option<PathBuf>,
@@ -49,6 +53,14 @@ fn main() {
 
     let file = args.input.join("c2rust-lib.rs");
     match args.command {
+        Command::Unsafe { r#union } => {
+            let unions = if r#union.is_empty() {
+                None
+            } else {
+                Some(r#union.into_iter().collect())
+            };
+            unsafety::analyze_path(&file, unions);
+        }
         Command::May { dump } => {
             let solutions = may_analysis::analyze_path(&file);
             if let Some(dump) = dump {
