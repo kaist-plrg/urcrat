@@ -41,6 +41,7 @@ use crate::*;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub print_unions: bool,
     pub solutions: Option<may_analysis::Solutions>,
     pub unions: HashSet<String>,
     pub transform: bool,
@@ -577,6 +578,19 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
 
     stat.tagged_unions = tagged_unions.len();
     stat.must_analysis = start.elapsed().as_millis() as usize;
+
+    if conf.print_unions {
+        println!("Tagged unions");
+        for u in tagged_unions.keys() {
+            println!("{}", tcx.def_path_str(*u));
+        }
+        println!("Others");
+        for u in &unions {
+            if !tagged_unions.contains_key(u) {
+                println!("{}", tcx.def_path_str(*u));
+            }
+        }
+    }
 
     if tagged_unions.is_empty() {
         if conf.verbose {

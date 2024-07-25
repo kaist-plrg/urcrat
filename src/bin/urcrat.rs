@@ -17,6 +17,8 @@ enum Command {
         dump: Option<PathBuf>,
     },
     Must {
+        #[arg(long)]
+        print_unions: bool,
         #[arg(short, long)]
         may: Option<PathBuf>,
         #[arg(short, long)]
@@ -69,6 +71,7 @@ fn main() {
             }
         }
         Command::Must {
+            print_unions,
             may,
             r#union,
             output,
@@ -92,6 +95,7 @@ fn main() {
                 may_analysis::deserialize_solutions(&arr)
             });
             let conf = tag_analysis::Config {
+                print_unions,
                 solutions,
                 unions: r#union.into_iter().collect(),
                 transform,
