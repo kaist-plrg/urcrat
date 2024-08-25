@@ -65,6 +65,30 @@ pub struct Statistics {
     pub nums: Nums,
 }
 
+impl Statistics {
+    pub fn show(&self) -> String {
+        format!(
+            "{} {} {} {} {} {} {} {} {} {} {}",
+            self.unions,
+            self.candidates,
+            self.tagged_unions,
+            self.preparation + self.may_analysis + self.must_analysis + self.transformation,
+            self.bodies,
+            self.analyzed_bodies,
+            self.nums.get_tag_num
+                + self.nums.set_tag_num
+                + self.nums.get_variant_num
+                + self.nums.set_variant_num,
+            self.nums.get_tag_match_num
+                + self.nums.get_variant_match_num
+                + self.nums.set_variant_match_num,
+            self.nums.get_tag_if_num + self.nums.get_variant_if_num + self.nums.set_variant_if_num,
+            self.nums.set_tag_aggregate_num + self.nums.set_variant_aggregate_num,
+            self.method_lines,
+        )
+    }
+}
+
 impl std::fmt::Display for Statistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

@@ -102,7 +102,7 @@ fn main() {
                 verbose: args.verbose,
             };
             let stat = tag_analysis::analyze_path(&file, &conf);
-            println!("{}", stat);
+            println!("{}", stat.show());
         }
     }
 }
