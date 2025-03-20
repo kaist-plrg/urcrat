@@ -27,7 +27,7 @@
 #![warn(unused_lifetimes)]
 #![warn(unused_macro_rules)]
 #![warn(unused_qualifications)]
-#![warn(unused_tuple_struct_fields)]
+#![warn(dead_code)]
 #![warn(variant_size_differences)]
 #![feature(rustc_private)]
 #![feature(iter_intersperse)]
@@ -37,6 +37,7 @@
 
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_ast_pretty;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_driver_impl;
@@ -49,16 +50,18 @@ extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
+extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
 
 pub mod alloc_finder;
+// pub mod ast_span;
 pub mod compile_util;
-pub mod disjoint_set;
-pub mod graph;
-pub mod may_analysis;
-pub mod must_analysis;
-pub mod tag_analysis;
-pub mod ty_finder;
-pub mod ty_shape;
-pub mod unsafety;
+// pub mod disjoint_set;
+// pub mod graph;
+// pub mod may_analysis;
+// pub mod must_analysis;
+// pub mod tag_analysis;
+// pub mod ty_finder;
+// pub mod ty_shape;
+// pub mod unsafety;
