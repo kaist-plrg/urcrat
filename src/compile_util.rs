@@ -8,17 +8,17 @@ use std::{
 
 use etrace::ok_or;
 use rustc_errors::{
-    emitter::Emitter, registry::Registry, translation::Translate, DiagCtxt, FluentBundle, Level,
+    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Level,
 };
 use rustc_feature::UnstableFeatures;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_interface::{create_and_enter_global_ctxt, passes::parse, Config};
 use rustc_middle::{
     mir::{Body, TerminatorKind},
     ty::TyCtxt,
 };
 use rustc_session::{
-    config::{CheckCfg, CrateType, ErrorOutputType, Input, Options},
+    config::{CrateType, ErrorOutputType, Input, Options},
     EarlyDiagCtxt,
 };
 use rustc_span::{edition::Edition, source_map::SourceMap, FileName, RealFileName, Span};
