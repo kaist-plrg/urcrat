@@ -6,9 +6,7 @@ use std::{
 use etrace::some_or;
 use rustc_hir::{def_id::LocalDefId, ItemKind};
 use rustc_middle::{
-    mir::{
-        ConstantKind, Local, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
-    },
+    mir::{Const, Local, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind},
     ty::{TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -33,15 +31,15 @@ pub fn analyze(tcx: TyCtxt<'_>) -> HashSet<LocalDefId> {
 
     let mut call_graph = HashMap::new();
     let mut assigns = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
-        if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        if !matches!(item.kind, ItemKind::Fn { .. }) {
             continue;
         }
         let local_def_id = item_id.owner_id.def_id;
         let sig = tcx.fn_sig(local_def_id).skip_binder();
         let output = sig.output().skip_binder();
-        let TyKind::RawPtr(TypeAndMut { ty, .. }) = output.kind() else { continue };
+        let TyKind::RawPtr(ty, ..) = output.kind() else { continue };
         if !ty.is_c_void(tcx) {
             continue;
         }
@@ -162,7 +160,7 @@ impl<'tcx> Analyzer<'tcx> {
             return;
         }
         let constant = some_or!(func.constant(), return);
-        let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+        let Const::Val(_, ty) = constant.const_ else { unreachable!() };
         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
         let local_def_id = some_or!(def_id.as_local(), return);
         let name: Vec<_> = self

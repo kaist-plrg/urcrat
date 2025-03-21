@@ -54,7 +54,7 @@ extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
 
-// pub mod alloc_finder;
+pub mod alloc_finder;
 // pub mod ast_span;
 pub mod compile_util;
 pub mod disjoint_set;
