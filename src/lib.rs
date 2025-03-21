@@ -54,14 +54,14 @@ extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
 
-pub mod alloc_finder;
+// pub mod alloc_finder;
 // pub mod ast_span;
 pub mod compile_util;
-// pub mod disjoint_set;
-// pub mod graph;
+pub mod disjoint_set;
+pub mod graph;
 // pub mod may_analysis;
 // pub mod must_analysis;
 // pub mod tag_analysis;
 // pub mod ty_finder;
 // pub mod ty_shape;
-// pub mod unsafety;
+pub mod unsafety;

@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use rustc_hir::{HirId, Unsafety};
+use rustc_hir::{HirId, Safety};
 use rustc_middle::{
     thir::{visit, visit::Visitor, Expr, ExprKind, LintLevel, Pat, PatKind, Thir},
     ty,
@@ -42,11 +42,10 @@ fn analyze_input(input: Input, unions: Option<HashSet<String>>) {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>, unions: Option<HashSet<String>>) {
-    let hir = tcx.hir();
     let mut fns = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
-        if matches!(item.kind, rustc_hir::ItemKind::Fn(..)) {
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        if matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
             let def_id = item_id.owner_id.def_id;
             let kinds = check_unsafety(tcx, def_id);
             fns.insert(def_id, kinds);
@@ -126,18 +125,24 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
         self.thir
     }
 
-    fn visit_pat(&mut self, pat: &Pat<'tcx>) {
+    fn visit_pat(&mut self, pat: &'a Pat<'tcx>) {
         if let Some(u) = self.in_union {
             match pat.kind {
                 PatKind::Binding { .. }
                 | PatKind::Constant { .. }
+                | PatKind::ExpandedConstant { .. }
                 | PatKind::Variant { .. }
                 | PatKind::Leaf { .. }
                 | PatKind::Deref { .. }
+                | PatKind::DerefPattern { .. }
                 | PatKind::Range { .. }
                 | PatKind::Slice { .. }
                 | PatKind::Array { .. } => self.requires_unsafe(AccessToUnionField(u)),
-                PatKind::Wild | PatKind::Or { .. } | PatKind::AscribeUserType { .. } => {}
+                PatKind::Wild
+                | PatKind::Or { .. }
+                | PatKind::AscribeUserType { .. }
+                | PatKind::Never
+                | PatKind::Error(..) => {}
             }
         };
 
@@ -160,14 +165,14 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
         }
     }
 
-    fn visit_expr(&mut self, expr: &Expr<'tcx>) {
+    fn visit_expr(&mut self, expr: &'a Expr<'tcx>) {
         match expr.kind {
             ExprKind::Field { .. }
             | ExprKind::VarRef { .. }
             | ExprKind::UpvarRef { .. }
             | ExprKind::Scope { .. }
             | ExprKind::Cast { .. } => {}
-            ExprKind::AddressOf { .. }
+            ExprKind::RawBorrow { .. }
             | ExprKind::Adt { .. }
             | ExprKind::Array { .. }
             | ExprKind::Binary { .. }
@@ -207,7 +212,10 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             | ExprKind::InlineAsm { .. }
             | ExprKind::OffsetOf { .. }
             | ExprKind::LogicalOp { .. }
-            | ExprKind::Use { .. } => {
+            | ExprKind::Use { .. }
+            | ExprKind::PlaceUnwrapUnsafeBinder { .. }
+            | ExprKind::ValueUnwrapUnsafeBinder { .. }
+            | ExprKind::WrapUnsafeBinder { .. } => {
                 self.assignment = false;
             }
         };
@@ -230,7 +238,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                 from_hir_call: _,
                 fn_span: _,
             } => {
-                if self.thir[fun].ty.fn_sig(self.tcx).unsafety() == Unsafety::Unsafe {
+                if self.thir[fun].ty.fn_sig(self.tcx).safety() == Safety::Unsafe {
                     let func_id = if let ty::FnDef(func_id, _) = self.thir[fun].ty.kind() {
                         Some(*func_id)
                     } else {
@@ -246,7 +254,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                     } else if self.tcx.is_foreign_item(def_id) {
                         self.requires_unsafe(UseOfExternStatic);
                     }
-                } else if self.thir[arg].ty.is_unsafe_ptr() {
+                } else if self.thir[arg].ty.is_raw_ptr() {
                     self.requires_unsafe(DerefOfRawPointer);
                 }
             }
@@ -288,7 +296,7 @@ fn check_unsafety(tcx: TyCtxt<'_>, def: LocalDefId) -> HashSet<UnsafeOpKind> {
     let thir = &thir.borrow();
     assert!(!thir.exprs.is_empty());
 
-    let hir_id = tcx.hir().local_def_id_to_hir_id(def);
+    let hir_id = tcx.local_def_id_to_hir_id(def);
     let mut visitor = UnsafetyVisitor {
         tcx,
         thir,
