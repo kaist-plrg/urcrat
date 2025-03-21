@@ -6,25 +6,24 @@ use std::{
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
-use rustc_data_structures::graph::{
-    scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
-};
+use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
 use rustc_hir::{def::Res, ItemKind, QPath, TyKind as HirTyKind};
-use rustc_index::{
-    bit_set::{HybridBitSet, HybridIter},
-    Idx, IndexVec,
-};
+use rustc_index::{bit_set::DenseBitSet, Idx, IndexVec};
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, GlobalAlloc, Scalar},
+        interpret::{GlobalAlloc, Scalar},
         visit::Visitor,
-        AggregateKind, BasicBlock, BinOp, Body, ConstantKind, Local, LocalDecl, Location, Operand,
-        Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
+        AggregateKind, BasicBlock, BinOp, Body, Const, ConstValue, Local, LocalDecl, Location,
+        Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        UnOp,
     },
-    ty::{Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    source_map::Spanned,
+};
 use ty_shape::*;
 use typed_arena::Arena;
 
@@ -75,7 +74,7 @@ pub struct PreAnalysisData<'tcx> {
     var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 }
 
-pub type Solutions = Vec<HybridBitSet<usize>>;
+pub type Solutions = Vec<DenseBitSet<usize>>; // Send not implemented for MixedBitSet
 
 #[derive(Debug)]
 pub struct AnalysisResults {
@@ -92,15 +91,15 @@ pub struct AnalysisResults {
     pub fn_sccs: HashMap<LocalDefId, usize>,
     pub reachables: RefCell<HashMap<usize, HashSet<usize>>>,
 
-    pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub fn_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+    pub writes: HashMap<LocalDefId, HashMap<Location, DenseBitSet<usize>>>,
+    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, DenseBitSet<usize>>>,
+    pub fn_writes: HashMap<LocalDefId, DenseBitSet<usize>>,
 }
 
 impl AnalysisResults {
-    pub fn call_writes(&self, def_id: LocalDefId) -> HybridBitSet<usize> {
+    pub fn call_writes(&self, def_id: LocalDefId) -> DenseBitSet<usize> {
         self.with_reachables(self.fn_sccs[&def_id], |sccs| {
-            let mut writes = HybridBitSet::new_empty(self.ends.len());
+            let mut writes = DenseBitSet::new_empty(self.ends.len());
             for scc in sccs {
                 for f in &self.scc_elems[scc] {
                     writes.union(&self.fn_writes[f]);
@@ -140,18 +139,17 @@ pub fn pre_analyze<'a, 'tcx>(
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> PreAnalysisData<'tcx> {
-    let hir = tcx.hir();
     let alloc_fns = alloc_finder::analyze(tcx);
 
     let mut bodies = vec![];
     let mut fn_def_ids = HashSet::new();
     let mut visitor = FnPtrVisitor::new(tcx);
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
         match item.kind {
-            ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+            ItemKind::Fn { .. } if item.ident.name.as_str() != "main" => {
                 fn_def_ids.insert(local_def_id);
                 let body = tcx.optimized_mir(def_id);
                 visitor.visit_body(body);
@@ -261,7 +259,7 @@ pub fn pre_analyze<'a, 'tcx>(
                     let def_id = some_or!(operand_to_fn(func), continue);
                     let local_def_id = some_or!(def_id.as_local(), continue);
                     let ty = destination.ty(&item.body.local_decls, tcx).ty;
-                    if ty.is_unsafe_ptr()
+                    if ty.is_raw_ptr()
                         && (is_c_fn(def_id, tcx) || alloc_fns.contains(&local_def_id))
                     {
                         allocs.push(Var::Alloc(item.local_def_id, bb));
@@ -345,14 +343,14 @@ pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
 
 pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     let size = arr.iter().filter(|n| **n == 255).count() + 1;
-    let mut solutions: Solutions = vec![HybridBitSet::new_empty(size)];
+    let mut solutions: Solutions = vec![DenseBitSet::new_empty(size)];
     let mut s = &mut solutions[0];
     let mut i = 0;
     let mut len = 0;
     for n in arr {
         match *n {
             255 => {
-                solutions.push(HybridBitSet::new_empty(size));
+                solutions.push(DenseBitSet::new_empty(size));
                 s = solutions.last_mut().unwrap();
             }
             254 => {
@@ -384,7 +382,7 @@ pub fn post_analyze<'a, 'tcx>(
         }
         pre.graph.insert(node, LocEdges::Deref(succs));
     }
-    let mut address_taken_indices = HybridBitSet::new_empty(pre.ends.len());
+    let mut address_taken_indices = DenseBitSet::new_empty(pre.ends.len());
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
@@ -460,7 +458,7 @@ pub fn post_analyze<'a, 'tcx>(
     let fn_writes: HashMap<_, _> = writes
         .iter()
         .map(|(f, writes)| {
-            let mut ws = HybridBitSet::new_empty(pre.ends.len());
+            let mut ws = DenseBitSet::new_empty(pre.ends.len());
             for w in writes.values() {
                 ws.union(w);
             }
@@ -531,14 +529,14 @@ fn compute_writes<'tcx>(
     l: Place<'tcx>,
     location: Location,
     ends: &[usize],
-    solutions: &[HybridBitSet<usize>],
+    solutions: &[DenseBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, HybridBitSet<usize>>,
+    writes: &mut HashMap<Location, DenseBitSet<usize>>,
 ) {
     let writes = writes
         .entry(location)
-        .or_insert(HybridBitSet::new_empty(ends.len()));
+        .or_insert(DenseBitSet::new_empty(ends.len()));
     let ty = l.ty(ctx.locals, analyzer.tcx).ty;
     let len = analyzer.tss.tys[&ty].len();
     let l = analyzer.prefixed_loc(l, ctx);
@@ -565,35 +563,35 @@ fn compute_writes<'tcx>(
 #[allow(clippy::too_many_arguments)]
 fn compute_bitfield_writes<'tcx>(
     func: &Operand<'tcx>,
-    args: &[Operand<'tcx>],
+    args: &Box<[Spanned<Operand<'tcx>>]>,
     location: Location,
     tss: &TyShapes<'_, 'tcx>,
     tcx: TyCtxt<'tcx>,
     ends: &[usize],
-    solutions: &[HybridBitSet<usize>],
+    solutions: &[DenseBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, HybridBitSet<usize>>,
+    writes: &mut HashMap<Location, DenseBitSet<usize>>,
 ) {
     if args.len() != 2 {
         return;
     }
     let Operand::Constant(box constant) = func else { return };
-    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+    let Const::Val(_, ty) = constant.const_ else { unreachable!() };
     let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
     let local_def_id = some_or!(def_id.as_local(), return);
     let (local_def_id, method) = some_or!(receiver_and_method(local_def_id, tcx), return);
     let field = method.strip_prefix("set_").unwrap();
-    let TyKind::Ref(_, ty, _) = args[0].ty(ctx.locals, tcx).kind() else { unreachable!() };
+    let TyKind::Ref(_, ty, _) = args[0].node.ty(ctx.locals, tcx).kind() else { unreachable!() };
     let TyShape::Struct(_, fs, _) = tss.tys[ty] else { unreachable!() };
     let idx = tss.bitfields[&local_def_id].name_to_idx[field];
     let offset = fs[idx.as_usize()].0;
-    let lhs = args[0].place().unwrap();
+    let lhs = args[0].node.place().unwrap();
     assert!(lhs.projection.is_empty());
     let l = analyzer.prefixed_loc(lhs, ctx);
     let writes = writes
         .entry(location)
-        .or_insert(HybridBitSet::new_empty(ends.len()));
+        .or_insert(DenseBitSet::new_empty(ends.len()));
     for loc in solutions[l.var.root].iter() {
         let loc = loc + offset;
         let end = ends[loc];
@@ -766,7 +764,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     self.transfer_assign(l, r, ty);
                 }
             }
-            Rvalue::AddressOf(_, r) => {
+            Rvalue::RawPtr(_, r) => {
                 assert!(r.is_indirect_first_projection());
                 let r = self.prefixed_loc(*r, ctx).with_deref(false);
                 self.transfer_assign(l, r, ty);
@@ -786,21 +784,6 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         if !r.deref {
                             self.transfer_assign(l, r, ty);
                         }
-                    }
-                    if let Some(r) = self.transfer_op(r2, ctx) {
-                        self.transfer_assign(l, r, ty);
-                    }
-                }
-            }
-            Rvalue::CheckedBinaryOp(op, box (r1, r2)) => {
-                if !matches!(
-                    op,
-                    BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
-                ) {
-                    let TyKind::Tuple(ts) = ty.kind() else { unreachable!() };
-                    let ty = ts[0];
-                    if let Some(r) = self.transfer_op(r1, ctx) {
-                        self.transfer_assign(l, r, ty);
                     }
                     if let Some(r) = self.transfer_op(r2, ctx) {
                         self.transfer_assign(l, r, ty);
@@ -844,6 +827,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 let r = self.prefixed_loc(*r, ctx);
                 self.transfer_assign(l, r, ty);
             }
+            Rvalue::WrapUnsafeBinder(_, _) => unreachable!(),
         }
     }
 
@@ -868,17 +852,19 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
     fn transfer_op(&mut self, op: &Operand<'tcx>, ctx: Context<'_, 'tcx>) -> Option<PrefixedLoc> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => Some(self.prefixed_loc(*place, ctx)),
-            Operand::Constant(box constant) => match constant.literal {
-                ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => None,
-                ConstantKind::Val(value, ty) => match value {
+            Operand::Constant(box constant) => match constant.const_ {
+                Const::Ty(..) => unreachable!(),
+                Const::Unevaluated(_, _) => None,
+                Const::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => None,
-                        Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
-                            GlobalAlloc::Static(def_id) => self.static_ref(def_id),
-                            GlobalAlloc::Memory(_) => None,
-                            _ => unreachable!(),
-                        },
+                        Scalar::Ptr(ptr, _) => {
+                            match self.tcx.global_alloc(ptr.provenance.alloc_id()) {
+                                GlobalAlloc::Static(def_id) => self.static_ref(def_id),
+                                GlobalAlloc::Memory(_) => None,
+                                _ => unreachable!(),
+                            }
+                        }
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
@@ -910,7 +896,10 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
         };
         assert!(destination.projection.is_empty());
 
-        let arg_locs: Vec<_> = args.iter().map(|arg| self.transfer_op(arg, ctx)).collect();
+        let arg_locs: Vec<_> = args
+            .iter()
+            .map(|arg| self.transfer_op(&arg.node, ctx))
+            .collect();
         let output = destination.ty(ctx.locals, self.tcx).ty;
         let dst = self.prefixed_loc(*destination, ctx);
 
@@ -919,7 +908,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 assert!(func.projection.is_empty());
                 let mut func = self.prefixed_loc(*func, ctx).with_deref(true);
                 for (arg, arg_loc) in args.iter().zip(arg_locs) {
-                    let ty = arg.ty(ctx.locals, self.tcx);
+                    let ty = arg.node.ty(ctx.locals, self.tcx);
                     if let Some(arg) = arg_loc {
                         self.transfer_assign(func, arg, ty);
                     }
@@ -928,7 +917,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                 self.transfer_assign(dst, func, output);
             }
             Operand::Constant(box constant) => {
-                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                let Const::Val(value, ty) = constant.const_ else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                 let name: Vec<_> = self
@@ -947,7 +936,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         let code = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
                         assert_eq!(code, "BitfieldStruct");
                     } else if is_extern {
-                        if output.is_unsafe_ptr() {
+                        if output.is_raw_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
                             let loc = Loc::new_root(self.pre.vars[&var]);
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
@@ -959,7 +948,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     } else {
                         let mut index = self.pre.globals[&local_def_id];
                         for (arg, arg_loc) in args.iter().zip(arg_locs) {
-                            let ty = arg.ty(ctx.locals, self.tcx);
+                            let ty = arg.node.ty(ctx.locals, self.tcx);
                             if let Some(arg) = arg_loc {
                                 let loc = Loc::new_root(index);
                                 self.transfer_assign(PrefixedLoc::new(loc), arg, ty);
@@ -1025,7 +1014,7 @@ type WeightedGraph = HashMap<usize, HashMap<usize, HashSet<usize>>>;
 
 struct Graph {
     solutions: Solutions,
-    zero_weight_edges: Vec<HybridBitSet<usize>>,
+    zero_weight_edges: Vec<DenseBitSet<usize>>,
     pos_weight_edges: WeightedGraph,
     deref_eqs: WeightedGraph,
     eq_derefs: WeightedGraph,
@@ -1050,8 +1039,8 @@ impl std::fmt::Debug for Graph {
 impl Graph {
     fn new(size: usize) -> Self {
         Self {
-            solutions: vec![HybridBitSet::new_empty(size); size],
-            zero_weight_edges: vec![HybridBitSet::new_empty(size); size],
+            solutions: vec![DenseBitSet::new_empty(size); size],
+            zero_weight_edges: vec![DenseBitSet::new_empty(size); size],
             pos_weight_edges: HashMap::new(),
             deref_eqs: HashMap::new(),
             eq_derefs: HashMap::new(),
@@ -1109,7 +1098,7 @@ impl Graph {
         while deltas.iter().any(|s| !s.is_empty()) {
             let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&zero_weight_edges));
 
-            let mut components = vec![HybridBitSet::new_empty(len); sccs.num_sccs()];
+            let mut components = vec![DenseBitSet::new_empty(len); sccs.num_sccs()];
             for i in 0..len {
                 let scc = sccs.scc(i);
                 components[scc.index()].insert(i);
@@ -1149,7 +1138,7 @@ impl Graph {
                     for id in ids.iter() {
                         if *rep != id {
                             let set =
-                                std::mem::replace(&mut deltas[id], HybridBitSet::new_empty(len));
+                                std::mem::replace(&mut deltas[id], DenseBitSet::new_empty(len));
                             deltas[*rep].union(&set);
                         }
                     }
@@ -1157,13 +1146,13 @@ impl Graph {
 
                 // update solutions
                 for (rep, ids) in &cycles {
-                    let mut intersection = HybridBitSet::new_empty(len);
+                    let mut intersection = DenseBitSet::new_empty(len);
                     intersection.insert_all();
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
                             let set =
-                                std::mem::replace(&mut solutions[id], HybridBitSet::new_empty(len));
+                                std::mem::replace(&mut solutions[id], DenseBitSet::new_empty(len));
                             solutions[*rep].union(&set);
                         }
                     }
@@ -1173,7 +1162,7 @@ impl Graph {
                 }
 
                 // update zero_weight_edges
-                zero_weight_edges = vec![HybridBitSet::new_empty(len); len];
+                zero_weight_edges = vec![DenseBitSet::new_empty(len); len];
                 for (scc, rep) in scc_to_rep.iter().enumerate() {
                     let succs = &mut zero_weight_edges[*rep];
                     for succ in sccs.successors(scc) {
@@ -1193,7 +1182,7 @@ impl Graph {
                 if deltas[v].is_empty() {
                     continue;
                 }
-                let delta = std::mem::replace(&mut deltas[v], HybridBitSet::new_empty(len));
+                let delta = std::mem::replace(&mut deltas[v], DenseBitSet::new_empty(len));
 
                 propagate_deref(
                     v,
@@ -1258,7 +1247,7 @@ impl Graph {
     }
 }
 
-fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &HybridBitSet<usize>)]) {
+fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &DenseBitSet<usize>)]) {
     for (rep, ids) in cycles {
         let mut rep_edges = graph.remove(rep).unwrap_or_default();
         for id in ids.iter() {
@@ -1299,12 +1288,12 @@ fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &HybridBit
 fn propagate_deref(
     v: usize,
     derefs: &WeightedGraph,
-    delta: &HybridBitSet<usize>,
+    delta: &DenseBitSet<usize>,
     ends: &[usize],
     id_to_rep: &[usize],
-    zero_weight_edges: &mut [HybridBitSet<usize>],
-    solutions: &mut [HybridBitSet<usize>],
-    deltas: &mut [HybridBitSet<usize>],
+    zero_weight_edges: &mut [DenseBitSet<usize>],
+    solutions: &mut [DenseBitSet<usize>],
+    deltas: &mut [DenseBitSet<usize>],
     deref_eq: bool,
 ) {
     let derefs = some_or!(derefs.get(&v), return);
@@ -1447,7 +1436,7 @@ pub enum LocProjection {
 #[inline]
 pub fn unwrap_ptr(ty: Ty<'_>) -> Option<Ty<'_>> {
     match ty.kind() {
-        TyKind::Ref(_, ty, _) | TyKind::RawPtr(TypeAndMut { ty, .. }) => Some(*ty),
+        TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, ..) => Some(*ty),
         _ => None,
     }
 }
@@ -1455,7 +1444,7 @@ pub fn unwrap_ptr(ty: Ty<'_>) -> Option<Ty<'_>> {
 #[inline]
 fn operand_to_fn(operand: &Operand<'_>) -> Option<DefId> {
     let constant = operand.constant()?;
-    let ConstantKind::Val(_, ty) = constant.literal else { return None };
+    let Const::Val(_, ty) = constant.const_ else { return None };
     let TyKind::FnDef(def_id, _) = ty.kind() else { return None };
     Some(*def_id)
 }
@@ -1471,7 +1460,7 @@ fn is_c_fn(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
 }
 
 #[inline]
-fn contains_multiple<T: Idx>(set: &HybridBitSet<T>) -> bool {
+fn contains_multiple<T: Idx>(set: &DenseBitSet<T>) -> bool {
     let mut iter = set.iter();
     iter.next().is_some() && iter.next().is_some()
 }
@@ -1492,7 +1481,7 @@ impl<'tcx> FnPtrVisitor<'tcx> {
 
     fn get_function(&self, operand: &Operand<'tcx>) -> Option<LocalDefId> {
         let constant = operand.constant()?;
-        let ConstantKind::Val(_, ty) = constant.literal else { return None };
+        let Const::Val(_, ty) = constant.const_ else { return None };
         let TyKind::FnDef(def_id, _) = ty.kind() else { return None };
         let local_def_id = def_id.as_local()?;
         if self.tcx.impl_of_method(*def_id).is_none() && !is_c_fn(*def_id, self.tcx) {
@@ -1531,25 +1520,18 @@ impl<'tcx> Visitor<'tcx> for FnPtrVisitor<'tcx> {
 }
 
 #[repr(transparent)]
-struct VecBitSet<'a, T: Idx>(&'a Vec<HybridBitSet<T>>);
+struct VecBitSet<'a, T: Idx>(&'a Vec<DenseBitSet<T>>);
 
 impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
     type Node = T;
-}
 
-impl<T: Idx> WithNumNodes for VecBitSet<'_, T> {
     fn num_nodes(&self) -> usize {
         self.0.len()
     }
 }
 
-impl<'a, T: Idx> GraphSuccessors<'_> for VecBitSet<'a, T> {
-    type Item = T;
-    type Iter = HybridIter<'a, T>;
-}
-
-impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
-    fn successors(&self, node: Self::Node) -> <Self as GraphSuccessors<'_>>::Iter {
+impl<T: Idx> Successors for VecBitSet<'_, T> {
+    fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
         self.0[node.index()].iter()
     }
 }

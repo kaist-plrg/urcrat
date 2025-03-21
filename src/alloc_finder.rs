@@ -160,6 +160,7 @@ impl<'tcx> Analyzer<'tcx> {
             return;
         }
         let constant = some_or!(func.constant(), return);
+        // let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
         let Const::Val(_, ty) = constant.const_ else { unreachable!() };
         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
         let local_def_id = some_or!(def_id.as_local(), return);

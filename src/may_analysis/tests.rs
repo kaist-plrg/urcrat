@@ -41,10 +41,9 @@ where F: FnOnce(AnalysisResults, TyCtxt<'_>) + Send {
 }
 
 fn find(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
-    let hir = tcx.hir();
-    hir.items()
+    tcx.hir_free_items()
         .find_map(|item_id| {
-            let item = hir.item(item_id);
+            let item = tcx.hir_item(item_id);
             if item.ident.name.as_str() != name {
                 return None;
             }
@@ -2202,7 +2201,7 @@ fn l(block: usize, statement_index: usize) -> Location {
 }
 
 fn wg(
-    writes: &HashMap<Location, HybridBitSet<usize>>,
+    writes: &HashMap<Location, DenseBitSet<usize>>,
     block: usize,
     statement_index: usize,
 ) -> Vec<usize> {
