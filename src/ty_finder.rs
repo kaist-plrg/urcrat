@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use etrace::some_or;
-use rustc_hir::{def::Res, intravisit, intravisit::Visitor, ItemKind, Node, QPath, Ty, TyKind};
+use rustc_hir::{
+    def::Res,
+    intravisit::{self, Visitor},
+    AmbigArg, ItemKind, Node, QPath, Ty, TyKind,
+};
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
@@ -41,7 +45,7 @@ impl<'tcx> TyVisitor<'tcx> {
         mut self,
         tcx: TyCtxt<'tcx>,
     ) -> (HashSet<LocalDefId>, HashSet<LocalDefId>) {
-        tcx.hir().visit_all_item_likes_in_crate(&mut self);
+        tcx.hir_visit_all_item_likes_in_crate(&mut self);
         let ftypes: HashSet<_> = self
             .foreign_types
             .into_iter()
@@ -68,16 +72,16 @@ impl<'tcx> TyVisitor<'tcx> {
         })
     }
 
-    fn handle_ty(&mut self, ty: &'tcx Ty<'tcx>) {
+    fn handle_ty<Unambig>(&mut self, ty: &'tcx Ty<'tcx, Unambig>) {
         let TyKind::Path(QPath::Resolved(_, path)) = ty.kind else { return };
         let Res::Def(_, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
         let id = self.ty_to_id(def_id);
 
         let hir = self.tcx.hir();
-        let mut hir_id = ty.hir_id;
-        while let Some(parent_id) = hir.opt_parent_id(hir_id) {
-            let node = hir.get(parent_id);
+        let hir_id = ty.hir_id;
+        for parent_id in hir.parent_id_iter(hir_id) {
+            let node = self.tcx.hir_node(parent_id);
             match node {
                 Node::ForeignItem(_) => {
                     self.foreign_types.insert(id);
@@ -93,7 +97,7 @@ impl<'tcx> TyVisitor<'tcx> {
                     }
                     break;
                 }
-                _ => hir_id = parent_id,
+                _ => {}
             }
         }
     }
@@ -102,11 +106,11 @@ impl<'tcx> TyVisitor<'tcx> {
 impl<'tcx> Visitor<'tcx> for TyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
-    fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
+    fn visit_ty(&mut self, ty: &'tcx Ty<'tcx, AmbigArg>) {
         self.handle_ty(ty);
         intravisit::walk_ty(self, ty);
     }

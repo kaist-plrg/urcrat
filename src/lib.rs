@@ -62,6 +62,6 @@ pub mod graph;
 // pub mod may_analysis;
 // pub mod must_analysis;
 // pub mod tag_analysis;
-// pub mod ty_finder;
+pub mod ty_finder;
 // pub mod ty_shape;
 pub mod unsafety;
