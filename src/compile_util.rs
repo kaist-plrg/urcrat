@@ -57,7 +57,7 @@ pub fn make_config(input: Input) -> Config {
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_owned(),
         lint_caps: FxHashMap::default(),
         psess_created: Some(Box::new(|ps| {
-            ps.dcx().set_emitter(Box::new(SilentEmitter));
+            ps.dcx().make_silent(None, false);
         })),
         register_lints: None,
         override_queries: None,
@@ -174,26 +174,6 @@ impl Emitter for CountingEmitter {
             *self.0.lock().unwrap() += 1;
         }
     }
-
-    fn source_map(&self) -> Option<&SourceMap> {
-        None
-    }
-}
-
-pub struct SilentEmitter;
-
-impl Translate for SilentEmitter {
-    fn fluent_bundle(&self) -> Option<&FluentBundle> {
-        None
-    }
-
-    fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!()
-    }
-}
-
-impl Emitter for SilentEmitter {
-    fn emit_diagnostic(&mut self, _: rustc_errors::DiagInner, _: &Registry) {}
 
     fn source_map(&self) -> Option<&SourceMap> {
         None
