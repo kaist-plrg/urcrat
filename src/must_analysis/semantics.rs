@@ -1,5 +1,4 @@
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_ast::InlineAsmOptions;
 use rustc_middle::{
     mir::{
         interpret::{GlobalAlloc, Scalar},

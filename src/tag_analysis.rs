@@ -24,7 +24,7 @@ use rustc_middle::{
         AggregateKind, BasicBlock, BasicBlockData, Body, Const, HasLocalDecls, Local, LocalDecl,
         Location, Operand, Place, PlaceElem, ProjectionElem, Rvalue, Terminator, TerminatorKind,
     },
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
+    ty::{List, Ty, TyCtxt, TyKind, TypeckResults},
 };
 use rustc_session::config::Input;
 use rustc_span::{

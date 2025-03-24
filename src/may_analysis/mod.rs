@@ -853,7 +853,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => Some(self.prefixed_loc(*place, ctx)),
             Operand::Constant(box constant) => match constant.const_ {
-                Const::Ty(..) => unreachable!(),
+                Const::Ty(_, _) => unreachable!(),
                 Const::Unevaluated(_, _) => None,
                 Const::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {

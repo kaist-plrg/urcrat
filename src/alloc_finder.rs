@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_hir::{def_id::LocalDefId, ItemKind};
 use rustc_middle::{
     mir::{Const, Local, Operand, Rvalue, Statement, StatementKind, Terminator, TerminatorKind},
-    ty::{TyCtxt, TyKind, TypeAndMut},
+    ty::{TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
 
@@ -27,8 +27,6 @@ fn analyze_input(input: Input) -> HashSet<LocalDefId> {
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> HashSet<LocalDefId> {
-    let hir = tcx.hir();
-
     let mut call_graph = HashMap::new();
     let mut assigns = HashMap::new();
     for item_id in tcx.hir_free_items() {
