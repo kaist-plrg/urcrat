@@ -13,7 +13,7 @@ use crate::*;
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, f).unwrap();
+    compile_util::run_compiler(config, f).unwrap_or_else(|e| e.raise());
 }
 
 fn find_fn(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {

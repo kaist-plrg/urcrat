@@ -21,17 +21,21 @@ use rustc_session::{
     config::{CrateType, ErrorOutputType, Input, Options},
     EarlyDiagCtxt,
 };
-use rustc_span::{edition::Edition, source_map::SourceMap, FileName, RealFileName, Span};
+use rustc_span::{
+    edition::Edition, fatal_error::FatalError, source_map::SourceMap, FileName, RealFileName, Span,
+};
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
-pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
+pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
+    config: Config,
+    f: F,
+) -> Result<R, FatalError> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
             let krate = parse(&compiler.sess);
             create_and_enter_global_ctxt(&compiler, krate, f)
         })
     })
-    .ok()
 }
 
 pub fn make_config(input: Input) -> Config {
