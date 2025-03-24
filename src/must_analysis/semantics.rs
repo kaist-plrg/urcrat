@@ -1,14 +1,15 @@
 use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_ast::InlineAsmOptions;
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, GlobalAlloc, Scalar},
-        AggregateKind, BinOp, CastKind, ConstantKind, HasLocalDecls, Local, Location, Operand,
+        interpret::{GlobalAlloc, Scalar},
+        AggregateKind, BinOp, CastKind, Const, ConstValue, HasLocalDecls, Local, Location, Operand,
         Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{adjustment::PointerCoercion, IntTy, Ty, TyCtxt, TyKind, UintTy},
 };
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{def_id::LocalDefId, source_map::Spanned};
 
 use super::*;
 use crate::{ty_shape::TyShape, *};
@@ -67,7 +68,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         state.gm().assign(&l, l_deref, &r);
                     }
                 }
-                CastKind::PointerCoercion(coercion) => match coercion {
+                CastKind::PointerCoercion(coercion, _) => match coercion {
                     PointerCoercion::ReifyFnPointer
                     | PointerCoercion::UnsafeFnPointer
                     | PointerCoercion::ClosureFnPointer(_)
@@ -79,7 +80,9 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                             self.ctx.tss.tys[&lty],
                         );
                     }
-                    PointerCoercion::MutToConstPointer | PointerCoercion::Unsize => {
+                    PointerCoercion::MutToConstPointer
+                    | PointerCoercion::Unsize
+                    | PointerCoercion::DynStar => {
                         let r = self.transfer_op(r, state);
                         state
                             .gm()
@@ -94,7 +97,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             },
             Rvalue::Repeat(r, len) => {
                 let r = self.transfer_op(r, state);
-                let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
+                let len = len.try_to_target_usize(self.tcx).unwrap();
                 let TyKind::Array(ty, _) = lty.kind() else { unreachable!() };
                 for i in 0..len.min(10) {
                     let l = l.extended(&[AccElem::num_index(i as _)]);
@@ -111,7 +114,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             Rvalue::ThreadLocalRef(_) => {
                 state.gm().assign(&l, l_deref, &OpVal::Other);
             }
-            Rvalue::AddressOf(_, r) => {
+            Rvalue::RawPtr(_, r) => {
                 assert_eq!(r.projection.len(), 1);
                 let (path, is_deref) = self.acc_path(*r, state);
                 assert!(is_deref);
@@ -148,16 +151,19 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     state.gm().assign(&l, l_deref, &OpVal::Other);
                 }
             }
-            Rvalue::CheckedBinaryOp(_, _) => unreachable!(),
             Rvalue::UnaryOp(op, r) => {
                 let ty = r.ty(&self.body.local_decls, self.tcx);
                 let r = self.transfer_op(r, state);
                 if let OpVal::Int(v) = r {
                     let v = match op {
-                        UnOp::Not => !v,
-                        UnOp::Neg => neg(v, ty),
+                        UnOp::Not => Some(!v),
+                        UnOp::Neg => Some(neg(v, ty)),
+                        UnOp::PtrMetadata => None,
                     };
-                    state.gm().assign(&l, l_deref, &OpVal::Int(v));
+                    match v {
+                        Some(v) => state.gm().assign(&l, l_deref, &OpVal::Int(v)),
+                        None => state.gm().assign(&l, l_deref, &OpVal::Other),
+                    }
                 } else {
                     state.gm().assign(&l, l_deref, &OpVal::Other);
                 }
@@ -208,6 +214,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 let v = OpVal::Place(path, is_deref);
                 state.gm().assign(&l, l_deref, &v);
             }
+            Rvalue::WrapUnsafeBinder(_, _) => unreachable!(),
         }
     }
 
@@ -221,9 +228,9 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                     OpVal::Place(path, is_deref)
                 }
             }
-            Operand::Constant(box constant) => match constant.literal {
-                ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(constant, ty) => {
+            Operand::Constant(box constant) => match constant.const_ {
+                Const::Ty(_, _) => unreachable!(),
+                Const::Unevaluated(constant, ty) => {
                     if ty.is_integral() || ty.is_char() {
                         if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
                             self.transfer_const_value(v, ty)
@@ -234,7 +241,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         OpVal::Other
                     }
                 }
-                ConstantKind::Val(value, ty) => self.transfer_const_value(value, ty),
+                Const::Val(value, ty) => self.transfer_const_value(value, ty),
             },
         }
     }
@@ -245,30 +252,30 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 Scalar::Int(i) => match ty.kind() {
                     TyKind::Int(int_ty) => {
                         let v = match int_ty {
-                            IntTy::Isize => i.try_to_i64().unwrap() as _,
-                            IntTy::I8 => i.try_to_i8().unwrap() as _,
-                            IntTy::I16 => i.try_to_i16().unwrap() as _,
-                            IntTy::I32 => i.try_to_i32().unwrap() as _,
-                            IntTy::I64 => i.try_to_i64().unwrap() as _,
-                            IntTy::I128 => i.try_to_i128().unwrap() as _,
+                            IntTy::Isize => i.to_i64() as _,
+                            IntTy::I8 => i.to_i8() as _,
+                            IntTy::I16 => i.to_i16() as _,
+                            IntTy::I32 => i.to_i32() as _,
+                            IntTy::I64 => i.to_i64() as _,
+                            IntTy::I128 => i.to_i128() as _,
                         };
                         OpVal::Int(v)
                     }
                     TyKind::Uint(uint_ty) => {
                         let v = match uint_ty {
-                            UintTy::Usize => i.try_to_u64().unwrap() as _,
-                            UintTy::U8 => i.try_to_u8().unwrap() as _,
-                            UintTy::U16 => i.try_to_u16().unwrap() as _,
-                            UintTy::U32 => i.try_to_u32().unwrap() as _,
-                            UintTy::U64 => i.try_to_u64().unwrap() as _,
-                            UintTy::U128 => i.try_to_u128().unwrap(),
+                            UintTy::Usize => i.to_u64() as _,
+                            UintTy::U8 => i.to_u8() as _,
+                            UintTy::U16 => i.to_u16() as _,
+                            UintTy::U32 => i.to_u32() as _,
+                            UintTy::U64 => i.to_u64() as _,
+                            UintTy::U128 => i.to_u128(),
                         };
                         OpVal::Int(v)
                     }
-                    TyKind::Char => OpVal::Int(i.try_to_u32().unwrap() as _),
+                    TyKind::Char => OpVal::Int(i.to_u32() as _),
                     _ => OpVal::Other,
                 },
-                Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
+                Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance.alloc_id()) {
                     GlobalAlloc::Static(def_id) => {
                         if let Some(def_id) = def_id.as_local() {
                             OpVal::Static(def_id)
@@ -282,7 +289,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
             },
             ConstValue::ZeroSized => OpVal::Other,
             ConstValue::Slice { .. } => unreachable!(),
-            ConstValue::ByRef { .. } => unreachable!(),
+            ConstValue::Indirect { .. } => unreachable!(),
         }
     }
 
@@ -296,22 +303,24 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         match &term.kind {
             TerminatorKind::Goto { target }
             | TerminatorKind::Drop { target, .. }
-            | TerminatorKind::Assert { target, .. }
-            | TerminatorKind::InlineAsm {
-                destination: Some(target),
-                ..
-            } => {
+            | TerminatorKind::Assert { target, .. } => {
                 let location = Location {
                     block: *target,
                     statement_index: 0,
                 };
                 vec![(location, state.clone())]
             }
-            TerminatorKind::Return
-            | TerminatorKind::InlineAsm {
-                destination: None, ..
-            }
-            | TerminatorKind::Call { target: None, .. } => vec![],
+            TerminatorKind::InlineAsm { targets, .. } => targets
+                .iter()
+                .map(|target| {
+                    let location = Location {
+                        block: *target,
+                        statement_index: 0,
+                    };
+                    (location, state.clone())
+                })
+                .collect(),
+            TerminatorKind::Return | TerminatorKind::Call { target: None, .. } => vec![],
             TerminatorKind::SwitchInt {
                 discr: discr_op,
                 targets,
@@ -447,7 +456,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         true
                     }
                     Operand::Constant(box constant) => {
-                        let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                        let Const::Val(value, ty) = constant.const_ else { unreachable!() };
                         assert!(matches!(value, ConstValue::ZeroSized));
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                         let namev: Vec<_> = self
@@ -517,12 +526,12 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
     fn transfer_method_call(
         &self,
         f: LocalDefId,
-        args: &[Operand<'tcx>],
+        args: &Box<[Spanned<Operand<'tcx>>]>,
         dst: &AccPath,
         loc: Location,
         state: &mut AbsMem,
     ) {
-        let l = args[0].place().unwrap();
+        let l = args[0].node.place().unwrap();
         let (mut l, l_deref) = self.acc_path(l, state);
         assert!(!l_deref);
 
@@ -550,7 +559,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 let field = method.strip_prefix("set_").unwrap();
                 let offset = self.ctx.tss.bitfields[&ty].name_to_idx[field];
                 l.extend_projection(&[AccElem::Field(offset, false)]);
-                let r = self.transfer_op(&args[1], state);
+                let r = self.transfer_op(&args[1].node, state);
                 state.gm().assign(&l, true, &r);
             }
             _ => unreachable!(),
@@ -561,7 +570,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         &self,
         name: &str,
         inputs: &[Ty<'_>],
-        args: &[Operand<'_>],
+        args: &Box<[Spanned<Operand<'tcx>>]>,
         state: &mut AbsMem,
     ) {
         if name == "realloc" || name == "free" {
@@ -569,7 +578,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         }
         let args = inputs.iter().zip(args).filter_map(|(ty, arg)| {
             if ty.is_mutable_ptr() {
-                if let Some(arg) = arg.place() {
+                if let Some(arg) = arg.node.place() {
                     assert!(arg.projection.is_empty());
                     return Some(arg.local);
                 }
@@ -590,7 +599,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
     fn transfer_rust_call(
         &self,
         name: (&str, &str, &str, &str),
-        args: &[Operand<'tcx>],
+        args: &Box<[Spanned<Operand<'tcx>>]>,
         dst: &Place<'tcx>,
         state: &mut AbsMem,
     ) {
@@ -598,17 +607,17 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         assert!(!d_deref);
         match name {
             ("slice", _, "as_ptr" | "as_mut_ptr", _) => {
-                let ptr = args[0].place().unwrap();
+                let ptr = args[0].node.place().unwrap();
                 let (mut ptr, ptr_deref) = self.acc_path(ptr, state);
                 assert!(!ptr_deref);
                 ptr.projection.push(AccElem::num_index(0));
                 state.gm().x_eq_ref_y(&d, &ptr, true);
             }
             ("ptr", _, _, "offset") => {
-                let ptr = args[0].place().unwrap();
+                let ptr = args[0].node.place().unwrap();
                 let (ptr, ptr_deref) = self.acc_path(ptr, state);
                 assert!(!ptr_deref);
-                let idx = self.transfer_op(&args[1], state);
+                let idx = self.transfer_op(&args[1].node, state);
                 state.gm().x_eq_offset(&d, &ptr, idx);
             }
             _ => {}
@@ -723,6 +732,8 @@ impl AccElem {
             ProjectionElem::Subslice { .. } => unreachable!(),
             ProjectionElem::Downcast(_, _) => unreachable!(),
             ProjectionElem::OpaqueCast(_) => unreachable!(),
+            ProjectionElem::UnwrapUnsafeBinder(_) => unreachable!(),
+            ProjectionElem::Subtype(_) => unreachable!(),
         }
     }
 }

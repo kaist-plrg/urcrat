@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_hir::def_id::LocalDefId;
-use rustc_index::bit_set::{BitSet, HybridBitSet};
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::Local;
 
 use super::*;
@@ -72,7 +72,7 @@ impl AbsMem {
         }
     }
 
-    pub fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+    pub fn clear_dead_locals(&mut self, dead_locals: &DenseBitSet<Local>) {
         if let Self::Mem(g) = self {
             g.clear_dead_locals(dead_locals);
         }
@@ -121,7 +121,7 @@ impl Index {
         }
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut DenseBitSet<Local>) {
         if let Self::Sym(ls) = self {
             for local in ls {
                 locals.insert(*local);
@@ -162,7 +162,7 @@ impl AccElem {
         Self::Index(Index::Sym(ls))
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut DenseBitSet<Local>) {
         if let Self::Index(i) = self {
             i.collect_locals(locals);
         }
@@ -520,7 +520,7 @@ impl Obj {
         }
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut DenseBitSet<Local>) {
         match self {
             Self::Top | Self::AtAddr(_) => {}
             Self::Ptr(loc) => {
@@ -1103,8 +1103,8 @@ impl Graph {
         &self.nodes[self.get_local_id(local)]
     }
 
-    fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
-        let mut locals = HybridBitSet::new_empty(dead_locals.domain_size());
+    fn clear_dead_locals(&mut self, dead_locals: &DenseBitSet<Local>) {
+        let mut locals = DenseBitSet::new_empty(dead_locals.domain_size());
         for node in &self.nodes {
             node.collect_locals(&mut locals);
         }
@@ -1138,7 +1138,7 @@ impl Graph {
         strong_update: Option<&AbsLoc>,
         strong_local: bool,
         may_points_to: &may_analysis::AnalysisResults,
-        writes: &HybridBitSet<usize>,
+        writes: &DenseBitSet<usize>,
     ) {
         let mut no_update_locals = HashSet::new();
         if strong_local {
@@ -1174,7 +1174,7 @@ struct InvalidateCtx<'a> {
     strong_update: Option<&'a AbsLoc>,
     no_update_locals: &'a HashSet<NodeId>,
     may_points_to: &'a may_analysis::AnalysisResults,
-    writes: &'a HybridBitSet<usize>,
+    writes: &'a DenseBitSet<usize>,
 }
 
 fn invalidate_rec(
