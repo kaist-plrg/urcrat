@@ -2,6 +2,105 @@ use rustc_middle::ty::TyCtxt;
 
 use super::*;
 
+/// How to write tests for may_analysis:
+///
+/// To inspect the MIR of test cases, you can:
+/// - Look at the compiled MIR code in the comments of the test case functions, or
+/// - Uncomment the line:
+/// ```rust
+/// println!("{}", compile_util::body_to_str(item.body));
+/// ```
+/// inside the `analyze` function in `src/may_analysis/mod.rs` and run the test cases.
+///
+///
+/// 1. `AnalysisResults.ends`
+///
+/// Each local variable in an MIR body is assigned one or more indices in the
+/// analysis, representing its location(s) in the points-to graph.
+///
+/// The indices are assigned in the following order:
+///
+/// - Function arguments
+/// - Return value
+/// - Remaining local variables (in the order they are declared, i.e., by name:
+///   `_1`, `_2`, ...)
+///
+/// If a local variable has a struct type, each of its fields is assigned a
+/// separate index.  For example, a struct with three fields will occupy three
+/// consecutive indices-say, `1`, `2`, and `3`.  The next local variable will
+/// then start at index `4`.
+///
+/// Each index corresponds to a specific "location", and every location has an
+/// associated "end": the furthest location that is reachable from it.
+///
+/// - For most locations, the "end" is simply the location itself.
+/// - However, for struct variables, the index of the first field is treated as
+///   representing the entire struct. Its "end" is updated to point to the last
+///   field of the struct, marking the span of the entire struct.
+///
+/// The `AnalysisResults.ends` vector record this mapping:
+///
+/// ```
+/// AnalysisResults.ends[<index of the location>] = <index of the end of that location>
+/// ```
+///
+/// Example assertion:
+///
+/// ```
+/// assert_eq!(res.ends, vec![0, 1, 2, 5, 4, 5, 6, 7, 8, 9]);
+/// ```
+///
+///
+/// 2. `AnalysisResults.solutions`
+///
+/// The `AnalysisResults.solutions` vector maps each location index to the set
+/// of locations it may point to-a conservative union of all points-to targets.
+///
+/// You can write assertions like:
+///
+/// ```
+/// assert_eq!(sol(&res, <index of the location>), <expected set of indices of locations>);
+/// ```
+///
+///
+/// 3. `AnalysisResults.writes`
+///
+/// `AnalysisResults.writes` records statements that perform memory writes,
+/// mapping each statement to the set of written locations.
+///
+/// Only locations that are "pointable" (i.e., appear in any `solutions` set,
+/// directly or via their `ends` range) are included. For example, if `4` is
+/// a pointable location and `ends[4] = 5`, then `5` is also considered pointable.
+///
+/// Each statement is identified by a `(block, statement_index)` pair:
+/// - `block`: the index of the basic block
+/// - `statement_index`: the index of the statement within that basic block
+///
+/// Note: Some statements (e.g., function calls) act as **terminators** in MIR
+/// and implicitly end the current basic block. As a result, even if
+/// statement appear sequential in MIR source, they may belong to different
+/// basic blocks.
+///
+/// ```
+/// assert_eq!(wg(&w, <basic block index>, <statement index>), <expected set of written location indices>);
+/// ```
+///
+/// 4. `AnalysisResults.bitfield_writes`
+///
+/// MIR statements that write to bitfields are recorded in the
+/// `AnalysisResults.bitfield_writes` map, which maps statement locations to the
+/// set of written bitfield indices.
+///
+/// Bitfields are declared in struct definitions, using the
+/// `#[bitfield(name=...)]` macro.  Bitfield indices are assigned after the
+/// regular struct fields, in the order they are declared.
+///
+/// Bitfield writes are easy to notice, as they always use generated setter
+/// functions.
+///
+/// ```
+/// assert_eq!(bw(&w, <basic block index>, <statement index>), <expected set of indices of written bitfields>);
+
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
