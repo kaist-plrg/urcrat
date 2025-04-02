@@ -33,7 +33,7 @@ pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
             let krate = parse(&compiler.sess);
-            create_and_enter_global_ctxt(&compiler, krate, f)
+            create_and_enter_global_ctxt(compiler, krate, f)
         })
     })
 }
@@ -174,7 +174,7 @@ impl Translate for CountingEmitter {
 
 impl Emitter for CountingEmitter {
     fn emit_diagnostic(&mut self, diag: rustc_errors::DiagInner, _: &Registry) {
-        if matches!(diag.level(), Level::Error { .. }) {
+        if matches!(diag.level(), Level::Error) {
             *self.0.lock().unwrap() += 1;
         }
     }

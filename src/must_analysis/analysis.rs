@@ -211,7 +211,7 @@ impl Analyzer<'_, '_, '_> {
     }
 
     pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<DenseBitSet<usize>> {
-        let c0 = callees.get(0)?;
+        let c0 = callees.first()?;
         let mut writes = self.ctx.may_points_to.call_writes(*c0);
         for c in &callees[1..] {
             writes.union(&self.ctx.may_points_to.call_writes(*c));

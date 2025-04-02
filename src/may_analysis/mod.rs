@@ -563,7 +563,7 @@ fn compute_writes<'tcx>(
 #[allow(clippy::too_many_arguments)]
 fn compute_bitfield_writes<'tcx>(
     func: &Operand<'tcx>,
-    args: &Box<[Spanned<Operand<'tcx>>]>,
+    args: &[Spanned<Operand<'tcx>>],
     location: Location,
     tss: &TyShapes<'_, 'tcx>,
     tcx: TyCtxt<'tcx>,

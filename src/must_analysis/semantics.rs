@@ -529,7 +529,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
     fn transfer_method_call(
         &self,
         f: LocalDefId,
-        args: &Box<[Spanned<Operand<'tcx>>]>,
+        args: &[Spanned<Operand<'tcx>>],
         dst: &AccPath,
         loc: Location,
         state: &mut AbsMem,
@@ -573,7 +573,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
         &self,
         name: &str,
         inputs: &[Ty<'_>],
-        args: &Box<[Spanned<Operand<'tcx>>]>,
+        args: &[Spanned<Operand<'tcx>>],
         state: &mut AbsMem,
     ) {
         if name == "realloc" || name == "free" {
@@ -602,7 +602,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
     fn transfer_rust_call(
         &self,
         name: (&str, &str, &str, &str),
-        args: &Box<[Spanned<Operand<'tcx>>]>,
+        args: &[Spanned<Operand<'tcx>>],
         dst: &Place<'tcx>,
         state: &mut AbsMem,
     ) {
@@ -688,7 +688,7 @@ impl AccPath {
         local_decls: &D,
         tcx: TyCtxt<'tcx>,
     ) -> (Self, bool) {
-        let is_deref = proj.get(0).map_or(false, |e| matches!(e, PlaceElem::Deref));
+        let is_deref = proj.first().is_some_and(|e| matches!(e, PlaceElem::Deref));
         let mut projections = vec![];
         for (i, e) in proj.iter().enumerate().skip(is_deref as usize) {
             let ty = Place::ty_from(local, &proj[..i], local_decls, tcx).ty;

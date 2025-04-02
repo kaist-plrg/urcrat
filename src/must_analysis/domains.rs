@@ -360,7 +360,7 @@ impl Obj {
     }
 
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match (self, elem) {
                 (Self::Struct(fs, _), AccElem::Field(f, _)) => fs.get(f),
                 (Self::Array(vs), AccElem::Index(i)) => {
@@ -376,7 +376,7 @@ impl Obj {
     }
 
     fn project_mut_opt<'a>(&'a mut self, proj: &[AccElem]) -> Option<&'a mut Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match elem {
                 AccElem::Field(f, _) => {
                     let Self::Struct(fs, _) = self else { return None };
@@ -398,7 +398,7 @@ impl Obj {
     }
 
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match elem {
                 AccElem::Field(f, is_union) => {
                     if !matches!(self, Self::Struct(_, _)) {
@@ -608,7 +608,7 @@ pub struct Graph {
 
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let nodes: BTreeMap<_, _> = self.nodes.iter().enumerate().map(|(i, n)| (i, n)).collect();
+        let nodes: BTreeMap<_, _> = self.nodes.iter().enumerate().collect();
         let locals: BTreeMap<_, _> = self.locals.iter().map(|(l, n)| (*l, *n)).collect();
         f.debug_struct("Graph")
             .field("nodes", &nodes)
@@ -784,7 +784,7 @@ impl Graph {
     }
 
     fn obj_at_rec<'a>(&'a self, obj: &'a Obj, proj: &[tag_analysis::AccElem]) -> Vec<&'a Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             match elem {
                 tag_analysis::AccElem::Field(f) => {
                     let Obj::Struct(fs, _) = obj else { return vec![] };

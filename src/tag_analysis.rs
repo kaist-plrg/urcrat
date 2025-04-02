@@ -216,7 +216,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
             .filter(|(i, f)| {
                 let ty = f.ty(tcx, List::empty());
                 (ty.is_integral() || ty.is_bool())
-                    && non_tag_fields.map_or(true, |fields| !fields.contains(i))
+                    && non_tag_fields.is_none_or(|fields| !fields.contains(i))
             })
             .map(|(i, _)| i)
             .collect();
@@ -684,7 +684,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
             let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
             (field_name, field_ty)
         } else {
-            let (name, ty) = tss.bitfields[&s].fields[&ts.tag_index].clone();
+            let (name, ty) = tss.bitfields[s].fields[&ts.tag_index].clone();
             let mut lo = item.ident.span.hi() + BytePos(3);
             'l: for f in sfs {
                 loop {
@@ -1268,7 +1268,7 @@ impl<'tcx, 'a> MBodyVisitor<'tcx, 'a> {
 
 impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
-        if place.projection.len() > 0 {
+        if !place.projection.is_empty() {
             for i in 0..(place.projection.len() - 1) {
                 let ty = Place::ty_from(
                     place.local,
@@ -2298,7 +2298,7 @@ struct AssignBlocks<'tcx> {
 
 impl<'tcx> AssignBlocks<'tcx> {
     fn add_stmt(&mut self, stmt: AssignBlockStmt<'tcx>) {
-        if let Some(curr) = self.block.get(0) {
+        if let Some(curr) = self.block.first() {
             if curr.struct_ty != stmt.struct_ty
                 || curr.struct_expr_string != stmt.struct_expr_string
             {
@@ -2900,7 +2900,7 @@ fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
 fn find_tag_from_accesses<'a>(
     accesses: &'a [AccessInIf<'_>],
 ) -> Option<(FieldIdx, &'a HashSet<u128>)> {
-    let access = accesses.get(0)?;
+    let access = accesses.first()?;
     if access.field_tags.len() > 1 {
         return None;
     }
