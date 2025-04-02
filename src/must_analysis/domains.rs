@@ -1038,7 +1038,11 @@ impl Graph {
         } else {
             self.get_pointed_loc(*id, &x.projection)?
         };
-        let obj = self.obj_at_location(&loc)?;
+        self.get_absloc_as_int(&loc)
+    }
+
+    pub fn get_absloc_as_int(&self, loc: &AbsLoc) -> Option<u128> {
+        let obj = self.obj_at_location(loc)?;
         let Obj::AtAddr(n) = obj else { return None };
         n.as_singleton()
     }
