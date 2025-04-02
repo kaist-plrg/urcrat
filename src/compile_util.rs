@@ -262,17 +262,20 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
 pub fn body_to_str(body: &Body<'_>) -> String {
     use std::fmt::Write;
     let mut s = String::new();
-    for bbd in body.basic_blocks.iter() {
+    writeln!(s, "{:?} {{", body.source.instance.def_id()).unwrap();
+    for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+        writeln!(s, "    {:?}:", bb).unwrap();
         for stmt in &bbd.statements {
-            writeln!(s, "{:?}", stmt).unwrap();
+            writeln!(s, "        {:?}", stmt).unwrap();
         }
         if !matches!(
             bbd.terminator().kind,
             TerminatorKind::Return | TerminatorKind::Assert { .. }
         ) {
-            writeln!(s, "{:?}", bbd.terminator().kind).unwrap();
+            writeln!(s, "        {:?}", bbd.terminator().kind).unwrap();
         }
     }
+    writeln!(s, "}}").unwrap();
     s
 }
 
