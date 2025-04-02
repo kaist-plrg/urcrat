@@ -10,6 +10,59 @@ use rustc_span::def_id::LocalDefId;
 use super::*;
 use crate::*;
 
+/// The indexing of locations in `must_analysis` is identical to the
+/// `may_analysis` (see `src/may_analysis/mod.rs`).
+///
+/// Test cases use `urcrat::must_analysis::domains::Graph`. For example,
+/// consider the following MIR code:
+///
+/// ```
+/// _1 = s { x: const 0_i32, y: const 1_i32 }
+/// _2 = copy (_1.0: i32)
+/// _3 = copy (_1.1: i32)
+/// ```
+///
+/// The resulting `Graph` would be:
+///
+/// ```
+/// Graph {
+///     nodes: {
+///         0: @{0},
+///         1: [0: 0, 1: 2],
+///         2: @{1},
+///         3: 0,
+///         4: 2,
+///     },
+///     locals: {
+///         _1: 1,
+///         _2: 3,
+///         _3: 4,
+///     }
+/// }
+/// ```
+///
+/// `Graph.nodes` maps locations to values.
+/// - Values prefixed with `@` are "imaginary" values-abstract,
+///   analysis-specific values.
+/// - For example, `0: @{0}` means that location `0` holds the abstract value
+///   `0`. (literally 0).
+///
+/// `Graph.locals` maps local variables to their corresponding locations.
+/// - You can extract this mapping using the `get_ids` function. For example:
+///   `get_ids(g, 1..=3)` returns a map of local variables `_1`, `_2`, and `_3` to
+///   their location indices.
+///
+/// To extract the values of local variables, use `get_nodes(g, 1..=3)`, which
+/// returns a mapping from local variable to the values they hold.
+///
+/// To extract The "imaginary" value of a local variable (if it has one), use
+/// `g.get_local_as_int(1)`, which returns the "imaginary" value held by `_1`,
+/// if it is of the form `@{N}`
+///
+/// To extract the "imaginary" value at a specific field accessed via a pointer,
+/// use `g.get_absloc_as_int(n[&1].field(0).as_ptr())`, which returns the
+/// imaginary value pointed to by field `0` of `_1`.
+
 fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
@@ -62,7 +115,7 @@ where F: FnOnce(Graph, AnalysisResults, TyCtxt<'_>) + Send {
         let loc = find_return(def_id, tcx);
         let state = res.functions[&def_id][&loc].clone();
         let AbsMem::Mem(graph) = state else { panic!() };
-        println!("{:?}", graph);
+        // println!("{:?}", graph);
         f(graph, res, tcx);
     });
 }

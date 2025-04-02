@@ -2,8 +2,6 @@ use rustc_middle::ty::TyCtxt;
 
 use super::*;
 
-/// How to write tests for may_analysis:
-///
 /// To inspect the MIR of test cases, you can:
 /// - Look at the compiled MIR code in the comments of the test case functions, or
 /// - Uncomment the line:
