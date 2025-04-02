@@ -228,7 +228,11 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 }
             }
             Operand::Constant(box constant) => match constant.const_ {
-                Const::Ty(_, _) => unreachable!(),
+                Const::Ty(ty, constant) => {
+                    let value = constant.to_value();
+                    let cv = self.tcx.valtree_to_const_val(value);
+                    self.transfer_const_value(cv, ty)
+                }
                 Const::Unevaluated(constant, ty) => {
                     if ty.is_integral() || ty.is_char() {
                         if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
