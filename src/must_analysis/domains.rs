@@ -3,11 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_hir::def_id::LocalDefId;
-use rustc_index::bit_set::{BitSet, HybridBitSet};
 use rustc_middle::mir::Local;
 
 use super::*;
-use crate::{may_analysis, tag_analysis, ty_shape::TyShape};
+use crate::{
+    bitset::{BitSet, HybridBitSet},
+    may_analysis, tag_analysis,
+    ty_shape::TyShape,
+};
 
 #[derive(Debug, Clone)]
 pub enum AbsMem {
@@ -121,7 +124,7 @@ impl Index {
         }
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut BitSet<Local>) {
         if let Self::Sym(ls) = self {
             for local in ls {
                 locals.insert(*local);
@@ -162,7 +165,7 @@ impl AccElem {
         Self::Index(Index::Sym(ls))
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut BitSet<Local>) {
         if let Self::Index(i) = self {
             i.collect_locals(locals);
         }
@@ -360,7 +363,7 @@ impl Obj {
     }
 
     fn project<'a>(&'a self, proj: &[AccElem]) -> Option<&'a Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match (self, elem) {
                 (Self::Struct(fs, _), AccElem::Field(f, _)) => fs.get(f),
                 (Self::Array(vs), AccElem::Index(i)) => {
@@ -376,7 +379,7 @@ impl Obj {
     }
 
     fn project_mut_opt<'a>(&'a mut self, proj: &[AccElem]) -> Option<&'a mut Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match elem {
                 AccElem::Field(f, _) => {
                     let Self::Struct(fs, _) = self else { return None };
@@ -398,7 +401,7 @@ impl Obj {
     }
 
     fn project_mut<'a>(&'a mut self, proj: &[AccElem], write: bool) -> &'a mut Obj {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             let inner = match elem {
                 AccElem::Field(f, is_union) => {
                     if !matches!(self, Self::Struct(_, _)) {
@@ -520,7 +523,7 @@ impl Obj {
         }
     }
 
-    fn collect_locals(&self, locals: &mut HybridBitSet<Local>) {
+    fn collect_locals(&self, locals: &mut BitSet<Local>) {
         match self {
             Self::Top | Self::AtAddr(_) => {}
             Self::Ptr(loc) => {
@@ -608,7 +611,7 @@ pub struct Graph {
 
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let nodes: BTreeMap<_, _> = self.nodes.iter().enumerate().map(|(i, n)| (i, n)).collect();
+        let nodes: BTreeMap<_, _> = self.nodes.iter().enumerate().collect();
         let locals: BTreeMap<_, _> = self.locals.iter().map(|(l, n)| (*l, *n)).collect();
         f.debug_struct("Graph")
             .field("nodes", &nodes)
@@ -784,7 +787,7 @@ impl Graph {
     }
 
     fn obj_at_rec<'a>(&'a self, obj: &'a Obj, proj: &[tag_analysis::AccElem]) -> Vec<&'a Obj> {
-        if let Some(elem) = proj.get(0) {
+        if let Some(elem) = proj.first() {
             match elem {
                 tag_analysis::AccElem::Field(f) => {
                     let Obj::Struct(fs, _) = obj else { return vec![] };
@@ -1038,7 +1041,11 @@ impl Graph {
         } else {
             self.get_pointed_loc(*id, &x.projection)?
         };
-        let obj = self.obj_at_location(&loc)?;
+        self.get_absloc_as_int(&loc)
+    }
+
+    pub fn get_absloc_as_int(&self, loc: &AbsLoc) -> Option<u128> {
+        let obj = self.obj_at_location(loc)?;
         let Obj::AtAddr(n) = obj else { return None };
         n.as_singleton()
     }
@@ -1104,7 +1111,7 @@ impl Graph {
     }
 
     fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
-        let mut locals = HybridBitSet::new_empty(dead_locals.domain_size());
+        let mut locals = BitSet::new_empty(dead_locals.domain_size());
         for node in &self.nodes {
             node.collect_locals(&mut locals);
         }

@@ -182,7 +182,8 @@ pub fn compute_sccs<T: Clone + Eq + std::hash::Hash>(
                 .map(|succ| (inv_id_map[node], inv_id_map[succ]))
         })
         .collect();
-    let sccs: Sccs<usize, usize> = Sccs::new(&VecGraph::new(map.len(), edges));
+    let vec_graph: VecGraph<usize> = VecGraph::new(map.len(), edges);
+    let sccs: Sccs<usize, usize> = Sccs::new(&vec_graph);
 
     let component_graph: HashMap<_, _> = sccs
         .all_sccs()

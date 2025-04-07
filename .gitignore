@@ -1,6 +1,10 @@
 target
 Session.vim
+.DS_Store
 *.log
 *.txt
 *.profdata
 *.profraw
+
+rs-resolved
+rs-transformed

@@ -55,12 +55,10 @@ pub fn get_ty_shapes<'a, 'tcx>(
 }
 
 fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
-    let hir = tcx.hir();
-
     let mut bitfield_structs = HashMap::new();
     let mut bitfield_impls = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         match item.kind {
             ItemKind::Struct(vd, _) => {
                 for field in vd.fields() {
@@ -91,7 +89,7 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
                         let name0 = name0.strip_prefix("set_").unwrap();
                         let name1 = items[1].ident.name.to_ident_string();
                         assert_eq!(name0, name1);
-                        let ImplItemKind::Fn(sig, _) = hir.impl_item(items[1].id).kind else {
+                        let ImplItemKind::Fn(sig, _) = tcx.hir_impl_item(items[1].id).kind else {
                             unreachable!()
                         };
                         let FnRetTy::Return(ty) = sig.decl.output else { unreachable!() };
@@ -142,16 +140,12 @@ fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
 }
 
 fn compute_ty_shapes<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
-    let hir = tcx.hir();
-
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         let local_def_id = item.owner_id.def_id;
         let def_id = local_def_id.to_def_id();
         let body = match item.kind {
-            ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
-                tcx.optimized_mir(def_id)
-            }
+            ItemKind::Fn { .. } if item.ident.name.as_str() != "main" => tcx.optimized_mir(def_id),
             ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
             _ => continue,
         };
@@ -196,12 +190,7 @@ fn compute_ty_shape<'a, 'tcx>(
         }
         TyKind::Array(ty, len) => {
             let t = compute_ty_shape(*ty, owner, tss, tcx);
-            let len = len
-                .eval(tcx, tcx.param_env(owner))
-                .try_to_scalar_int()
-                .unwrap()
-                .try_to_u64()
-                .unwrap() as usize;
+            let len = len.try_to_target_usize(tcx).unwrap() as usize;
             tss.arena.alloc(TyShape::Array(t, len))
         }
         TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, false, owner, tss, tcx),

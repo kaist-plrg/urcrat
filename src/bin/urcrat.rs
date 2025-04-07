@@ -1,3 +1,5 @@
+#![feature(rustc_private)]
+
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},

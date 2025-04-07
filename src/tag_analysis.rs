@@ -4,28 +4,28 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bitset::BitSet;
 use compile_util::{make_suggestion, span_to_snippet};
 use etrace::{ok_or, some_or};
 use must_analysis::{Graph, Obj};
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_ast::{BindingAnnotation, LitKind, Mutability};
+use rustc_ast::{BindingMode, LitKind, Mutability};
 use rustc_hir::{
     def::Res,
     definitions::DefPathDataName,
     intravisit::{self, Visitor as HVisitor},
-    BinOpKind, Block, ByRef, Expr, ExprKind, HirId, ItemKind, MatchSource, Node, Pat, PatKind,
-    QPath, StmtKind, UnOp, VariantData,
+    BinOpKind, Block, ByRef, Expr, ExprKind, HirId, ItemKind, MatchSource, Node, Pat, PatExpr,
+    PatExprKind, PatKind, QPath, StmtKind, UnOp, VariantData,
 };
-use rustc_index::{bit_set::BitSet, IndexVec};
+use rustc_index::IndexVec;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
         visit::{PlaceContext, Visitor as MVisitor},
-        AggregateKind, BasicBlock, BasicBlockData, Body, ConstantKind, HasLocalDecls, Local,
-        LocalDecl, Location, Operand, Place, PlaceElem, ProjectionElem, Rvalue, Terminator,
-        TerminatorKind,
+        AggregateKind, BasicBlock, BasicBlockData, Body, Const, HasLocalDecls, Local, LocalDecl,
+        Location, Operand, Place, PlaceElem, ProjectionElem, Rvalue, Terminator, TerminatorKind,
     },
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeckResults},
+    ty::{List, Ty, TyCtxt, TyKind, TypeckResults},
 };
 use rustc_session::config::Input;
 use rustc_span::{
@@ -137,13 +137,13 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
     let tss = ty_shape::get_ty_shapes(&arena, tcx);
 
     let mut non_tag_fields = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         let body_id = match item.kind {
-            ItemKind::Fn(_, _, body_id) | ItemKind::Static(_, _, body_id) => body_id,
+            ItemKind::Fn { body: body_id, .. } | ItemKind::Static(_, _, body_id) => body_id,
             _ => continue,
         };
-        let body = hir.body(body_id);
+        let body = tcx.hir_body(body_id);
         let typeck = tcx.typeck(item_id.owner_id.def_id);
         let mut visitor = FieldVisitor {
             tcx,
@@ -156,7 +156,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
         .into_iter()
         .map(|(s, symbols)| {
             let item = hir.expect_item(s);
-            let ItemKind::Struct(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
+            let ItemKind::Struct(VariantData::Struct { fields: fs, .. }, _) = item.kind else {
+                unreachable!()
+            };
             let fields = symbols
                 .into_iter()
                 .map(|sym| {
@@ -177,8 +179,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
     let mut unions = vec![];
     let mut union_to_struct = HashMap::new();
     let mut ty_graph: HashMap<_, Vec<_>> = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         let local_def_id = item_id.owner_id.def_id;
 
         if local_tys.contains(&local_def_id)
@@ -215,7 +217,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
             .filter(|(i, f)| {
                 let ty = f.ty(tcx, List::empty());
                 (ty.is_integral() || ty.is_bool())
-                    && non_tag_fields.map_or(true, |fields| !fields.contains(i))
+                    && non_tag_fields.is_none_or(|fields| !fields.contains(i))
             })
             .map(|(i, _)| i)
             .collect();
@@ -302,16 +304,16 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
     let mut access_in_ifs: HashMap<_, Vec<_>> = HashMap::new();
     let mut basic_blocks = HashMap::new();
     let mut locals: HashMap<_, HashMap<_, _>> = HashMap::new();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
         let local_def_id = item_id.owner_id.def_id;
         let (body_id, body) = match item.kind {
-            ItemKind::Fn(_, _, body_id) => (body_id, tcx.optimized_mir(local_def_id)),
+            ItemKind::Fn { body: body_id, .. } => (body_id, tcx.optimized_mir(local_def_id)),
             ItemKind::Static(_, _, body_id) => (body_id, tcx.mir_for_ctfe(local_def_id)),
             _ => continue,
         };
         bodies += 1;
-        let hbody = hir.body(body_id);
+        let hbody = tcx.hir_body(body_id);
         let mut visitor = MBodyVisitor::new(tcx, &body.local_decls, &structs, &unions);
         visitor.visit_body(body);
         let mut hvisitor = HBodyVisitor::new(tcx);
@@ -541,7 +543,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
 
             let item = hir.expect_item(*u);
             let name = item.ident.name.to_ident_string();
-            let ItemKind::Union(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
+            let ItemKind::Union(VariantData::Struct { fields: fs, .. }, _) = item.kind else {
+                unreachable!()
+            };
             let field_names: IndexVec<FieldIdx, _> =
                 fs.iter().map(|f| f.ident.name.to_ident_string()).collect();
             let field_tys: IndexVec<FieldIdx, _> = fs
@@ -640,7 +644,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
         let ts = tagged_structs.entry(s).or_insert_with(|| {
             let item = hir.expect_item(s);
             let name = item.ident.name.to_ident_string();
-            let ItemKind::Struct(VariantData::Struct(fs, _), _) = item.kind else { unreachable!() };
+            let ItemKind::Struct(VariantData::Struct { fields: fs, .. }, _) = item.kind else {
+                unreachable!()
+            };
             let mut field_names: IndexVec<FieldIdx, _> =
                 fs.iter().map(|f| f.ident.name.to_ident_string()).collect();
             if let Some(bitfield) = tss.bitfields.get(&s) {
@@ -667,7 +673,9 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
     let mut suggestions = Suggestions::new(source_map);
     for (s, ts) in &tagged_structs {
         let item = hir.expect_item(*s);
-        let ItemKind::Struct(VariantData::Struct(sfs, _), _) = item.kind else { unreachable!() };
+        let ItemKind::Struct(VariantData::Struct { fields: sfs, .. }, _) = item.kind else {
+            unreachable!()
+        };
 
         let (field_name, field_ty) = if let Some(field) = sfs.get(ts.tag_index.as_usize()) {
             let span = source_map.span_extend_to_line(field.span);
@@ -677,7 +685,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
             let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
             (field_name, field_ty)
         } else {
-            let (name, ty) = tss.bitfields[&s].fields[&ts.tag_index].clone();
+            let (name, ty) = tss.bitfields[s].fields[&ts.tag_index].clone();
             let mut lo = item.ident.span.hi() + BytePos(3);
             'l: for f in sfs {
                 loop {
@@ -707,7 +715,9 @@ impl {} {{
             let tu = &tagged_unions[u];
             let struct_field_name = &ts.field_names[*i];
             let item = hir.expect_item(*u);
-            let ItemKind::Union(VariantData::Struct(ufs, _), _) = item.kind else { unreachable!() };
+            let ItemKind::Union(VariantData::Struct { fields: ufs, .. }, _) = item.kind else {
+                unreachable!()
+            };
             let tys: Vec<_> = ufs
                 .iter()
                 .map(|f| source_map.span_to_snippet(f.ty.span).unwrap().to_string())
@@ -939,12 +949,13 @@ impl {} {{
     stat.method_lines = method_lines;
 
     let mut nums = Nums::default();
-    for item_id in hir.items() {
-        let item = hir.item(item_id);
-        let (ItemKind::Fn(_, _, body_id) | ItemKind::Static(_, _, body_id)) = item.kind else {
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let (ItemKind::Fn { body: body_id, .. } | ItemKind::Static(_, _, body_id)) = item.kind
+        else {
             continue;
         };
-        let hir_body = hir.body(body_id);
+        let hir_body = tcx.hir_body(body_id);
         let local_def_id = item_id.owner_id.def_id;
         let typeck = tcx.typeck(local_def_id);
         let mut visitor = SuggestingVisitor {
@@ -1173,7 +1184,7 @@ fn ty_to_proj(ty: Ty<'_>) -> Option<(LocalDefId, Vec<AccElem>)> {
             v.push(AccElem::Index);
             Some((def_id, v))
         }
-        TyKind::Ref(_, ty, _) | TyKind::RawPtr(TypeAndMut { ty, .. }) => {
+        TyKind::Ref(_, ty, _) | TyKind::RawPtr(ty, ..) => {
             let (def_id, mut v) = ty_to_proj(*ty)?;
             v.push(AccElem::Deref);
             Some((def_id, v))
@@ -1258,7 +1269,7 @@ impl<'tcx, 'a> MBodyVisitor<'tcx, 'a> {
 
 impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
-        if place.projection.len() > 0 {
+        if !place.projection.is_empty() {
             for i in 0..(place.projection.len() - 1) {
                 let ty = Place::ty_from(
                     place.local,
@@ -1321,15 +1332,16 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
         match &terminator.kind {
             TerminatorKind::Call { func, args, .. } => {
                 if let Some(constant) = func.constant() {
-                    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                    let Const::Val(_, ty) = constant.const_ else { unreachable!() };
                     let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                     if def_id.is_local() && self.tcx.impl_of_method(*def_id).is_some() {
-                        let ty = args[0].ty(self.local_decls, self.tcx);
+                        let ty = args[0].node.ty(self.local_decls, self.tcx);
                         let TyKind::Ref(_, ty, _) = ty.kind() else { unreachable!() };
                         let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
                         let local_def_id = adt_def.did().expect_local();
                         if self.structs.contains_key(&local_def_id) {
-                            self.struct_accesses.insert(args[0].place().unwrap().local);
+                            self.struct_accesses
+                                .insert(args[0].node.place().unwrap().local);
                         }
                     }
                 }
@@ -1896,7 +1908,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     let span = expr.span.shrink_to_lo();
                                     self.suggestions.add(span, "(*".to_string());
 
-                                    let ItemKind::Union(VariantData::Struct(fs, _), _) =
+                                    let ItemKind::Union(VariantData::Struct { fields: fs, .. }, _) =
                                         self.tcx.hir().expect_item(did).kind
                                     else {
                                         unreachable!()
@@ -1926,11 +1938,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     let root = unwrap_projection(expr);
                                     if let ExprKind::Unary(UnOp::Deref, e) = root.kind {
                                         let ty = self.typeck.expr_ty(e);
-                                        if let TyKind::RawPtr(TypeAndMut {
-                                            mutbl: Mutability::Not,
-                                            ty,
-                                        }) = ty.kind()
-                                        {
+                                        if let TyKind::RawPtr(ty, Mutability::Not) = ty.kind() {
                                             let span = e.span.shrink_to_lo();
                                             self.suggestions.add(span, "(".to_string());
 
@@ -1961,7 +1969,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
         }
     }
 
-    fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn handle_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         let PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
         let init = some_or!(local.init, return);
         self.locals.insert(hir_id, init);
@@ -2291,7 +2299,7 @@ struct AssignBlocks<'tcx> {
 
 impl<'tcx> AssignBlocks<'tcx> {
     fn add_stmt(&mut self, stmt: AssignBlockStmt<'tcx>) {
-        if let Some(curr) = self.block.get(0) {
+        if let Some(curr) = self.block.first() {
             if curr.struct_ty != stmt.struct_ty
                 || curr.struct_expr_string != stmt.struct_expr_string
             {
@@ -2324,8 +2332,8 @@ struct AssignBlockStmt<'tcx> {
 impl<'tcx> HVisitor<'tcx> for SuggestingVisitor<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -2333,7 +2341,7 @@ impl<'tcx> HVisitor<'tcx> for SuggestingVisitor<'_, 'tcx> {
         intravisit::walk_expr(self, expr);
     }
 
-    fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         self.handle_local(local);
         intravisit::walk_local(self, local);
     }
@@ -2377,7 +2385,7 @@ impl<'tcx> HBodyVisitor<'tcx> {
                 if block.stmts.len() <= 1 {
                     return;
                 }
-                let StmtKind::Local(local) = block.stmts[0].kind else { return };
+                let StmtKind::Let(local) = block.stmts[0].kind else { return };
                 let PatKind::Binding(_, hir_id, ident, _) = local.pat.kind else { return };
                 if ident.name.to_ident_string() != "init" {
                     return;
@@ -2424,8 +2432,8 @@ impl<'tcx> HBodyVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for HBodyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -2470,8 +2478,8 @@ impl<'tcx> FieldVisitor<'_, 'tcx> {
 impl<'tcx> HVisitor<'tcx> for FieldVisitor<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -2505,8 +2513,12 @@ impl<'tcx> AssignVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for AssignVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    // fn nested_visit_map(&mut self) -> Self::Map {
+    //     self.tcx.hir()
+    // }
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -2526,7 +2538,7 @@ fn get_expr_context<'tcx>(
     expr: &'tcx Expr<'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> (ExprContext, &'tcx Expr<'tcx>) {
-    let parent = tcx.hir().get_parent(expr.hir_id);
+    let parent = tcx.parent_hir_node(expr.hir_id);
     match parent {
         Node::Expr(e) => match e.kind {
             ExprKind::Assign(l, _, _) | ExprKind::AssignOp(_, l, _) => {
@@ -2552,11 +2564,11 @@ fn get_expr_context<'tcx>(
             }
             _ => (ExprContext::Value, e),
         },
-        Node::Local(rustc_hir::Local { pat, .. }) => {
-            let PatKind::Binding(BindingAnnotation(by_ref, _), _, _, _) = pat.kind else {
+        Node::LetStmt(rustc_hir::LetStmt { pat, .. }) => {
+            let PatKind::Binding(BindingMode(by_ref, _), _, _, _) = pat.kind else {
                 unreachable!()
             };
-            if by_ref == ByRef::Yes {
+            if matches!(by_ref, ByRef::Yes(_)) {
                 (ExprContext::Address, expr)
             } else {
                 (ExprContext::Value, expr)
@@ -2577,20 +2589,23 @@ fn tag_to_string(tag: Tag, ty: &str) -> String {
     }
 }
 
-fn expr_to_tag(expr: &Expr<'_>) -> u128 {
+fn expr_to_tag(expr: &PatExpr<'_>) -> u128 {
     match expr.kind {
-        ExprKind::Lit(lit) => {
+        PatExprKind::Lit { lit, negated } => {
             let LitKind::Int(n, _) = lit.node else { unreachable!() };
-            n
+            if negated {
+                0u128.wrapping_sub(n.get())
+            } else {
+                n.get()
+            }
         }
-        ExprKind::Unary(UnOp::Neg, e) => 0u128.wrapping_sub(expr_to_tag(e)),
         _ => unreachable!(),
     }
 }
 
 fn pat_to_tags(pat: &Pat<'_>) -> ArmTags {
     match pat.kind {
-        PatKind::Lit(expr) => Some([expr_to_tag(expr)].into_iter().collect()),
+        PatKind::Expr(expr) => Some([expr_to_tag(expr)].into_iter().collect()),
         PatKind::Or(pats) => {
             let mut tags = BTreeSet::new();
             for pat in pats {
@@ -2886,7 +2901,7 @@ fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
 fn find_tag_from_accesses<'a>(
     accesses: &'a [AccessInIf<'_>],
 ) -> Option<(FieldIdx, &'a HashSet<u128>)> {
-    let access = accesses.get(0)?;
+    let access = accesses.first()?;
     if access.field_tags.len() > 1 {
         return None;
     }
@@ -2948,20 +2963,14 @@ fn is_from_const_ptr<'tcx>(expr: &Expr<'tcx>, typeck: &TypeckResults<'tcx>) -> b
     let expr_wo_proj = unwrap_projection(expr);
     if let ExprKind::Unary(UnOp::Deref, expr_ptr) = expr_wo_proj.kind {
         let ty = typeck.expr_ty(expr_ptr);
-        matches!(
-            ty.kind(),
-            TyKind::RawPtr(TypeAndMut {
-                mutbl: Mutability::Not,
-                ..
-            })
-        )
+        matches!(ty.kind(), TyKind::RawPtr(_, Mutability::Not))
     } else {
         false
     }
 }
 
 fn get_parent<'tcx>(expr: &Expr<'_>, tcx: TyCtxt<'tcx>) -> Option<&'tcx Expr<'tcx>> {
-    let Node::Expr(parent) = tcx.hir().get_parent(expr.hir_id) else { return None };
+    let Node::Expr(parent) = tcx.parent_hir_node(expr.hir_id) else { return None };
     if matches!(parent.kind, ExprKind::DropTemps(_)) {
         get_parent(parent, tcx)
     } else {

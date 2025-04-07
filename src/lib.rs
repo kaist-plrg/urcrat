@@ -10,7 +10,6 @@
 #![warn(missing_copy_implementations)]
 #![warn(missing_debug_implementations)]
 #![warn(non_ascii_idents)]
-#![warn(pointer_structural_match)]
 #![warn(private_bounds)]
 #![warn(private_interfaces)]
 #![warn(rust_2021_incompatible_closure_captures)]
@@ -27,11 +26,10 @@
 #![warn(unused_lifetimes)]
 #![warn(unused_macro_rules)]
 #![warn(unused_qualifications)]
-#![warn(unused_tuple_struct_fields)]
+#![warn(dead_code)]
 #![warn(variant_size_differences)]
 #![feature(rustc_private)]
 #![feature(iter_intersperse)]
-#![feature(file_create_new)]
 #![feature(box_into_inner)]
 #![feature(box_patterns)]
 
@@ -39,8 +37,6 @@ extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
-extern crate rustc_driver_impl;
-extern crate rustc_error_codes;
 extern crate rustc_errors;
 extern crate rustc_feature;
 extern crate rustc_hash;
@@ -53,6 +49,8 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 pub mod alloc_finder;
+// pub mod ast_span;
+pub mod bitset;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod graph;
