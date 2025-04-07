@@ -4,11 +4,12 @@ use std::{
     path::Path,
 };
 
+use bitset::HybridBitSet;
 use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
 use rustc_hir::{def::Res, ItemKind, QPath, TyKind as HirTyKind};
-use rustc_index::{bit_set::DenseBitSet, Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::{
     mir::{
         interpret::{GlobalAlloc, Scalar},
@@ -74,7 +75,7 @@ pub struct PreAnalysisData<'tcx> {
     var_nodes: HashMap<(LocalDefId, Local), LocNode>,
 }
 
-pub type Solutions = Vec<DenseBitSet<usize>>; // Send not implemented for MixedBitSet
+pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for MixedBitSet
 
 #[derive(Debug)]
 pub struct AnalysisResults {
@@ -91,15 +92,15 @@ pub struct AnalysisResults {
     pub fn_sccs: HashMap<LocalDefId, usize>,
     pub reachables: RefCell<HashMap<usize, HashSet<usize>>>,
 
-    pub writes: HashMap<LocalDefId, HashMap<Location, DenseBitSet<usize>>>,
-    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, DenseBitSet<usize>>>,
-    pub fn_writes: HashMap<LocalDefId, DenseBitSet<usize>>,
+    pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
+    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
+    pub fn_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
 }
 
 impl AnalysisResults {
-    pub fn call_writes(&self, def_id: LocalDefId) -> DenseBitSet<usize> {
+    pub fn call_writes(&self, def_id: LocalDefId) -> HybridBitSet<usize> {
         self.with_reachables(self.fn_sccs[&def_id], |sccs| {
-            let mut writes = DenseBitSet::new_empty(self.ends.len());
+            let mut writes = HybridBitSet::new_empty(self.ends.len());
             for scc in sccs {
                 for f in &self.scc_elems[scc] {
                     writes.union(&self.fn_writes[f]);
@@ -343,14 +344,14 @@ pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
 
 pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     let size = arr.iter().filter(|n| **n == 255).count() + 1;
-    let mut solutions: Solutions = vec![DenseBitSet::new_empty(size)];
+    let mut solutions: Solutions = vec![HybridBitSet::new_empty(size)];
     let mut s = &mut solutions[0];
     let mut i = 0;
     let mut len = 0;
     for n in arr {
         match *n {
             255 => {
-                solutions.push(DenseBitSet::new_empty(size));
+                solutions.push(HybridBitSet::new_empty(size));
                 s = solutions.last_mut().unwrap();
             }
             254 => {
@@ -382,7 +383,7 @@ pub fn post_analyze<'a, 'tcx>(
         }
         pre.graph.insert(node, LocEdges::Deref(succs));
     }
-    let mut address_taken_indices = DenseBitSet::new_empty(pre.ends.len());
+    let mut address_taken_indices = HybridBitSet::new_empty(pre.ends.len());
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
@@ -458,7 +459,7 @@ pub fn post_analyze<'a, 'tcx>(
     let fn_writes: HashMap<_, _> = writes
         .iter()
         .map(|(f, writes)| {
-            let mut ws = DenseBitSet::new_empty(pre.ends.len());
+            let mut ws = HybridBitSet::new_empty(pre.ends.len());
             for w in writes.values() {
                 ws.union(w);
             }
@@ -529,14 +530,14 @@ fn compute_writes<'tcx>(
     l: Place<'tcx>,
     location: Location,
     ends: &[usize],
-    solutions: &[DenseBitSet<usize>],
+    solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, DenseBitSet<usize>>,
+    writes: &mut HashMap<Location, HybridBitSet<usize>>,
 ) {
     let writes = writes
         .entry(location)
-        .or_insert(DenseBitSet::new_empty(ends.len()));
+        .or_insert(HybridBitSet::new_empty(ends.len()));
     let ty = l.ty(ctx.locals, analyzer.tcx).ty;
     let len = analyzer.tss.tys[&ty].len();
     let l = analyzer.prefixed_loc(l, ctx);
@@ -568,10 +569,10 @@ fn compute_bitfield_writes<'tcx>(
     tss: &TyShapes<'_, 'tcx>,
     tcx: TyCtxt<'tcx>,
     ends: &[usize],
-    solutions: &[DenseBitSet<usize>],
+    solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, DenseBitSet<usize>>,
+    writes: &mut HashMap<Location, HybridBitSet<usize>>,
 ) {
     if args.len() != 2 {
         return;
@@ -591,7 +592,7 @@ fn compute_bitfield_writes<'tcx>(
     let l = analyzer.prefixed_loc(lhs, ctx);
     let writes = writes
         .entry(location)
-        .or_insert(DenseBitSet::new_empty(ends.len()));
+        .or_insert(HybridBitSet::new_empty(ends.len()));
     for loc in solutions[l.var.root].iter() {
         let loc = loc + offset;
         let end = ends[loc];
@@ -1014,7 +1015,7 @@ type WeightedGraph = HashMap<usize, HashMap<usize, HashSet<usize>>>;
 
 struct Graph {
     solutions: Solutions,
-    zero_weight_edges: Vec<DenseBitSet<usize>>,
+    zero_weight_edges: Vec<HybridBitSet<usize>>,
     pos_weight_edges: WeightedGraph,
     deref_eqs: WeightedGraph,
     eq_derefs: WeightedGraph,
@@ -1039,8 +1040,8 @@ impl std::fmt::Debug for Graph {
 impl Graph {
     fn new(size: usize) -> Self {
         Self {
-            solutions: vec![DenseBitSet::new_empty(size); size],
-            zero_weight_edges: vec![DenseBitSet::new_empty(size); size],
+            solutions: vec![HybridBitSet::new_empty(size); size],
+            zero_weight_edges: vec![HybridBitSet::new_empty(size); size],
             pos_weight_edges: HashMap::new(),
             deref_eqs: HashMap::new(),
             eq_derefs: HashMap::new(),
@@ -1098,7 +1099,7 @@ impl Graph {
         while deltas.iter().any(|s| !s.is_empty()) {
             let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&zero_weight_edges));
 
-            let mut components = vec![DenseBitSet::new_empty(len); sccs.num_sccs()];
+            let mut components = vec![HybridBitSet::new_empty(len); sccs.num_sccs()];
             for i in 0..len {
                 let scc = sccs.scc(i);
                 components[scc.index()].insert(i);
@@ -1138,7 +1139,7 @@ impl Graph {
                     for id in ids.iter() {
                         if *rep != id {
                             let set =
-                                std::mem::replace(&mut deltas[id], DenseBitSet::new_empty(len));
+                                std::mem::replace(&mut deltas[id], HybridBitSet::new_empty(len));
                             deltas[*rep].union(&set);
                         }
                     }
@@ -1146,13 +1147,13 @@ impl Graph {
 
                 // update solutions
                 for (rep, ids) in &cycles {
-                    let mut intersection = DenseBitSet::new_empty(len);
+                    let mut intersection = HybridBitSet::new_empty(len);
                     intersection.insert_all();
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
                             let set =
-                                std::mem::replace(&mut solutions[id], DenseBitSet::new_empty(len));
+                                std::mem::replace(&mut solutions[id], HybridBitSet::new_empty(len));
                             solutions[*rep].union(&set);
                         }
                     }
@@ -1162,7 +1163,7 @@ impl Graph {
                 }
 
                 // update zero_weight_edges
-                zero_weight_edges = vec![DenseBitSet::new_empty(len); len];
+                zero_weight_edges = vec![HybridBitSet::new_empty(len); len];
                 for (scc, rep) in scc_to_rep.iter().enumerate() {
                     let succs = &mut zero_weight_edges[*rep];
                     for succ in sccs.successors(scc) {
@@ -1182,7 +1183,7 @@ impl Graph {
                 if deltas[v].is_empty() {
                     continue;
                 }
-                let delta = std::mem::replace(&mut deltas[v], DenseBitSet::new_empty(len));
+                let delta = std::mem::replace(&mut deltas[v], HybridBitSet::new_empty(len));
 
                 propagate_deref(
                     v,
@@ -1247,7 +1248,7 @@ impl Graph {
     }
 }
 
-fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &DenseBitSet<usize>)]) {
+fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &HybridBitSet<usize>)]) {
     for (rep, ids) in cycles {
         let mut rep_edges = graph.remove(rep).unwrap_or_default();
         for id in ids.iter() {
@@ -1288,12 +1289,12 @@ fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &DenseBitS
 fn propagate_deref(
     v: usize,
     derefs: &WeightedGraph,
-    delta: &DenseBitSet<usize>,
+    delta: &HybridBitSet<usize>,
     ends: &[usize],
     id_to_rep: &[usize],
-    zero_weight_edges: &mut [DenseBitSet<usize>],
-    solutions: &mut [DenseBitSet<usize>],
-    deltas: &mut [DenseBitSet<usize>],
+    zero_weight_edges: &mut [HybridBitSet<usize>],
+    solutions: &mut [HybridBitSet<usize>],
+    deltas: &mut [HybridBitSet<usize>],
     deref_eq: bool,
 ) {
     let derefs = some_or!(derefs.get(&v), return);
@@ -1460,7 +1461,7 @@ fn is_c_fn(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
 }
 
 #[inline]
-fn contains_multiple<T: Idx>(set: &DenseBitSet<T>) -> bool {
+fn contains_multiple<T: Idx>(set: &HybridBitSet<T>) -> bool {
     let mut iter = set.iter();
     iter.next().is_some() && iter.next().is_some()
 }
@@ -1520,7 +1521,7 @@ impl<'tcx> Visitor<'tcx> for FnPtrVisitor<'tcx> {
 }
 
 #[repr(transparent)]
-struct VecBitSet<'a, T: Idx>(&'a Vec<DenseBitSet<T>>);
+struct VecBitSet<'a, T: Idx>(&'a Vec<HybridBitSet<T>>);
 
 impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
     type Node = T;

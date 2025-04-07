@@ -1,6 +1,6 @@
 use rustc_middle::ty::TyCtxt;
 
-use super::*;
+use super::{bitset::HybridBitSet, *};
 
 /// To inspect the MIR of test cases, you can:
 /// - Look at the compiled MIR code in the comments of the test case functions, or
@@ -2282,7 +2282,7 @@ fn l(block: usize, statement_index: usize) -> Location {
 }
 
 fn wg(
-    writes: &HashMap<Location, DenseBitSet<usize>>,
+    writes: &HashMap<Location, HybridBitSet<usize>>,
     block: usize,
     statement_index: usize,
 ) -> Vec<usize> {

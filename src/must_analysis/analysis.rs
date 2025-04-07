@@ -3,6 +3,7 @@ use std::{
     path::Path,
 };
 
+use bitset::{BitSet, HybridBitSet};
 use rustc_data_structures::graph::Successors;
 use rustc_hir::{def_id::DefId, ItemKind};
 use rustc_index::bit_set::DenseBitSet;
@@ -69,7 +70,7 @@ pub struct AnalysisContext<'a, 'b, 'tcx> {
     pub local_def_id: LocalDefId,
     pub tss: &'a TyShapes<'a, 'tcx>,
     pub may_points_to: &'b may_analysis::AnalysisResults,
-    pub no_gc_locals: Option<&'b DenseBitSet<Local>>,
+    pub no_gc_locals: Option<&'b BitSet<Local>>,
     pub gc: bool,
 }
 
@@ -118,7 +119,7 @@ pub struct Analyzer<'tcx, 'a, 'b> {
     pub loop_heads: HashSet<Location>,
     pub rpo_map: HashMap<BasicBlock, usize>,
     pub join_terminators: HashSet<Location>,
-    pub dead_locals: Vec<DenseBitSet<Local>>,
+    pub dead_locals: Vec<BitSet<Local>>,
     pub discriminant_values: HashMap<BasicBlock, DiscrVal>,
 }
 
@@ -192,7 +193,7 @@ impl Analyzer<'_, '_, '_> {
         &self.ctx.may_points_to.indirect_calls[&self.ctx.local_def_id][&loc.block]
     }
 
-    pub fn get_assign_writes(&self, loc: Location) -> Option<&DenseBitSet<usize>> {
+    pub fn get_assign_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
         let w = &self.ctx.may_points_to.writes[&self.ctx.local_def_id][&loc];
         if w.is_empty() {
             None
@@ -201,7 +202,7 @@ impl Analyzer<'_, '_, '_> {
         }
     }
 
-    pub fn get_bitfield_writes(&self, loc: Location) -> Option<&DenseBitSet<usize>> {
+    pub fn get_bitfield_writes(&self, loc: Location) -> Option<&HybridBitSet<usize>> {
         let w = self.ctx.may_points_to.bitfield_writes[&self.ctx.local_def_id].get(&loc)?;
         if w.is_empty() {
             None
@@ -210,7 +211,7 @@ impl Analyzer<'_, '_, '_> {
         }
     }
 
-    pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<DenseBitSet<usize>> {
+    pub fn get_call_writes(&self, callees: &[LocalDefId]) -> Option<HybridBitSet<usize>> {
         let c0 = callees.first()?;
         let mut writes = self.ctx.may_points_to.call_writes(*c0);
         for c in &callees[1..] {
@@ -226,7 +227,7 @@ impl Analyzer<'_, '_, '_> {
     pub fn get_arg_writes<I: Iterator<Item = Local>>(
         &self,
         locals: I,
-    ) -> Option<DenseBitSet<usize>> {
+    ) -> Option<HybridBitSet<usize>> {
         let mut writes = locals
             .flat_map(|local| {
                 let start = self.ctx.may_points_to.var_nodes[&(self.ctx.local_def_id, local)].index;
@@ -386,7 +387,7 @@ fn compute_join_terminators(body: &Body<'_>) -> HashSet<Location> {
         .collect()
 }
 
-fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSet<Local>> {
+fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Local>> {
     let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
     borrowed_locals.insert(Local::from_usize(0));
     let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
@@ -401,7 +402,7 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSe
             borrowed_or_live_locals.union(live_locals);
             let mut dead_locals = DenseBitSet::new_filled(body.local_decls.len());
             dead_locals.subtract(&borrowed_or_live_locals);
-            dead_locals
+            BitSet::from_dense(&dead_locals)
         })
         .collect()
 }

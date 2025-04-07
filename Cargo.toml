@@ -12,6 +12,8 @@ lazy_static = "1.4.0"
 typed-arena = "2.0.2"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
+arrayvec = { version = "0.7", default-features = false }
+smallvec = "1.8.1"
 
 [build]
 rustflags = ["-Zon-broken-pipe=kill"]

@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bitset::BitSet;
 use compile_util::{make_suggestion, span_to_snippet};
 use etrace::{ok_or, some_or};
 use must_analysis::{Graph, Obj};
@@ -16,7 +17,7 @@ use rustc_hir::{
     BinOpKind, Block, ByRef, Expr, ExprKind, HirId, ItemKind, MatchSource, Node, Pat, PatExpr,
     PatExprKind, PatKind, QPath, StmtKind, UnOp, VariantData,
 };
-use rustc_index::{bit_set::DenseBitSet, IndexVec};
+use rustc_index::IndexVec;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
@@ -360,7 +361,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
                     .map(|(local, _)| *local),
             )
             .collect();
-        let mut locals = DenseBitSet::new_empty(body.local_decls.len());
+        let mut locals = BitSet::new_empty(body.local_decls.len());
         for l in local_set {
             locals.insert(l);
         }

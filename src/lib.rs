@@ -50,6 +50,7 @@ extern crate rustc_span;
 
 pub mod alloc_finder;
 // pub mod ast_span;
+pub mod bitset;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod graph;
