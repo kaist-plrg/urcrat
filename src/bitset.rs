@@ -1,3 +1,5 @@
+// from rustc_index/src/bit_set.rs (nightly-2023-09-05)
+
 use std::{
     fmt, iter,
     marker::PhantomData,

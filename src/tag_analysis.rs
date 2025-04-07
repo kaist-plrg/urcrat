@@ -2568,7 +2568,7 @@ fn get_expr_context<'tcx>(
             let PatKind::Binding(BindingMode(by_ref, _), _, _, _) = pat.kind else {
                 unreachable!()
             };
-            if let ByRef::Yes(_) = by_ref {
+            if matches!(by_ref, ByRef::Yes(_)) {
                 (ExprContext::Address, expr)
             } else {
                 (ExprContext::Value, expr)
