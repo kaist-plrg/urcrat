@@ -32,9 +32,12 @@
 #![feature(iter_intersperse)]
 #![feature(box_into_inner)]
 #![feature(box_patterns)]
+#![feature(macro_metavar_expr)]
+#![feature(extract_if)]
 
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_ast_pretty;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -45,11 +48,15 @@ extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
+extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate smallvec;
+extern crate thin_vec;
 
 pub mod alloc_finder;
-// pub mod ast_span;
+#[macro_use]
+pub mod astutil;
 pub mod bitset;
 pub mod compile_util;
 pub mod disjoint_set;

@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -9,7 +10,8 @@ use compile_util::{make_suggestion, span_to_snippet};
 use etrace::{ok_or, some_or};
 use must_analysis::{Graph, Obj};
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_ast::{BindingMode, LitKind, Mutability};
+use rustc_ast::{BindingMode, LitKind, Mutability, DUMMY_NODE_ID};
+use rustc_ast_pretty::pprust;
 use rustc_hir::{
     def::Res,
     definitions::DefPathDataName,
@@ -27,17 +29,21 @@ use rustc_middle::{
     },
     ty::{List, Ty, TyCtxt, TyKind, TypeckResults},
 };
+use rustc_parse::new_parser_from_source_str;
 use rustc_session::config::Input;
 use rustc_span::{
     def_id::LocalDefId,
     source_map::{SourceMap, Spanned},
-    BytePos, Span, Symbol,
+    BytePos, FileName, RealFileName, Span, Symbol, DUMMY_SP,
 };
 use rustfix::Suggestion;
 use typed_arena::Arena;
 
 use self::must_analysis::{AbsInt, AbsMem, AccPath};
-use crate::*;
+use crate::{
+    astutil::{parse::*, AstEdit::*, AstSuggestions},
+    *,
+};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -670,7 +676,7 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
     stat.tagged_structs = tagged_structs.len();
 
     let mut method_lines = 0;
-    let mut suggestions = Suggestions::new(source_map);
+    let mut suggestions = AstSuggestions::new(source_map);
     for (s, ts) in &tagged_structs {
         let item = hir.expect_item(*s);
         let ItemKind::Struct(VariantData::Struct { fields: sfs, .. }, _) = item.kind else {
@@ -678,8 +684,8 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
         };
 
         let (field_name, field_ty) = if let Some(field) = sfs.get(ts.tag_index.as_usize()) {
-            let span = source_map.span_extend_to_line(field.span);
-            suggestions.add(span, "".to_string());
+            // let span = source_map.span_extend_to_line(field.span); // REMOVED
+            suggestions.add(item.span, RemoveFieldDef(field.span)); // shouldn't be extended to line
 
             let field_name = field.ident.name.to_ident_string();
             let field_ty = source_map.span_to_snippet(field.ty.span).unwrap();
@@ -689,14 +695,15 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
             let mut lo = item.ident.span.hi() + BytePos(3);
             'l: for f in sfs {
                 loop {
-                    let span = source_map.span_extend_to_line(f.span.with_lo(lo).with_hi(lo));
-                    let code = source_map.span_to_snippet(span).unwrap();
+                    let attr_span = source_map.span_extend_to_line(f.span.with_lo(lo).with_hi(lo));
+                    let code = source_map.span_to_snippet(attr_span).unwrap();
                     if code.contains(&format!("#[bitfield(name = \"{}\"", name)) {
-                        suggestions.add(span, "".to_string());
+                        // WARINING: believing the span is exactly the field attribute
+                        suggestions.add(f.span, RemoveFieldAttr(attr_span));
                         break 'l;
                     }
-                    lo = span.hi() + BytePos(1);
-                    if span.hi() >= f.span.hi() {
+                    lo = attr_span.hi() + BytePos(1);
+                    if attr_span.hi() >= f.span.hi() {
                         break;
                     }
                 }
@@ -934,7 +941,7 @@ impl {} {{
                 if is_first_union { &get_tag_method } else { "" },
             );
             method_lines += code.split('\n').count();
-            suggestions.add(item.span, code);
+            suggestions.add(item.span, ReplaceItem(item!("{}", code)));
         }
 
         set_tag_method.push_str(
@@ -943,8 +950,7 @@ impl {} {{
 }",
         );
         method_lines += set_tag_method.split('\n').count();
-        let span = item.span.shrink_to_hi();
-        suggestions.add(span, set_tag_method);
+        suggestions.add(item.span, AppendAfterItem(item!("{}", set_tag_method)));
     }
     stat.method_lines = method_lines;
 
@@ -987,43 +993,74 @@ impl {} {{
     let mut suggestions = suggestions.suggestions;
     for (path, suggestions) in &mut suggestions {
         tracing::info!("{:?}", path);
-        suggestions.sort_by_key(|s| s.snippets[0].range.start);
+        suggestions.sort_by_key(|s| s.span.lo());
         for suggestion in suggestions {
             tracing::info!("{:?}", suggestion);
         }
     }
 
     if conf.transform {
-        compile_util::apply_suggestions(&suggestions);
+        // Not using rustfix
+        // compile_util::apply_suggestions(&suggestions);
+
+        let source_map = tcx.sess.source_map();
+        let parse_sess = new_silent_parse_sess();
+        for file in source_map.files().iter() {
+            if !matches!(
+                file.name,
+                FileName::Real(RealFileName::LocalPath(_)) | FileName::Custom(_)
+            ) {
+                continue;
+            }
+            let src = some_or!(file.src.as_ref(), continue);
+            let mut parser =
+                new_parser_from_source_str(&parse_sess, file.name.clone(), src.to_string())
+                    .unwrap();
+            let mut krate = parser.parse_crate_mod().unwrap();
+
+            let updated = true;
+
+            if updated && conf.transform {
+                for item in &mut krate.items {}
+                let s = pprust::crate_to_string_for_macros(&krate);
+                let FileName::Real(RealFileName::LocalPath(p)) = file.name.clone() else {
+                    panic!()
+                };
+                fs::write(p, s).unwrap();
+            }
+
+            // TODO: add definitions
+            // TODO: add transform transformation visitor
+        }
     }
 
     stat.transformation = start.elapsed().as_millis() as usize;
     stat
 }
 
-struct Suggestions<'tcx> {
-    suggestions: HashMap<PathBuf, Vec<Suggestion>>,
-    source_map: &'tcx SourceMap,
-}
+// struct Suggestions<'tcx> {
+//     suggestions: HashMap<PathBuf, Vec<Suggestion>>,
+//     source_map: &'tcx SourceMap,
+// }
 
-impl<'tcx> Suggestions<'tcx> {
-    fn new(source_map: &'tcx SourceMap) -> Self {
-        Self {
-            suggestions: HashMap::new(),
-            source_map,
-        }
-    }
+// impl<'tcx> Suggestions<'tcx> {
+//     fn new(source_map: &'tcx SourceMap) -> Self {
+//         Self {
+//             suggestions: HashMap::new(),
+//             source_map,
+//         }
+//     }
 
-    fn add(&mut self, span: Span, code: String) {
-        let snippet = span_to_snippet(span, self.source_map);
-        let suggestion = make_suggestion(snippet, code);
-        let path = compile_util::span_to_path(span, self.source_map).unwrap();
-        self.suggestions.entry(path).or_default().push(suggestion);
-    }
-}
+//     fn add(&mut self, span: Span, code: String) {
+//         let snippet = span_to_snippet(span, self.source_map);
+//         let suggestion = make_suggestion(snippet, code);
+//         let path = compile_util::span_to_path(span, self.source_map).unwrap();
+//         self.suggestions.entry(path).or_default().push(suggestion);
+//     }
+// }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Tag(u32);
+pub(super) struct Tag(u32);
 
 impl std::fmt::Debug for Tag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1480,7 +1517,7 @@ struct SuggestingVisitor<'a, 'tcx> {
     access_in_ifs: &'a HashMap<Span, Vec<AccessInIf<'tcx>>>,
     basic_blocks: &'a [(Span, Location)],
     hir_id_to_locals: &'a HashMap<HirId, Local>,
-    suggestions: &'a mut Suggestions<'tcx>,
+    suggestions: &'a mut AstSuggestions<'tcx>,
 
     locals: HashMap<HirId, &'tcx Expr<'tcx>>,
     match_targets: HashMap<Span, (String, Vec<Span>)>,
@@ -1580,8 +1617,10 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
             let TyKind::Adt(adt_def, _) = ty.kind() else { unreachable!() };
             if adt_def.did().as_local() == Some(ts.local_def_id) {
                 let struct_str = source_map.span_to_snippet(struct_expr.span).unwrap();
-                self.suggestions
-                    .add(expr.span, format!("{}.{}", struct_str, union_field_name));
+                self.suggestions.add(
+                    expr.span,
+                    ReplaceExpr(expr!("{}.{}", struct_str, union_field_name)),
+                );
 
                 let (root, derefs) = unwrap_deref(unwrap_projection(struct_expr));
                 let root = if let ExprKind::Path(QPath::Resolved(_, path)) = root.kind {
@@ -1601,16 +1640,17 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                     let span = arm.pat.span;
                     if let Some(tags) = pat_to_tags(arm.pat) {
                         let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
-                        self.suggestions.add(span, pat);
+                        self.suggestions.add(span, ReplacePat(pat!("{}", pat)));
                         if matches!(arm.body.kind, ExprKind::Block(_, _)) {
                             if let Some(cast) = cast {
                                 let pos = arm.body.span.lo() + BytePos(1);
-                                let span = arm.body.span.with_lo(pos).with_hi(pos);
-                                self.suggestions.add(span, cast);
+                                let span = arm.body.span; //.with_lo(pos).with_hi(pos);
+                                self.suggestions
+                                    .add(span, PrependToBlock(stmt!("{}", cast)));
                             }
                         }
                     } else if source_map.span_to_snippet(arm.pat.span).unwrap() != "_" {
-                        self.suggestions.add(arm.pat.span, "_".to_string());
+                        self.suggestions.add(arm.pat.span, ReplacePat(pat!("_")));
                     }
                     let has_assign = root
                         .map(|root| {
@@ -1663,13 +1703,15 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             };
                             let is_const = is_from_const_ptr(struct_expr, self.typeck);
                             let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
-                            let code = format!(
-                                "let {} = {}.{}",
-                                pat,
-                                source_map.span_to_snippet(struct_expr.span).unwrap(),
-                                union_field_name,
+                            self.suggestions.add(
+                                expr.span,
+                                ReplaceExpr(expr!(
+                                    "let {} = {}.{}",
+                                    pat,
+                                    source_map.span_to_snippet(struct_expr.span).unwrap(),
+                                    union_field_name,
+                                )),
                             );
-                            self.suggestions.add(expr.span, code);
 
                             let if_expr = get_parent(expr, self.tcx).unwrap();
                             let ExprKind::If(_, t, _) = if_expr.kind else {
@@ -1678,9 +1720,8 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
 
                             if let Some(cast) = cast {
                                 assert!(matches!(t.kind, ExprKind::Block(_, _)));
-                                let pos = t.span.lo() + BytePos(1);
-                                let span = t.span.with_lo(pos).with_hi(pos);
-                                self.suggestions.add(span, cast);
+                                self.suggestions
+                                    .add(t.span, PrependToBlock(stmt!("{}", cast)));
                             }
 
                             let has_assign = root
@@ -1721,8 +1762,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 let ts = some_or!(self.structs.get(&def_id), return);
 
                 let tag_expr = fs.get(ts.tag_index.as_usize()).and_then(|field| {
-                    let span = source_map.span_extend_to_line(field.span);
-                    self.suggestions.add(span, "".to_string());
+                    self.suggestions.add(expr.span, RemoveExprField(field.span));
 
                     source_map.span_to_snippet(field.expr.span).ok()
                 });
@@ -1778,7 +1818,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                     if v.contains("::new(") {
                         self.nums.new_num += 1;
                     }
-                    self.suggestions.add(expr.span, v);
+                    self.suggestions.add(expr.span, ReplaceExpr(expr!("{}", v)));
                 }
             }
             ExprKind::Field(e, field) => {
@@ -1798,8 +1838,10 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     } else if self.if_targets.keys().any(|s| s.contains(e.span)) {
                                         self.nums.get_tag_if_num += 1;
                                     } else {
-                                        let span = field.span.shrink_to_hi();
-                                        self.suggestions.add(span, "()".to_string());
+                                        let expr_str =
+                                            source_map.span_to_snippet(expr.span).unwrap();
+                                        self.suggestions
+                                            .add(expr.span, ReplaceExpr(expr!("{}()", expr_str)));
                                         self.nums.get_tag_num += 1;
                                     }
                                 }
@@ -1813,15 +1855,15 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     {
                                         self.nums.set_tag_aggregate_num += 1;
                                     } else {
-                                        let span = field.span.shrink_to_lo();
-                                        self.suggestions.add(span, "set_".to_string());
-
-                                        let span = field.span.shrink_to_hi();
-                                        let span = span.with_hi(span.hi() + BytePos(2));
-                                        self.suggestions.add(span, "(".to_string());
-
-                                        let span = e2.span.shrink_to_hi();
-                                        self.suggestions.add(span, ")".to_string());
+                                        let expr_str =
+                                            source_map.span_to_snippet(expr.span).unwrap();
+                                        let replaced = str_replace_last(
+                                            &expr_str,
+                                            &format!(".{} = ", field.name),
+                                            &format!(".set_{}(", field.name),
+                                        );
+                                        self.suggestions
+                                            .add(expr.span, ReplaceExpr(expr!("{})", replaced)));
 
                                         self.nums.set_tag_num += 1;
                                     }
@@ -1876,7 +1918,8 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             .iter()
                             .any(|span| span.contains(expr.span))
                         {
-                            self.suggestions.add(expr.span, "(*__v)".to_string());
+                            self.suggestions
+                                .add(expr.span, ReplaceExpr(expr!("(*__v)")));
 
                             match (is_match, ctx) {
                                 (true, ExprContext::Value) => self.nums.get_variant_match_num += 1,
@@ -1893,8 +1936,14 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         match ctx {
                             ExprContext::Value => {
                                 if !replaced_by_aggregate {
-                                    let call = format!("get_{}()", field.name);
-                                    self.suggestions.add(field.span, call);
+                                    let expr_str = source_map.span_to_snippet(expr.span).unwrap();
+                                    let replaced = str_replace_last(
+                                        &expr_str,
+                                        &format!(".{}", field.name),
+                                        &format!(".get_{}()", field.name),
+                                    );
+                                    self.suggestions
+                                        .add(expr.span, ReplaceExpr(expr!("{}", replaced)));
 
                                     self.nums.get_variant_num += 1;
                                 }
@@ -1904,9 +1953,6 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     self.nums.set_variant_aggregate_num += 1;
                                 } else {
                                     self.nums.set_variant_num += 1;
-
-                                    let span = expr.span.shrink_to_lo();
-                                    self.suggestions.add(span, "(*".to_string());
 
                                     let ItemKind::Union(VariantData::Struct { fields: fs, .. }, _) =
                                         self.tcx.hir().expect_item(did).kind
@@ -1933,20 +1979,26 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                         );
                                         format!("deref_{}_mut({}()))", field.name, tag)
                                     };
-                                    self.suggestions.add(field.span, call);
-
+                                    let expr_str = source_map.span_to_snippet(expr.span).unwrap();
+                                    let mut replaced = str_replace_last(
+                                        &expr_str,
+                                        &format!(".{}", field.name),
+                                        &format!(".{}", call),
+                                    );
                                     let root = unwrap_projection(expr);
                                     if let ExprKind::Unary(UnOp::Deref, e) = root.kind {
                                         let ty = self.typeck.expr_ty(e);
                                         if let TyKind::RawPtr(ty, Mutability::Not) = ty.kind() {
-                                            let span = e.span.shrink_to_lo();
-                                            self.suggestions.add(span, "(".to_string());
-
-                                            let span = e.span.shrink_to_hi();
-                                            let cast = format!(" as *mut crate::{:?})", ty);
-                                            self.suggestions.add(span, cast);
+                                            let e_str = source_map.span_to_snippet(e.span).unwrap();
+                                            replaced = replaced.replacen(
+                                                &e_str,
+                                                &format!("({} as *mut crate::{:?})", e_str, ty),
+                                                1,
+                                            );
                                         }
                                     }
+                                    self.suggestions
+                                        .add(expr.span, ReplaceExpr(expr!("(*{}", replaced)));
                                 }
                             }
                         }
@@ -2125,23 +2177,25 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         .collect();
                     let bs = bss.pop().unwrap();
                     let value = self.assigned_value_to_string(&value);
-                    let code = format!(
-                        "{}.{} = {}::{}{}({});",
-                        self.tcx
-                            .sess
-                            .source_map()
-                            .span_to_snippet(expr.span)
-                            .unwrap(),
-                        union_field_name,
-                        union_name,
-                        variant,
-                        tag,
-                        value,
+                    self.suggestions.add(
+                        bs.span,
+                        ReplaceStmt(stmt!(
+                            "{}.{} = {}::{}{}({});",
+                            self.tcx
+                                .sess
+                                .source_map()
+                                .span_to_snippet(expr.span)
+                                .unwrap(),
+                            union_field_name,
+                            union_name,
+                            variant,
+                            tag,
+                            value,
+                        )),
                     );
-                    self.suggestions.add(bs.span, code);
                     self.aggregate_spans.push(bs.span);
                     for bs in bss {
-                        self.suggestions.add(bs.span, "".to_string());
+                        self.suggestions.add(bs.span, RemoveStmt);
                         self.aggregate_spans.push(bs.span);
                     }
                     removed = true;
@@ -2157,7 +2211,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                 }
             }
             if removed {
-                self.suggestions.add(tag_assign.span, "".to_string());
+                self.suggestions.add(tag_assign.span, RemoveStmt);
                 self.aggregate_spans.push(tag_assign.span);
                 self.nums.aggregate_num += 1;
             }
@@ -2663,13 +2717,13 @@ impl<'a, 'tcx> AccessCtx<'a, 'tcx> {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-struct AccessInMatch<'tcx> {
-    access: FieldAccess<'tcx>,
-    field_tags: Vec<(FieldIdx, HashSet<u128>)>,
-    match_loc: Location,
-    arm_loc: Location,
-    match_span: Span,
-    arm_span: Span,
+pub(super) struct AccessInMatch<'tcx> {
+    pub(super) access: FieldAccess<'tcx>,
+    pub(super) field_tags: Vec<(FieldIdx, HashSet<u128>)>,
+    pub(super) match_loc: Location,
+    pub(super) arm_loc: Location,
+    pub(super) match_span: Span,
+    pub(super) arm_span: Span,
 }
 
 fn access_in_match<'tcx>(
@@ -2733,7 +2787,7 @@ fn access_in_match<'tcx>(
 
 #[derive(Debug)]
 #[allow(dead_code)]
-struct AccessInIf<'tcx> {
+pub(super) struct AccessInIf<'tcx> {
     access: FieldAccess<'tcx>,
     field_tags: Vec<(FieldIdx, HashSet<u128>)>,
     if_loc: Location,
@@ -2992,5 +3046,17 @@ fn unwrap_deref<'a, 'tcx>(e: &'a Expr<'tcx>) -> (&'a Expr<'tcx>, usize) {
         (e, i + 1)
     } else {
         (e, 0)
+    }
+}
+
+fn str_replace_last(s: &str, old: &str, new: &str) -> String {
+    if let Some(pos) = s.rfind(old) {
+        let mut result = String::with_capacity(s.len() - old.len() + new.len());
+        result.push_str(&s[..pos]);
+        result.push_str(new);
+        result.push_str(&s[pos + old.len()..]);
+        result
+    } else {
+        s.to_string()
     }
 }

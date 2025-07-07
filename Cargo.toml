@@ -13,7 +13,7 @@ typed-arena = "2.0.2"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
 arrayvec = { version = "0.7", default-features = false }
-smallvec = "1.8.1"
+memoize = "0.5.1"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

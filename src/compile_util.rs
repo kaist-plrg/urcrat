@@ -7,6 +7,7 @@ use std::{
 };
 
 use etrace::ok_or;
+use rustc_ast_pretty::pprust::crate_to_string_for_macros;
 use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Level,
 };
@@ -33,6 +34,7 @@ pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
             let krate = parse(&compiler.sess);
+            // println!("{}", crate_to_string_for_macros(&krate));
             create_and_enter_global_ctxt(compiler, krate, f)
         })
     })
