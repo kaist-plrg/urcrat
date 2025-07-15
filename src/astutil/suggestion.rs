@@ -7,7 +7,7 @@ use crate::compile_util;
 
 #[derive(Clone)]
 pub struct AstSuggestions<'tcx> {
-    pub suggestions: HashMap<PathBuf, Vec<AstSuggestion>>,
+    pub suggestions: HashMap<Option<PathBuf>, Vec<AstSuggestion>>,
     source_map: &'tcx SourceMap,
 }
 
@@ -26,9 +26,9 @@ impl<'tcx> AstSuggestions<'tcx> {
     }
 
     pub fn add(&mut self, span: Span, replacement: AstEdit) {
-        let path = compile_util::span_to_path(span, self.source_map).unwrap();
+        let path_opt = compile_util::span_to_path(span, self.source_map);
         self.suggestions
-            .entry(path)
+            .entry(path_opt)
             .or_default()
             .push(AstSuggestion {
                 span,
@@ -42,11 +42,8 @@ impl<'tcx> AstSuggestions<'tcx> {
         kinds: Vec<AstEditKind>,
     ) -> Vec<AstSuggestion> {
         // Suppose the suggestions are distinct by span and path.
-        let path = match compile_util::span_to_path(span, self.source_map) {
-            Some(path) => path,
-            None => return Vec::new(),
-        };
-        let vec = match self.suggestions.get_mut(&path) {
+        let path_opt = compile_util::span_to_path(span, self.source_map);
+        let vec = match self.suggestions.get_mut(&path_opt) {
             Some(vec) => vec,
             None => return Vec::new(),
         };
@@ -104,21 +101,6 @@ define_ast_edit!(
     // Handled by TODO: visit_field_def?
     RemoveFieldAttr(Span), /* Given the parent FieldDef's span, remove a field attribute of this span. */
 );
-
-// pub trait Spanned {
-//     fn span(&self) -> Span;
-//     fn set_span(&mut self, span: Span);
-// }
-
-// impl Spanned for Expr {
-//     fn span(&self) -> Span {
-//         self.span
-//     }
-
-//     fn set_span(&mut self, span: Span) {
-//         self.span = span;
-//     }
-// }
 
 #[derive(Debug, Clone)]
 pub struct AstSuggestion {

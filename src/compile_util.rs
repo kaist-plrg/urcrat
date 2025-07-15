@@ -7,6 +7,7 @@ use std::{
 };
 
 use etrace::ok_or;
+use rustc_ast::Crate;
 use rustc_ast_pretty::pprust::crate_to_string_for_macros;
 use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Level,

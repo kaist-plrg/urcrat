@@ -7,6 +7,7 @@ use rustc_ast::{
         AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream, TokenStream, TokenTree,
     },
 };
+use rustc_middle::ty::TyCtxt;
 use rustc_span::{source_map::SourceMap, Span};
 use smallvec::smallvec;
 
@@ -18,7 +19,17 @@ pub struct TransformVisitor<'tcx> {
     updated: bool,
 }
 
-impl TransformVisitor<'_> {
+impl<'tcx> TransformVisitor<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, suggestion_vec: Vec<AstSuggestion>) -> Self {
+        let mut suggestions = AstSuggestions::new(tcx.sess.source_map());
+        for suggestion in suggestion_vec {
+            suggestions.add(suggestion.span, suggestion.action);
+        }
+        Self {
+            suggestions,
+            updated: false,
+        }
+    }
     // fn try_replace<T: Spanned>(
     //     &mut self,
     //     replacement_kind: AstEditKind,
@@ -181,7 +192,7 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::walk_expr(self, expr);
         let edit_vec = self.suggestions.pop_by_kind(
             expr.span,
-            vec![AstEditKind::ReplaceExpr, AstEditKind::RemoveFieldDef],
+            vec![AstEditKind::ReplaceExpr, AstEditKind::RemoveExprField],
         );
         for edit in edit_vec {
             match edit.action {

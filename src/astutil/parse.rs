@@ -31,6 +31,20 @@ pub fn new_parser_from_sess_str(parse_sess: &ParseSess, s: String) -> Parser<'_>
 }
 
 #[inline]
+pub fn parse_crate(raw: String) -> Crate {
+    let parse_sess = new_silent_parse_sess();
+    let mut parser = new_parser_from_sess_str(&parse_sess, raw);
+    parser.parse_crate_mod().unwrap()
+}
+
+#[macro_export]
+macro_rules! krate {
+    ($($arg:tt)*) => {{
+        parse_crate(format!($($arg)*))
+    }};
+}
+
+#[inline]
 pub fn parse_item(item: String) -> Item {
     let parse_sess = new_silent_parse_sess();
     let mut parser = new_parser_from_sess_str(&parse_sess, item);

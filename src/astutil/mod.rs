@@ -6,3 +6,6 @@ mod transform;
 
 pub use suggestion::*;
 pub use transform::*;
+
+#[cfg(test)]
+mod tests;
