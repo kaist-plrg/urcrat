@@ -1027,8 +1027,8 @@ impl {} {{
                 fs::write(p, s).unwrap();
             }
         }
-        println!("================================================");
-        trans_visitor.print_suggestions();
+        // println!("================================================");
+        // trans_visitor.print_suggestions();
         trans_visitor.assert_finished();
     }
 
