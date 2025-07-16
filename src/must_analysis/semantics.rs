@@ -137,10 +137,10 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                         BinOp::BitOr => v1 | v2,
                         BinOp::Shl => shl(v1, v2, ty),
                         BinOp::Shr => shr(v1, v2, ty),
-                        BinOp::Eq => (v1 == v2) as u128,
+                        BinOp::Eq => (v1 == v2) as i128,
                         BinOp::Lt => lt(v1, v2, ty),
                         BinOp::Le => le(v1, v2, ty),
-                        BinOp::Ne => (v1 != v2) as u128,
+                        BinOp::Ne => (v1 != v2) as i128,
                         BinOp::Ge => ge(v1, v2, ty),
                         BinOp::Gt => gt(v1, v2, ty),
                         _ => unreachable!(),
@@ -271,7 +271,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                             UintTy::U16 => i.to_u16() as _,
                             UintTy::U32 => i.to_u32() as _,
                             UintTy::U64 => i.to_u64() as _,
-                            UintTy::U128 => i.to_u128(),
+                            UintTy::U128 => i.to_u128() as _,
                         };
                         OpVal::Int(v)
                     }
@@ -377,7 +377,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                                     assert_eq!(v, 0);
                                 }
                                 let mut state = state.clone();
-                                state.gm().filter_x_int(&discr, is_deref, v);
+                                state.gm().filter_x_int(&discr, is_deref, v as i128);
                                 (location, state)
                             })
                             .chain(std::iter::once({
@@ -392,7 +392,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                                     state.gm().filter_x_not_ints(
                                         &discr,
                                         is_deref,
-                                        targets.iter().map(|(v, _)| v),
+                                        targets.iter().map(|(v, _)| v as i128),
                                     )
                                 }
                                 (location, state)
@@ -402,7 +402,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                 },
                 OpVal::Static(_) => unreachable!(),
                 OpVal::Int(i) => {
-                    let target_opt = targets.iter().find(|(v, _)| i == *v);
+                    let target_opt = targets.iter().find(|(v, _)| i as u128 == *v);
                     let target = if let Some((_, target)) = target_opt {
                         target
                     } else {
@@ -636,7 +636,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
 pub enum OpVal {
     Place(AccPath, bool),
     Static(LocalDefId),
-    Int(u128),
+    Int(i128),
     Other,
 }
 
@@ -743,26 +743,26 @@ impl AccElem {
 
 macro_rules! create_div_fn {
     ($name:ident, $op:tt) => {
-        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+        fn $name(n: i128, m: i128, ty: Ty<'_>) -> i128 {
             match ty.kind() {
                 TyKind::Int(int_ty) => {
                     match int_ty {
-                        IntTy::Isize => (n as isize $op m as isize) as u128,
-                        IntTy::I8 => (n as i8 $op m as i8) as u128,
-                        IntTy::I16 => (n as i16 $op m as i16) as u128,
-                        IntTy::I32 => (n as i32 $op m as i32) as u128,
-                        IntTy::I64 => (n as i64 $op m as i64) as u128,
-                        IntTy::I128 => (n as i128 $op m as i128) as u128,
+                        IntTy::Isize => (n as isize $op m as isize) as i128,
+                        IntTy::I8 => (n as i8 $op m as i8) as i128,
+                        IntTy::I16 => (n as i16 $op m as i16) as i128,
+                        IntTy::I32 => (n as i32 $op m as i32) as i128,
+                        IntTy::I64 => (n as i64 $op m as i64) as i128,
+                        IntTy::I128 => n $op m,
                     }
                 }
                 TyKind::Uint(uint_ty) => {
                     match uint_ty {
-                        UintTy::Usize => (n as usize $op m as usize) as u128,
-                        UintTy::U8 => (n as u8 $op m as u8) as u128,
-                        UintTy::U16 => (n as u16 $op m as u16) as u128,
-                        UintTy::U32 => (n as u32 $op m as u32) as u128,
-                        UintTy::U64 => (n as u64 $op m as u64) as u128,
-                        UintTy::U128 => n $op m,
+                        UintTy::Usize => (n as usize $op m as usize) as i128,
+                        UintTy::U8 => (n as u8 $op m as u8) as i128,
+                        UintTy::U16 => (n as u16 $op m as u16) as i128,
+                        UintTy::U32 => (n as u32 $op m as u32) as i128,
+                        UintTy::U64 => (n as u64 $op m as u64) as i128,
+                        UintTy::U128 => (n as u128 $op m as u128) as i128,
                     }
                 }
                 _ => panic!(),
@@ -776,25 +776,25 @@ create_div_fn!(rem, %);
 
 macro_rules! create_shift_fn {
     ($name:ident, $op:tt) => {
-        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+        fn $name(n: i128, m: i128, ty: Ty<'_>) -> i128 {
             match ty.kind() {
                 TyKind::Int(int_ty) => {
                     match int_ty {
-                        IntTy::Isize => ((n as isize) $op m) as u128,
-                        IntTy::I8 => ((n as i8) $op m) as u128,
-                        IntTy::I16 => ((n as i16) $op m) as u128,
-                        IntTy::I32 => ((n as i32) $op m) as u128,
-                        IntTy::I64 => ((n as i64) $op m) as u128,
-                        IntTy::I128 => ((n as i128) $op m) as u128,
+                        IntTy::Isize => ((n as isize) $op m) as i128,
+                        IntTy::I8 => ((n as i8) $op m) as i128,
+                        IntTy::I16 => ((n as i16) $op m) as i128,
+                        IntTy::I32 => ((n as i32) $op m) as i128,
+                        IntTy::I64 => ((n as i64) $op m) as i128,
+                        IntTy::I128 => (n $op m),
                     }
                 }
                 TyKind::Uint(uint_ty) => {
                     match uint_ty {
-                        UintTy::Usize => ((n as usize) $op m) as u128,
-                        UintTy::U8 => ((n as u8) $op m) as u128,
-                        UintTy::U16 => ((n as u16) $op m) as u128,
-                        UintTy::U32 => ((n as u32) $op m) as u128,
-                        UintTy::U64 => ((n as u64) $op m) as u128,
+                        UintTy::Usize => ((n as usize) $op m) as i128,
+                        UintTy::U8 => ((n as u8) $op m) as i128,
+                        UintTy::U16 => ((n as u16) $op m) as i128,
+                        UintTy::U32 => ((n as u32) $op m) as i128,
+                        UintTy::U64 => ((n as u64) $op m) as i128,
                         UintTy::U128 => n $op m,
                     }
                 }
@@ -809,29 +809,29 @@ create_shift_fn!(shr, >>);
 
 macro_rules! create_cmp_fn {
     ($name:ident, $op:tt) => {
-        fn $name(n: u128, m: u128, ty: Ty<'_>) -> u128 {
+        fn $name(n: i128, m: i128, ty: Ty<'_>) -> i128 {
             match ty.kind() {
                 TyKind::Int(int_ty) => {
                     match int_ty {
-                        IntTy::Isize => ((n as isize) $op m as isize) as u128,
-                        IntTy::I8 => ((n as i8) $op m as i8) as u128,
-                        IntTy::I16 => ((n as i16) $op m as i16) as u128,
-                        IntTy::I32 => ((n as i32) $op m as i32) as u128,
-                        IntTy::I64 => ((n as i64) $op m as i64) as u128,
-                        IntTy::I128 => ((n as i128) $op m as i128) as u128,
+                        IntTy::Isize => ((n as isize) $op m as isize) as i128,
+                        IntTy::I8 => ((n as i8) $op m as i8) as i128,
+                        IntTy::I16 => ((n as i16) $op m as i16) as i128,
+                        IntTy::I32 => ((n as i32) $op m as i32) as i128,
+                        IntTy::I64 => ((n as i64) $op m as i64) as i128,
+                        IntTy::I128 => (n $op m) as i128,
                     }
                 }
                 TyKind::Uint(uint_ty) => {
                     match uint_ty {
-                        UintTy::Usize => ((n as usize) $op m as usize) as u128,
-                        UintTy::U8 => ((n as u8) $op m as u8) as u128,
-                        UintTy::U16 => ((n as u16) $op m as u16) as u128,
-                        UintTy::U32 => ((n as u32) $op m as u32) as u128,
-                        UintTy::U64 => ((n as u64) $op m as u64) as u128,
-                        UintTy::U128 => (n $op m) as u128,
+                        UintTy::Usize => ((n as usize) $op m as usize) as i128,
+                        UintTy::U8 => ((n as u8) $op m as u8) as i128,
+                        UintTy::U16 => ((n as u16) $op m as u16) as i128,
+                        UintTy::U32 => ((n as u32) $op m as u32) as i128,
+                        UintTy::U64 => ((n as u64) $op m as u64) as i128,
+                        UintTy::U128 => (n $op m) as i128,
                     }
                 }
-                TyKind::Bool => ((n != 0) $op (m != 0)) as u128,
+                TyKind::Bool => ((n != 0) $op (m != 0)) as i128,
                 _ => panic!(),
             }
         }
@@ -845,27 +845,27 @@ create_cmp_fn!(gt, >);
 
 macro_rules! create_cast_fn {
     ($name:ident, $typ:ty) => {
-        fn $name(n: u128, ty: Ty<'_>) -> u128 {
+        fn $name(n: i128, ty: Ty<'_>) -> i128 {
             #[allow(trivial_numeric_casts)]
             match ty.kind() {
                 TyKind::Int(int_ty) => match int_ty {
-                    IntTy::Isize => (n as isize) as $typ as u128,
-                    IntTy::I8 => (n as i8) as $typ as u128,
-                    IntTy::I16 => (n as i16) as $typ as u128,
-                    IntTy::I32 => (n as i32) as $typ as u128,
-                    IntTy::I64 => (n as i64) as $typ as u128,
-                    IntTy::I128 => (n as i128) as $typ as u128,
+                    IntTy::Isize => (n as isize) as $typ as i128,
+                    IntTy::I8 => (n as i8) as $typ as i128,
+                    IntTy::I16 => (n as i16) as $typ as i128,
+                    IntTy::I32 => (n as i32) as $typ as i128,
+                    IntTy::I64 => (n as i64) as $typ as i128,
+                    IntTy::I128 => (n as i128) as $typ as i128,
                 },
                 TyKind::Uint(uint_ty) => match uint_ty {
-                    UintTy::Usize => (n as usize) as $typ as u128,
-                    UintTy::U8 => (n as u8) as $typ as u128,
-                    UintTy::U16 => (n as u16) as $typ as u128,
-                    UintTy::U32 => (n as u32) as $typ as u128,
-                    UintTy::U64 => (n as u64) as $typ as u128,
-                    UintTy::U128 => n as $typ as u128,
+                    UintTy::Usize => (n as usize) as $typ as i128,
+                    UintTy::U8 => (n as u8) as $typ as i128,
+                    UintTy::U16 => (n as u16) as $typ as i128,
+                    UintTy::U32 => (n as u32) as $typ as i128,
+                    UintTy::U64 => (n as u64) as $typ as i128,
+                    UintTy::U128 => n as $typ as i128,
                 },
-                TyKind::Bool => (n != 0) as $typ as u128,
-                TyKind::Char => (n as u32) as $typ as u128,
+                TyKind::Bool => (n != 0) as $typ as i128,
+                TyKind::Char => (n as u32) as $typ as i128,
                 _ => panic!(),
             }
         }
@@ -885,15 +885,15 @@ create_cast_fn!(to_u64, u64);
 create_cast_fn!(to_u128, u128);
 create_cast_fn!(to_usize, usize);
 
-fn neg(n: u128, ty: Ty<'_>) -> u128 {
+fn neg(n: i128, ty: Ty<'_>) -> i128 {
     match ty.kind() {
         TyKind::Int(int_ty) => match int_ty {
-            IntTy::Isize => -(n as isize) as u128,
-            IntTy::I8 => -(n as i8) as u128,
-            IntTy::I16 => -(n as i16) as u128,
-            IntTy::I32 => -(n as i32) as u128,
-            IntTy::I64 => -(n as i64) as u128,
-            IntTy::I128 => -(n as i128) as u128,
+            IntTy::Isize => -(n as isize) as _,
+            IntTy::I8 => -(n as i8) as _,
+            IntTy::I16 => -(n as i16) as _,
+            IntTy::I32 => -(n as i32) as _,
+            IntTy::I64 => -(n as i64) as _,
+            IntTy::I128 => -n,
         },
         _ => panic!(),
     }

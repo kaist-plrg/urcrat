@@ -86,7 +86,7 @@ type NodeId = usize;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Index {
-    Num(u128),
+    Num(i128),
     Sym(BTreeSet<Local>),
 }
 
@@ -156,7 +156,7 @@ impl std::fmt::Debug for AccElem {
 
 impl AccElem {
     #[inline]
-    pub fn num_index(i: u128) -> Self {
+    pub fn num_index(i: i128) -> Self {
         Self::Index(Index::Num(i))
     }
 
@@ -241,7 +241,7 @@ impl AbsLoc {
 #[derive(Clone, PartialEq, Eq)]
 pub enum AbsInt {
     Top,
-    Set(HashSet<u128>),
+    Set(HashSet<i128>),
 }
 
 impl std::fmt::Debug for AbsInt {
@@ -255,12 +255,12 @@ impl std::fmt::Debug for AbsInt {
 
 impl AbsInt {
     #[inline]
-    fn singleton(n: u128) -> Self {
+    fn singleton(n: i128) -> Self {
         Self::Set([n].into_iter().collect())
     }
 
     #[inline]
-    fn new(ns: HashSet<u128>) -> Self {
+    fn new(ns: HashSet<i128>) -> Self {
         if ns.len() > 10 {
             Self::Top
         } else {
@@ -269,7 +269,7 @@ impl AbsInt {
     }
 
     #[inline]
-    pub fn as_singleton(&self) -> Option<u128> {
+    pub fn as_singleton(&self) -> Option<i128> {
         match self {
             Self::Set(s) if s.len() == 1 => Some(*s.iter().next().unwrap()),
             _ => None,
@@ -277,7 +277,7 @@ impl AbsInt {
     }
 
     #[inline]
-    pub fn iter(&self) -> Box<dyn Iterator<Item = u128> + '_> {
+    pub fn iter(&self) -> Box<dyn Iterator<Item = i128> + '_> {
         match self {
             Self::Top => Box::new(std::iter::empty()),
             Self::Set(s) => Box::new(s.iter().copied()),
@@ -285,7 +285,7 @@ impl AbsInt {
     }
 
     #[inline]
-    pub fn into_set(&self) -> HashSet<u128> {
+    pub fn into_set(&self) -> HashSet<i128> {
         match self {
             Self::Top => HashSet::new(),
             Self::Set(s) => s.clone(),
@@ -358,7 +358,7 @@ impl std::fmt::Debug for Obj {
 }
 
 impl Obj {
-    fn at_addr(n: u128) -> Self {
+    fn at_addr(n: i128) -> Self {
         Self::AtAddr(AbsInt::singleton(n))
     }
 
@@ -556,7 +556,7 @@ impl Obj {
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn index(&self, i: u128) -> &Obj {
+    pub fn index(&self, i: i128) -> &Obj {
         let Obj::Array(vs) = self else { panic!() };
         vs.get(&Index::Num(i)).unwrap()
     }
@@ -606,7 +606,7 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     locals: HashMap<Local, NodeId>,
     statics: HashMap<LocalDefId, NodeId>,
-    ints: HashMap<u128, AbsLoc>,
+    ints: HashMap<i128, AbsLoc>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -689,7 +689,7 @@ impl Graph {
         (id, &mut self.nodes[id])
     }
 
-    fn get_int_node(&mut self, n: u128) -> AbsLoc {
+    fn get_int_node(&mut self, n: i128) -> AbsLoc {
         if let Some(id) = self.ints.get(&n) {
             id.clone()
         } else {
@@ -871,7 +871,7 @@ impl Graph {
         *obj = Obj::Ptr(AbsLoc::new_root(id));
     }
 
-    fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: u128) {
+    fn x_eq_int(&mut self, x: &AccPath, deref: bool, n: i128) {
         let loc = self.get_int_node(n);
         let obj = self.lvalue(x, deref);
         *obj = Obj::Ptr(loc);
@@ -936,7 +936,7 @@ impl Graph {
         }
     }
 
-    pub fn x_eq_offset_int(&mut self, x: &AccPath, y: &AccPath, idx: u128) {
+    pub fn x_eq_offset_int(&mut self, x: &AccPath, y: &AccPath, idx: i128) {
         let (id, _) = self.get_local_node_mut(y.local);
         let mut loc = self.get_pointed_loc_mut(id, &[], false);
         let obj = self.lvalue(x, false);
@@ -949,7 +949,7 @@ impl Graph {
         }
     }
 
-    pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: u128) {
+    pub fn filter_x_int(&mut self, x: &AccPath, deref: bool, n: i128) {
         let ptr_loc = self.set_obj_ptr(|this| this.lvalue(x, deref));
         if let Some(n_loc) = self.ints.get(&n) {
             let n_loc = n_loc.clone();
@@ -961,7 +961,7 @@ impl Graph {
         }
     }
 
-    pub fn filter_x_not_ints<I: Iterator<Item = u128>>(
+    pub fn filter_x_not_ints<I: Iterator<Item = i128>>(
         &mut self,
         x: &AccPath,
         deref: bool,
@@ -1028,11 +1028,11 @@ impl Graph {
         }
     }
 
-    pub fn get_local_as_int(&self, x: usize) -> Option<u128> {
+    pub fn get_local_as_int(&self, x: usize) -> Option<i128> {
         self.get_x_as_int(&AccPath::new(Local::from_usize(x), vec![]), false)
     }
 
-    pub fn get_x_as_int(&self, x: &AccPath, deref: bool) -> Option<u128> {
+    pub fn get_x_as_int(&self, x: &AccPath, deref: bool) -> Option<i128> {
         let id = self.locals.get(&x.local)?;
         let loc = if deref {
             let mut loc = self.get_pointed_loc(*id, &[])?;
@@ -1044,7 +1044,7 @@ impl Graph {
         self.get_absloc_as_int(&loc)
     }
 
-    pub fn get_absloc_as_int(&self, loc: &AbsLoc) -> Option<u128> {
+    pub fn get_absloc_as_int(&self, loc: &AbsLoc) -> Option<i128> {
         let obj = self.obj_at_location(loc)?;
         let Obj::AtAddr(n) = obj else { return None };
         n.as_singleton()

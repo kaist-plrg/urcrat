@@ -3,6 +3,7 @@ use rustc_ast::{ast::*, ptr::P};
 use rustc_parse::parser::{ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
 use rustc_span::FileName;
+use thin_vec::ThinVec;
 
 #[inline]
 pub fn new_silent_parse_sess() -> ParseSess {
@@ -59,6 +60,19 @@ pub fn parse_item(item: String) -> Item {
 macro_rules! item {
     ($($arg:tt)*) => {{
         parse_item(format!($($arg)*))
+    }};
+}
+
+#[inline]
+pub fn parse_items(items: String) -> ThinVec<P<Item>> {
+    let krate = parse_crate(items);
+    krate.items
+}
+
+#[macro_export]
+macro_rules! items {
+    ($($arg:tt)*) => {{
+        parse_items(format!($($arg)*))
     }};
 }
 

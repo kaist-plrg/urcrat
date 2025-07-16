@@ -6,11 +6,10 @@ use std::{
 };
 
 use bitset::BitSet;
-use compile_util::{make_suggestion, span_to_snippet};
 use etrace::{ok_or, some_or};
 use must_analysis::{Graph, Obj};
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_ast::{BindingMode, LitKind, Mutability, DUMMY_NODE_ID};
+use rustc_ast::{BindingMode, LitKind, Mutability};
 use rustc_ast_pretty::pprust;
 use rustc_hir::{
     def::Res,
@@ -34,9 +33,10 @@ use rustc_session::config::Input;
 use rustc_span::{
     def_id::LocalDefId,
     source_map::{SourceMap, Spanned},
-    BytePos, FileName, RealFileName, Span, Symbol, DUMMY_SP,
+    sym::field_init_shorthand,
+    BytePos, FileName, RealFileName, Span, Symbol,
 };
-use rustfix::Suggestion;
+use thin_vec::thin_vec;
 use typed_arena::Arena;
 
 use self::must_analysis::{AbsInt, AbsMem, AccPath};
@@ -933,15 +933,15 @@ impl {} {{
             );
             enum_str.push_str("\n}");
 
-            let code = format!(
+            let method_str = format!(
                 "{}\n{}\n{}\n{}",
                 enum_str,
                 new_method,
                 field_methods,
                 if is_first_union { &get_tag_method } else { "" },
             );
-            method_lines += code.split('\n').count();
-            suggestions.add(item.span, ReplaceItem(item!("{}", code)));
+            method_lines += method_str.split('\n').count();
+            suggestions.add(item.span, FlatMapItemsWithAttrs(items!("{}", method_str)));
         }
 
         set_tag_method.push_str(
@@ -990,21 +990,20 @@ impl {} {{
     }
     stat.nums = nums;
 
-    let mut suggestions = suggestions.suggestions;
-    for (path, suggestions) in &mut suggestions {
+    for (path, suggestion_vec) in &mut suggestions.suggestions {
         tracing::info!("{:?}", path);
-        suggestions.sort_by_key(|s| s.span.lo());
-        for suggestion in suggestions {
+        suggestion_vec.sort_by_key(|s| s.span.lo());
+        for suggestion in suggestion_vec {
             tracing::info!("{:?}", suggestion);
         }
     }
 
     if conf.transform {
-        // Not using rustfix
-        // compile_util::apply_suggestions(&suggestions);
-
         let source_map = tcx.sess.source_map();
         let parse_sess = new_silent_parse_sess();
+
+        let mut trans_visitor = suggestions.to_transform_visitor();
+
         for file in source_map.files().iter() {
             if !matches!(
                 file.name,
@@ -1018,49 +1017,27 @@ impl {} {{
                     .unwrap();
             let mut krate = parser.parse_crate_mod().unwrap();
 
-            let updated = true;
+            trans_visitor.transform(&mut krate);
 
-            if updated && conf.transform {
-                for item in &mut krate.items {}
+            if trans_visitor.updated && conf.transform {
                 let s = pprust::crate_to_string_for_macros(&krate);
                 let FileName::Real(RealFileName::LocalPath(p)) = file.name.clone() else {
                     panic!()
                 };
                 fs::write(p, s).unwrap();
             }
-
-            // TODO: add definitions
-            // TODO: add transform transformation visitor
         }
+        println!("================================================");
+        trans_visitor.print_suggestions();
+        trans_visitor.assert_finished();
     }
 
     stat.transformation = start.elapsed().as_millis() as usize;
     stat
 }
 
-// struct Suggestions<'tcx> {
-//     suggestions: HashMap<PathBuf, Vec<Suggestion>>,
-//     source_map: &'tcx SourceMap,
-// }
-
-// impl<'tcx> Suggestions<'tcx> {
-//     fn new(source_map: &'tcx SourceMap) -> Self {
-//         Self {
-//             suggestions: HashMap::new(),
-//             source_map,
-//         }
-//     }
-
-//     fn add(&mut self, span: Span, code: String) {
-//         let snippet = span_to_snippet(span, self.source_map);
-//         let suggestion = make_suggestion(snippet, code);
-//         let path = compile_util::span_to_path(span, self.source_map).unwrap();
-//         self.suggestions.entry(path).or_default().push(suggestion);
-//     }
-// }
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct Tag(u32);
+pub(super) struct Tag(i32);
 
 impl std::fmt::Debug for Tag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1089,7 +1066,7 @@ impl UnionUse {
     }
 
     #[inline]
-    fn insert_tags<T: TryInto<u32>, S: IntoIterator<Item = T>>(
+    fn insert_tags<T: TryInto<i32>, S: IntoIterator<Item = T>>(
         &mut self,
         field: FieldIdx,
         tags: S,
@@ -1153,7 +1130,7 @@ struct VariantTags {
 
 impl VariantTags {
     #[inline]
-    fn insert<T: TryInto<u32>>(&mut self, field: FieldIdx, tag: T, span: Span) {
+    fn insert<T: TryInto<i32>>(&mut self, field: FieldIdx, tag: T, span: Span) {
         let tag = ok_or!(tag.try_into(), return);
         self.tags
             .entry(field)
@@ -1258,7 +1235,7 @@ fn find_paths(
     visited.remove(&curr);
 }
 
-type ArmTags = Option<BTreeSet<u128>>;
+type ArmTags = Option<BTreeSet<i128>>;
 
 struct MIf {
     c: Span,
@@ -1401,7 +1378,7 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
                 } else {
                     let mut tags: HashMap<_, BTreeSet<_>> = HashMap::new();
                     for (tag, bb) in targets.iter() {
-                        tags.entry(bb).or_default().insert(tag);
+                        tags.entry(bb).or_default().insert(tag as i128);
                     }
                     tags.remove(&targets.otherwise());
                     let mut ts: HashMap<_, _> =
@@ -1703,6 +1680,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             };
                             let is_const = is_from_const_ptr(struct_expr, self.typeck);
                             let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
+                            // TODO: Probably bug here
                             self.suggestions.add(
                                 expr.span,
                                 ReplaceExpr(expr!(
@@ -1855,15 +1833,14 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                     {
                                         self.nums.set_tag_aggregate_num += 1;
                                     } else {
-                                        let expr_str =
-                                            source_map.span_to_snippet(expr.span).unwrap();
+                                        let expr_str = source_map.span_to_snippet(e2.span).unwrap();
                                         let replaced = str_replace_last(
                                             &expr_str,
                                             &format!(".{} = ", field.name),
                                             &format!(".set_{}(", field.name),
                                         );
                                         self.suggestions
-                                            .add(expr.span, ReplaceExpr(expr!("{})", replaced)));
+                                            .add(e2.span, ReplaceExpr(expr!("{})", replaced)));
 
                                         self.nums.set_tag_num += 1;
                                     }
@@ -2643,14 +2620,14 @@ fn tag_to_string(tag: Tag, ty: &str) -> String {
     }
 }
 
-fn expr_to_tag(expr: &PatExpr<'_>) -> u128 {
+fn expr_to_tag(expr: &PatExpr<'_>) -> i128 {
     match expr.kind {
         PatExprKind::Lit { lit, negated } => {
             let LitKind::Int(n, _) = lit.node else { unreachable!() };
             if negated {
-                0u128.wrapping_sub(n.get())
+                0i128.wrapping_sub(n.get() as i128)
             } else {
-                n.get()
+                n.get() as i128
             }
         }
         _ => unreachable!(),
@@ -2719,7 +2696,7 @@ impl<'a, 'tcx> AccessCtx<'a, 'tcx> {
 #[allow(dead_code)]
 pub(super) struct AccessInMatch<'tcx> {
     pub(super) access: FieldAccess<'tcx>,
-    pub(super) field_tags: Vec<(FieldIdx, HashSet<u128>)>,
+    pub(super) field_tags: Vec<(FieldIdx, HashSet<i128>)>,
     pub(super) match_loc: Location,
     pub(super) arm_loc: Location,
     pub(super) match_span: Span,
@@ -2789,7 +2766,7 @@ fn access_in_match<'tcx>(
 #[allow(dead_code)]
 pub(super) struct AccessInIf<'tcx> {
     access: FieldAccess<'tcx>,
-    field_tags: Vec<(FieldIdx, HashSet<u128>)>,
+    field_tags: Vec<(FieldIdx, HashSet<i128>)>,
     if_loc: Location,
     branch_loc: Location,
     if_span: Span,
@@ -2863,7 +2840,7 @@ fn access_in_if<'tcx>(
 
 fn is_tag_from_branch<'tcx>(
     f: FieldIdx,
-    tags: &HashSet<u128>,
+    tags: &HashSet<i128>,
     loc_before: Location,
     loc_after: Location,
     access: FieldAccess<'tcx>,
@@ -2887,7 +2864,7 @@ fn is_tag_from_branch<'tcx>(
 
 fn filter_paths_by_tag(
     f: FieldIdx,
-    tags: &HashSet<u128>,
+    tags: &HashSet<i128>,
     loc: Location,
     paths: &mut Vec<(Local, Vec<AccElem>)>,
     same: bool,
@@ -2918,7 +2895,7 @@ fn set_eq<T: Eq + Ord + std::hash::Hash>(s1: &HashSet<T>, s2: &BTreeSet<T>) -> b
     s2.iter().all(|x| s1.contains(x))
 }
 
-fn extract_tags_from_obj(obj: &Obj, g: &Graph) -> Vec<(FieldIdx, HashSet<u128>)> {
+fn extract_tags_from_obj(obj: &Obj, g: &Graph) -> Vec<(FieldIdx, HashSet<i128>)> {
     let Obj::Struct(fs, _) = obj else { return vec![] };
     fs.iter()
         .filter_map(|(f, obj)| {
@@ -2954,7 +2931,7 @@ fn unwrap_projection<'a, 'tcx>(e: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
 
 fn find_tag_from_accesses<'a>(
     accesses: &'a [AccessInIf<'_>],
-) -> Option<(FieldIdx, &'a HashSet<u128>)> {
+) -> Option<(FieldIdx, &'a HashSet<i128>)> {
     let access = accesses.first()?;
     if access.field_tags.len() > 1 {
         return None;
@@ -2972,7 +2949,7 @@ fn find_tag_from_accesses<'a>(
     Some((field, tags))
 }
 
-fn tags_to_pattern<I: Iterator<Item = u128>>(
+fn tags_to_pattern<I: Iterator<Item = i128>>(
     tags: I,
     is_const: bool,
     tu: &TaggedUnion,

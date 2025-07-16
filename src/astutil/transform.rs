@@ -7,21 +7,25 @@ use rustc_ast::{
         AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream, TokenStream, TokenTree,
     },
 };
-use rustc_middle::ty::TyCtxt;
-use rustc_span::{source_map::SourceMap, Span};
+use rustc_middle::ty::{print, TyCtxt};
+use rustc_span::{
+    source_map::{SourceMap, SourceMapInputs},
+    Span,
+};
 use smallvec::smallvec;
+use thin_vec::ThinVec;
 
 use super::{AstEdit, AstEditKind, AstSuggestion, AstSuggestions};
 
 #[derive(Debug)]
 pub struct TransformVisitor<'tcx> {
-    suggestions: AstSuggestions<'tcx>,
-    updated: bool,
+    pub(super) suggestions: AstSuggestions<'tcx>,
+    pub updated: bool,
 }
 
 impl<'tcx> TransformVisitor<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, suggestion_vec: Vec<AstSuggestion>) -> Self {
-        let mut suggestions = AstSuggestions::new(tcx.sess.source_map());
+    pub fn new(source_map: &'tcx SourceMap, suggestion_vec: Vec<AstSuggestion>) -> Self {
+        let mut suggestions = AstSuggestions::new(source_map);
         for suggestion in suggestion_vec {
             suggestions.add(suggestion.span, suggestion.action);
         }
@@ -30,62 +34,60 @@ impl<'tcx> TransformVisitor<'tcx> {
             updated: false,
         }
     }
-    // fn try_replace<T: Spanned>(
-    //     &mut self,
-    //     replacement_kind: AstEditKind,
-    //     target: &mut P<T>,
-    //     extract: impl FnOnce(AstEdit) -> Option<T>,
-    //     // fallback: impl FnOnce(&mut Self, &mut P<T>),
-    // ) {
-    //     let span = target.span();
-    //     let Some(AstSuggestion {
-    //         action: replacement,
-    //         ..
-    //     }) = self.suggestions.pop_by_kind(span, replacement_kind)
-    //     else {
-    //         // fallback(self, target);
-    //         return;
-    //     };
 
-    //     let Some(new_node) = extract(replacement) else {
-    //         // fallback(self, target);
-    //         return;
-    //     };
+    pub fn transform(&mut self, krate: &mut Crate) {
+        self.updated = false;
+        self.visit_crate(krate);
+    }
 
-    //     self.updated = true;
-    //     **target = new_node;
-    //     target.set_span(span);
-    // }
+    pub fn print_suggestions(&self) {
+        self.suggestions.print_suggestions();
+    }
+
+    pub fn assert_finished(&self) {
+        self.suggestions.assert_empty();
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_> {
     fn visit_crate(&mut self, krate: &mut Crate) {
         mut_visit::walk_crate(self, krate);
-        let mut append_vec = vec![];
-        for (idx, item) in &mut krate.items.iter_mut().enumerate() {
-            let edit_vec = self
-                .suggestions
-                .pop_by_kind(item.span, vec![AstEditKind::AppendAfterItem]);
-            for edit in edit_vec {
-                match edit.action {
-                    AstEdit::AppendAfterItem(new_item) => {
-                        self.updated = true;
-                        // Insert the new item after the current item.
-                        append_vec.push((idx, new_item));
-                        // Update the span of the current item to the new item's span.
-                        item.span = edit.span;
-                    }
-                    _ => {
-                        unreachable!();
+        let new_items: ThinVec<_> = krate
+            .items
+            .drain(..)
+            .flat_map(|item| {
+                let item_span = item.span;
+                let mut append_vec: ThinVec<_> = vec![item].into();
+                let edit_vec = self.suggestions.pop_by_kind(
+                    item_span,
+                    vec![
+                        AstEditKind::AppendAfterItem,
+                        AstEditKind::FlatMapItemsWithAttrs,
+                    ],
+                );
+                for edit in edit_vec {
+                    match edit.action {
+                        AstEdit::AppendAfterItem(new_item) => {
+                            self.updated = true;
+                            append_vec.push(P(new_item));
+                        }
+                        AstEdit::FlatMapItemsWithAttrs(mut new_items) => {
+                            self.updated = true;
+                            let mut orig_item = append_vec.swap_remove(0);
+                            if let Some(first_item) = new_items.first_mut() {
+                                first_item.attrs = orig_item.attrs.drain(..).collect();
+                            }
+                            append_vec = new_items;
+                        }
+                        _ => {
+                            unreachable!();
+                        }
                     }
                 }
-            }
-        }
-        append_vec.reverse(); // for not messing up the indices
-        for (idx, new_item) in append_vec {
-            // Insert the new item after the current item.
-            krate.items.insert(idx + 1, P(new_item));
-        }
+                append_vec
+            })
+            .collect();
+        krate.items.extend(new_items);
     }
 
     fn visit_item(&mut self, item: &mut P<Item>) {

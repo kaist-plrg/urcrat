@@ -1,6 +1,7 @@
 target
 Session.vim
 .DS_Store
+.vscode
 *.log
 *.txt
 *.profdata
@@ -8,5 +9,6 @@ Session.vim
 
 rs-resolved
 rs-transformed
+rs-ast-transformed
 
 src/legacy

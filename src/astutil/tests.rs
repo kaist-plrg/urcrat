@@ -47,7 +47,7 @@ fn test_append_after_item() {
             span: item_span,
             action: astutil::AstEdit::AppendAfterItem(item!("{}", item_code)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -66,7 +66,7 @@ fn test_replace_item() {
             span: item_span,
             action: astutil::AstEdit::ReplaceItem(item!("{}", item_code)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -92,7 +92,7 @@ fn test_remove_field_def() {
             span: item_span,
             action: astutil::AstEdit::RemoveFieldDef(field_span),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -115,7 +115,7 @@ fn test_prepend_to_block() {
             span: block_span,
             action: astutil::AstEdit::PrependToBlock(stmt!("{}", prep_stmt)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -140,7 +140,7 @@ fn test_replace_stmt() {
             span: stmt_span,
             action: astutil::AstEdit::ReplaceStmt(stmt!("{}", repl_stmt)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -163,7 +163,7 @@ fn test_remove_stmt() {
             span: stmt_span,
             action: astutil::AstEdit::RemoveStmt,
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -188,7 +188,7 @@ fn test_replace_pat() {
             span: pat_span,
             action: astutil::AstEdit::ReplacePat(pat!("{}", repl_pat)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -213,7 +213,7 @@ fn test_replace_expr() {
             span: expr_span,
             action: astutil::AstEdit::ReplaceExpr(expr!("{}", repl_expr)),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -241,7 +241,7 @@ fn test_remove_expr_field() {
             span: expr_span,
             action: astutil::AstEdit::RemoveExprField(field_span),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
@@ -265,7 +265,7 @@ fn test_remove_field_attr() {
             span: field_def_span,
             action: astutil::AstEdit::RemoveFieldAttr(attr_span),
         };
-        let mut mut_visitor = TransformVisitor::new(tcx, vec![suggestion]);
+        let mut mut_visitor = TransformVisitor::new(tcx.sess.source_map(), vec![suggestion]);
         mut_visitor.visit_crate(&mut krate);
         assert_eq_crate(&krate, &expected_code);
     });
