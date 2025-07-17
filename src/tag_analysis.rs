@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use bitset::BitSet;
@@ -31,12 +31,8 @@ use rustc_middle::{
 use rustc_parse::new_parser_from_source_str;
 use rustc_session::config::Input;
 use rustc_span::{
-    def_id::LocalDefId,
-    source_map::{SourceMap, Spanned},
-    sym::field_init_shorthand,
-    BytePos, FileName, RealFileName, Span, Symbol,
+    def_id::LocalDefId, source_map::Spanned, BytePos, FileName, RealFileName, Span, Symbol,
 };
-use thin_vec::thin_vec;
 use typed_arena::Arena;
 
 use self::must_analysis::{AbsInt, AbsMem, AccPath};
@@ -1041,11 +1037,7 @@ pub(super) struct Tag(i32);
 
 impl std::fmt::Debug for Tag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0 < 0 {
-            write!(f, "_m{}", self.0.abs())
-        } else {
-            write!(f, "_{}", self.0)
-        }
+        write!(f, "{}", self.0)
     }
 }
 
