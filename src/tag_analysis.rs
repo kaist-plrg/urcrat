@@ -1633,7 +1633,6 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                         self.suggestions.add(span, ReplacePat(pat!("{}", pat)));
                         if matches!(arm.body.kind, ExprKind::Block(_, _)) {
                             if let Some(cast) = cast {
-                                let pos = arm.body.span.lo() + BytePos(1);
                                 let span = arm.body.span; //.with_lo(pos).with_hi(pos);
                                 self.suggestions
                                     .add(span, PrependToBlock(stmt!("{}", cast)));
@@ -2627,7 +2626,7 @@ fn tag_to_string(tag: Tag, ty: &str) -> String {
     if ty == "bool" {
         (tag.0 != 0).to_string()
     } else if ty.ends_with("c_int") {
-        (tag.0 as i32).to_string()
+        tag.0.to_string()
     } else {
         tag.to_string()
     }
@@ -2708,12 +2707,12 @@ impl<'a, 'tcx> AccessCtx<'a, 'tcx> {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(super) struct AccessInMatch<'tcx> {
-    pub(super) access: FieldAccess<'tcx>,
-    pub(super) field_tags: Vec<(FieldIdx, HashSet<i128>)>,
-    pub(super) match_loc: Location,
-    pub(super) arm_loc: Location,
-    pub(super) match_span: Span,
-    pub(super) arm_span: Span,
+    access: FieldAccess<'tcx>,
+    field_tags: Vec<(FieldIdx, HashSet<i128>)>,
+    match_loc: Location,
+    arm_loc: Location,
+    match_span: Span,
+    arm_span: Span,
 }
 
 fn access_in_match<'tcx>(

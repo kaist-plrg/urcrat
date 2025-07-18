@@ -1,17 +1,10 @@
 use rustc_ast::{
+    self,
     ast::*,
     mut_visit::{self, MutVisitor},
     ptr::P,
-    token::TokenKind,
-    tokenstream::{
-        AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream, TokenStream, TokenTree,
-    },
 };
-use rustc_middle::ty::{print, TyCtxt};
-use rustc_span::{
-    source_map::{SourceMap, SourceMapInputs},
-    Span,
-};
+use rustc_span::source_map::SourceMap;
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 

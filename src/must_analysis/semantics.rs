@@ -260,7 +260,7 @@ impl<'tcx> Analyzer<'tcx, '_, '_> {
                             IntTy::I16 => i.to_i16() as _,
                             IntTy::I32 => i.to_i32() as _,
                             IntTy::I64 => i.to_i64() as _,
-                            IntTy::I128 => i.to_i128() as _,
+                            IntTy::I128 => i.to_i128(),
                         };
                         OpVal::Int(v)
                     }
