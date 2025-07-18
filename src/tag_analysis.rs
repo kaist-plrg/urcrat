@@ -1132,6 +1132,19 @@ impl VariantTags {
     #[inline]
     fn insert<T: TryInto<i32>>(&mut self, field: FieldIdx, tag: T, span: Span) {
         let tag = ok_or!(tag.try_into(), return);
+
+        // NOTE: Negative tags are not supported. In some cases, a field may
+        // serve dual purposes: it acts as a tag when negative and as a regular
+        // field when non-negative.  For example, in the `Colamd_Col_Struct`
+        // struct from glpk-5.0, the `start` field is set to `-1` or `-2` when
+        // acting as a tag for the union `C2RustUnnamed_4`.  When positive, it
+        // represents a normal start index.  Since we don't currently handle
+        // this tag/field duality, we ignore negative tags.
+        if tag < 0 {
+            tracing::warn!("Ignoring negative tag: {}", tag);
+            return;
+        }
+
         self.tags
             .entry(field)
             .or_default()
