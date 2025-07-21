@@ -17,13 +17,18 @@ if [[ ! -d "$DIR1" || ! -d "$DIR2" ]]; then
   exit 1
 fi
 
+# Ensure difftastic is installed
+if ! command -v difft &> /dev/null; then
+  echo "[*] difftastic (difft) not found. Installing with cargo..."
+  cargo install difftastic
+fi
+
 echo "[*] Forcing formatting of all .rs files..."
 find "$DIR1" -name '*.rs' -exec rustfmt --config-path rustfmt.toml {} +
 find "$DIR2" -name '*.rs' -exec rustfmt --config-path rustfmt.toml {} +
 
 echo ""
 echo "[*] Comparing .rs files..."
-
 
 TMP1=$(mktemp)
 TMP2=$(mktemp)
@@ -34,13 +39,13 @@ find "$DIR1" -type f -name '*.rs' | while read -r file1; do
   file2="$DIR2/$rel_path"
 
   if [[ -f "$file2" ]]; then
-      tr -s '[:space:]' ' ' < "$file1" > "$TMP1"
-      tr -s '[:space:]' ' ' < "$file2" > "$TMP2"
+    tr -s '[:space:]' ' ' < "$file1" > "$TMP1"
+    tr -s '[:space:]' ' ' < "$file2" > "$TMP2"
 
     if ! cmp -s "$TMP1" "$TMP2"; then
       echo ""
       echo "=== Difference in $rel_path ==="
-      diff --side-by-side --color=always --suppress-common-lines --width=200 "$file1" "$file2" || true
+      difft "$file1" "$file2" || true
       echo "================================="
     fi
   else

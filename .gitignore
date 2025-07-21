@@ -8,7 +8,6 @@ Session.vim
 *.profraw
 
 rs-resolved
-rs-transformed
-rs-ast-transformed
+rs-transformed*
 
 src/legacy
