@@ -1046,7 +1046,7 @@ impl std::fmt::Display for Tag {
         if self.0 < 0 {
             write!(f, "_m{}", self.0.abs())
         } else {
-            write!(f, "_{}", self.0)
+            write!(f, "{}", self.0)
         }
     }
 }
