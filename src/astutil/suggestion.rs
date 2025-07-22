@@ -145,7 +145,7 @@ define_ast_edit!(
     RemoveFieldAttr(Span), /* Given the parent FieldDef's span, remove a field attribute of this span. */
 );
 
-fn span_eq(span1: Span, span2: Span) -> bool {
+pub fn span_eq(span1: Span, span2: Span) -> bool {
     span1.lo() == span2.lo() && span1.hi() == span2.hi()
 }
 

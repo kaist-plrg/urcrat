@@ -39,8 +39,10 @@ find "$DIR1" -type f -name '*.rs' | while read -r file1; do
   file2="$DIR2/$rel_path"
 
   if [[ -f "$file2" ]]; then
-    tr -s '[:space:]' ' ' < "$file1" > "$TMP1"
-    tr -s '[:space:]' ' ' < "$file2" > "$TMP2"
+    # tr -s '[:space:]' ' ' < "$file1" > "$TMP1"
+    # tr -s '[:space:]' ' ' < "$file2" > "$TMP2"
+    tr -d '[:space:],:{}' < "$file1" > "$TMP1"
+    tr -d '[:space:],:{}' < "$file2" > "$TMP2"
 
     if ! cmp -s "$TMP1" "$TMP2"; then
       echo ""

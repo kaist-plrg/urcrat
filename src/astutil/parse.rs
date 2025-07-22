@@ -1,9 +1,14 @@
-// use memoize::memoize;
+use std::path::PathBuf;
+
 use rustc_ast::{ast::*, ptr::P};
+use rustc_ast_pretty::pprust;
 use rustc_parse::parser::{ForceCollect, Parser};
 use rustc_session::parse::ParseSess;
-use rustc_span::FileName;
+use rustc_span::{FileName, RealFileName};
 use thin_vec::ThinVec;
+
+// use memoize::memoize;
+use crate::compile_util::{make_config, path_to_input, run_compiler};
 
 #[inline]
 pub fn new_silent_parse_sess() -> ParseSess {
@@ -129,4 +134,38 @@ macro_rules! pat {
     ($($arg:tt)*) => {{
         parse_pat(format!($($arg)*))
     }};
+}
+
+fn collect_rs_files(entry: &PathBuf) -> Vec<PathBuf> {
+    let dir = entry.parent().unwrap();
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.path().extension().map_or(false, |ext| ext == "rs")
+        })
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+pub fn format_project(file: PathBuf) {
+    let config = make_config(path_to_input(&file));
+    run_compiler(config, |_| {
+        let parse_sess = new_silent_parse_sess();
+
+        for path in collect_rs_files(&file) {
+            println!("Formatting file: {}", path.display());
+            let src = std::fs::read_to_string(&path).unwrap();
+            let mut parser = rustc_parse::new_parser_from_source_str(
+                &parse_sess,
+                FileName::Real(RealFileName::LocalPath(path.clone())),
+                src,
+            )
+            .unwrap();
+            let krate = parser.parse_crate_mod().unwrap();
+            print!("Krate: {}", pprust::crate_to_string_for_macros(&krate));
+            std::fs::write(path, pprust::crate_to_string_for_macros(&krate)).unwrap();
+        }
+    })
+    .unwrap();
 }

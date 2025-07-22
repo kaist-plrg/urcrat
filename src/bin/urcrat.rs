@@ -28,6 +28,7 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    Format,
 }
 
 #[derive(Parser, Debug)]
@@ -105,6 +106,9 @@ fn main() {
             };
             let stat = tag_analysis::analyze_path(&file, &conf);
             println!("{}", stat.show());
+        }
+        Command::Format => {
+            astutil::parse::format_project(file);
         }
     }
 }
