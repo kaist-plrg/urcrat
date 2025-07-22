@@ -141,7 +141,7 @@ define_ast_edit!(
     // Handled by visit_expr
     ReplaceExpr(Expr),
     RemoveExprField(Span), /* Given the parent Expr's span, remove a field definition of this span. */
-    // Handled by TODO: visit_field_def?
+    // Handled by visit_field_def
     RemoveFieldAttr(Span), /* Given the parent FieldDef's span, remove a field attribute of this span. */
 );
 

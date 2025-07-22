@@ -405,7 +405,13 @@ pub fn analyze(tcx: TyCtxt<'_>, conf: &Config) -> Statistics {
                     .push(access_match);
                 tags
             } else {
+                // println!(
+                //     "hvisitor.ifs.len() = {}, visitor.ifs.len() = {}",
+                //     hvisitor.ifs.len(),
+                //     visitor.ifs.len() // TODO: This has insufficient length
+                // );
                 let accesses_if = access_in_if(access, &hvisitor.ifs, &visitor.ifs, ctx);
+                // println!("accesses_if.len() = {}", accesses_if.len());
                 let tags = accesses_if
                     .iter()
                     .flat_map(|a| a.field_tags.clone())
@@ -1376,7 +1382,19 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 let span = terminator.source_info.span;
                 let ty = discr.ty(self.local_decls, self.tcx);
+                // let span_str = format!(
+                //     "SwitchInt at {:?} with type {:?} {}",
+                //     span,
+                //     ty,
+                //     ty.is_integral()
+                // );
+                // if span_str.contains("load") {
+                //     println!("{}", span_str);
+                // }
+
+                // It still can be `if` though ty is integral
                 if ty.is_bool() {
+                    // let targets_cloned = targets.clone();
                     let mut targets_iter = targets.iter();
                     let (tag, bb) = targets_iter.next().unwrap();
                     assert!(targets_iter.next().is_none());
@@ -1388,7 +1406,29 @@ impl<'tcx> MVisitor<'tcx> for MBodyVisitor<'tcx, '_> {
                         f: bb,
                     };
                     self.ifs.push(mif);
-                } else {
+                }
+                if ty.is_integral() {
+                    // let targets_cloned = targets.clone();
+                    let mut targets_iter = targets.iter();
+                    let (tag, bb) = targets_iter.next().unwrap();
+                    // if span_str.contains("load") {
+                    //     println!("SwitchInt at {:?} with type {:?} tag {}", span, ty, tag);
+                    // }
+                    if targets_iter.next().is_none() {
+                        // This is a simple if, not a switch
+                        let mif = MIf {
+                            c: span,
+                            loc: location,
+                            t: bb,
+                            f: targets.otherwise(),
+                        };
+                        // if span_str.contains("load") {
+                        //     println!("Simple if at {:?} with type {:?}", span, ty);
+                        // }
+                        self.ifs.push(mif);
+                    }
+                }
+                if !ty.is_bool() {
                     let mut tags: HashMap<_, BTreeSet<_>> = HashMap::new();
                     for (tag, bb) in targets.iter() {
                         tags.entry(bb).or_default().insert(tag as i128);
@@ -1692,7 +1732,6 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                             };
                             let is_const = is_from_const_ptr(struct_expr, self.typeck);
                             let (pat, cast) = tags_to_pattern(tags.iter().copied(), is_const, tu);
-                            // TODO: Probably bug here
                             self.suggestions.add(
                                 expr.span,
                                 ReplaceExpr(expr!(
@@ -1730,6 +1769,7 @@ impl<'tcx> SuggestingVisitor<'_, 'tcx> {
                                 Some(expr_strs.into_iter().next().unwrap())
                             };
                             self.if_targets.insert(expr.span, s);
+                            // TODO: if_num is not sufficient
                             self.nums.if_num += 1;
                         }
                     } else {
@@ -2819,7 +2859,13 @@ fn access_in_if<'tcx>(
             continue;
         };
 
+        // let hif_span_str = format!("{:?}", c_span);
+        // if hif_span_str.contains("load") {
+        //     println!("Checking Hif: {}", hif_span_str);
+        // }
+
         for mif in mifs {
+            // println!("Checking MIf: {:?}", mif.c);
             if !mif.c.overlaps(c_span) {
                 continue;
             }

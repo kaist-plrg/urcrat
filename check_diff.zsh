@@ -24,8 +24,8 @@ if ! command -v difft &> /dev/null; then
 fi
 
 echo "[*] Forcing formatting of all .rs files..."
-find "$DIR1" -name '*.rs' -exec rustfmt --config-path rustfmt.toml {} +
-find "$DIR2" -name '*.rs' -exec rustfmt --config-path rustfmt.toml {} +
+find "$DIR1" -name '*.rs' -exec rustfmt --config-path rustfmt_diff.toml {} +
+find "$DIR2" -name '*.rs' -exec rustfmt --config-path rustfmt_diff.toml {} +
 
 echo ""
 echo "[*] Comparing .rs files..."

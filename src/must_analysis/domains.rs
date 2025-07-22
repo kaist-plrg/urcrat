@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use ::rustc_middle::mir::Local;
 use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::Local;
 
 use super::*;
 use crate::{
