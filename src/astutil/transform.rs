@@ -8,7 +8,7 @@ use rustc_span::source_map::SourceMap;
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 
-use super::{AstEdit, AstEditKind, AstSuggestion, AstSuggestions};
+use super::{span_eq, AstEdit, AstEditKind, AstSuggestion, AstSuggestions};
 
 #[derive(Debug)]
 pub struct TransformVisitor<'tcx> {
@@ -106,7 +106,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     // Remove the field with the given span from the struct definition.
                     fields.retain(|field| {
                         // Retain fields that do not match the span of the field to be removed.
-                        field.span != span
+                        !span_eq(field.span, span)
                     });
                     self.updated = true;
                 }
@@ -205,7 +205,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     // Remove the field with the given span from the struct expression.
                     struct_expr.fields.retain(|field| {
                         // Retain fields that do not match the span of the field to be removed.
-                        field.span != span
+                        !span_eq(field.span, span)
                     });
                     self.updated = true;
                 }
@@ -223,7 +223,7 @@ impl MutVisitor for TransformVisitor<'_> {
             match edit.action {
                 AstEdit::RemoveFieldAttr(span) => {
                     // Remove the attribute with the given span from the field definition.
-                    field_def.attrs.retain(|attr| attr.span != span);
+                    field_def.attrs.retain(|attr| !span_eq(attr.span, span));
                     self.updated = true;
                 }
                 _ => {
