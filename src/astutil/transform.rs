@@ -8,7 +8,7 @@ use rustc_span::source_map::SourceMap;
 use smallvec::smallvec;
 use thin_vec::ThinVec;
 
-use super::{span_eq, span_line_eq, AstEdit, AstEditKind, AstSuggestion, AstSuggestions};
+use super::{span_eq, AstEdit, AstEditKind, AstSuggestion, AstSuggestions};
 
 #[derive(Debug)]
 pub struct TransformVisitor<'tcx> {
