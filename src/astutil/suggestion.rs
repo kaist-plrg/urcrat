@@ -92,6 +92,12 @@ impl<'tcx> AstSuggestions<'tcx> {
         })
         .collect()
     }
+
+    pub(super) fn span_line_eq(&self, span1: Span, span2: Span) -> bool {
+        let span1_expanded = self.source_map.span_extend_to_line(span1);
+        let span2_expanded = self.source_map.span_extend_to_line(span2);
+        span_eq(span1_expanded, span2_expanded)
+    }
 }
 
 macro_rules! define_ast_edit {

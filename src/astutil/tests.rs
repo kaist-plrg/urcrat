@@ -249,8 +249,8 @@ fn test_remove_expr_field() {
 
 #[test]
 fn test_remove_field_attr() {
-    let orig_code = "struct Human {\n#[rotten]\nbrain: i32,\nheart: i32 }";
-    let expected_code = "struct Human {\nbrain: i32,\nheart: i32 }";
+    let orig_code = "struct Human {\n#[rotten]\n#[fresh]\nbrain: i32,\nheart: i32 }";
+    let expected_code = "struct Human {\n#[fresh]\nbrain: i32,\nheart: i32 }";
 
     run_compiler(orig_code, |tcx| {
         let mut krate = parse_crate(orig_code.to_string());
